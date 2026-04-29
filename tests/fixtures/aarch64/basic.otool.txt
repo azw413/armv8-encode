@@ -1,0 +1,17 @@
+# Generated from tests/fixtures/aarch64/basic.s with:
+#   clang -target arm64-apple-macos -c basic.s -o basic.o
+#   otool -s __TEXT __text basic.o
+#   otool -tvV basic.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 a9bf7bfd stp x29, x30, [sp, #-0x10]!
+0000000000000004 910003fd mov x29, sp
+0000000000000008 91000400 add x0, x0, #0x1
+000000000000000c d1000821 sub x1, x1, #0x2
+0000000000000010 9a030042 adc x2, x2, x3
+0000000000000014 b4000040 cbz x0, 0x1c
+0000000000000018 94000003 bl _callee
+000000000000001c a8c17bfd ldp x29, x30, [sp], #0x10
+0000000000000020 d65f03c0 ret
+0000000000000024 d65f03c0 ret
