@@ -380,6 +380,87 @@ impl Aarch64Opcode {
             Operands::Op5(a, b, c, d, e) => vec![a, b, c, d, e],
         }
     }
+
+    pub(crate) fn class_name(&self) -> &'static str {
+        self.iclass.name()
+    }
+}
+
+impl Aarch64InsnClass {
+    fn name(self) -> &'static str {
+        match self {
+            Aarch64InsnClass::AddsubCarry => "AddsubCarry",
+            Aarch64InsnClass::AddsubExt => "AddsubExt",
+            Aarch64InsnClass::AddsubImm => "AddsubImm",
+            Aarch64InsnClass::AddsubShift => "AddsubShift",
+            Aarch64InsnClass::Asimdall => "Asimdall",
+            Aarch64InsnClass::Asimddiff => "Asimddiff",
+            Aarch64InsnClass::Asimdelem => "Asimdelem",
+            Aarch64InsnClass::Asimdext => "Asimdext",
+            Aarch64InsnClass::Asimdimm => "Asimdimm",
+            Aarch64InsnClass::Asimdins => "Asimdins",
+            Aarch64InsnClass::Asimdmisc => "Asimdmisc",
+            Aarch64InsnClass::Asimdperm => "Asimdperm",
+            Aarch64InsnClass::Asimdsame => "Asimdsame",
+            Aarch64InsnClass::Asimdshf => "Asimdshf",
+            Aarch64InsnClass::Asimdtbl => "Asimdtbl",
+            Aarch64InsnClass::Asisddiff => "Asisddiff",
+            Aarch64InsnClass::Asisdelem => "Asisdelem",
+            Aarch64InsnClass::Asisdlse => "Asisdlse",
+            Aarch64InsnClass::Asisdlsep => "Asisdlsep",
+            Aarch64InsnClass::Asisdlso => "Asisdlso",
+            Aarch64InsnClass::Asisdlsop => "Asisdlsop",
+            Aarch64InsnClass::Asisdmisc => "Asisdmisc",
+            Aarch64InsnClass::Asisdone => "Asisdone",
+            Aarch64InsnClass::Asisdpair => "Asisdpair",
+            Aarch64InsnClass::Asisdsame => "Asisdsame",
+            Aarch64InsnClass::Asisdshf => "Asisdshf",
+            Aarch64InsnClass::Bitfield => "Bitfield",
+            Aarch64InsnClass::BranchImm => "BranchImm",
+            Aarch64InsnClass::BranchReg => "BranchReg",
+            Aarch64InsnClass::Compbranch => "Compbranch",
+            Aarch64InsnClass::Condbranch => "Condbranch",
+            Aarch64InsnClass::CondcmpImm => "CondcmpImm",
+            Aarch64InsnClass::CondcmpReg => "CondcmpReg",
+            Aarch64InsnClass::Condsel => "Condsel",
+            Aarch64InsnClass::Cryptoaes => "Cryptoaes",
+            Aarch64InsnClass::Cryptosha2 => "Cryptosha2",
+            Aarch64InsnClass::Cryptosha3 => "Cryptosha3",
+            Aarch64InsnClass::Dp1src => "Dp1src",
+            Aarch64InsnClass::Dp2src => "Dp2src",
+            Aarch64InsnClass::Dp3src => "Dp3src",
+            Aarch64InsnClass::Exception => "Exception",
+            Aarch64InsnClass::Extract => "Extract",
+            Aarch64InsnClass::Float2fix => "Float2fix",
+            Aarch64InsnClass::Float2int => "Float2int",
+            Aarch64InsnClass::Floatccmp => "Floatccmp",
+            Aarch64InsnClass::Floatcmp => "Floatcmp",
+            Aarch64InsnClass::Floatdp1 => "Floatdp1",
+            Aarch64InsnClass::Floatdp2 => "Floatdp2",
+            Aarch64InsnClass::Floatdp3 => "Floatdp3",
+            Aarch64InsnClass::Floatimm => "Floatimm",
+            Aarch64InsnClass::Floatsel => "Floatsel",
+            Aarch64InsnClass::LdstImmpost => "LdstImmpost",
+            Aarch64InsnClass::LdstImmpre => "LdstImmpre",
+            Aarch64InsnClass::LdstImm9 => "LdstImm9",
+            Aarch64InsnClass::LdstPos => "LdstPos",
+            Aarch64InsnClass::LdstRegoff => "LdstRegoff",
+            Aarch64InsnClass::LdstUnpriv => "LdstUnpriv",
+            Aarch64InsnClass::LdstUnscaled => "LdstUnscaled",
+            Aarch64InsnClass::Ldstexcl => "Ldstexcl",
+            Aarch64InsnClass::LdstnapairOffs => "LdstnapairOffs",
+            Aarch64InsnClass::LdstpairOff => "LdstpairOff",
+            Aarch64InsnClass::LdstpairIndexed => "LdstpairIndexed",
+            Aarch64InsnClass::Loadlit => "Loadlit",
+            Aarch64InsnClass::LogImm => "LogImm",
+            Aarch64InsnClass::LogShift => "LogShift",
+            Aarch64InsnClass::LseAtomic => "LseAtomic",
+            Aarch64InsnClass::Movewide => "Movewide",
+            Aarch64InsnClass::Pcreladdr => "Pcreladdr",
+            Aarch64InsnClass::IcSystem => "IcSystem",
+            Aarch64InsnClass::Testbranch => "Testbranch",
+        }
+    }
 }
 
 const fn Aarch64Opcode(
@@ -9376,10 +9457,14 @@ fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
     match opcode.name {
         "ubfiz" | "bfi" => imms < immr,
         "ubfx" | "bfxil" => imms >= immr,
-        "lsl" => imms + 1 == immr,
-        "lsr" | "asr" => imms == max,
+        "lsl" if is_bitfield_alias(opcode) => imms + 1 == immr,
+        "lsr" | "asr" if is_bitfield_alias(opcode) => imms == max,
         _ => true,
     }
+}
+
+fn is_bitfield_alias(opcode: &Aarch64Opcode) -> bool {
+    opcode.mask == 0x7f800000
 }
 
 fn should_replace_match(current: &Aarch64Opcode, candidate: &Aarch64Opcode) -> bool {
@@ -9397,11 +9482,22 @@ fn should_replace_match(current: &Aarch64Opcode, candidate: &Aarch64Opcode) -> b
         return true;
     }
 
+    if is_variable_shift_alias(current.name, candidate.name) {
+        return true;
+    }
+
     if candidate.is_alias() != current.is_alias() {
         return !candidate.is_alias();
     }
 
     false
+}
+
+fn is_variable_shift_alias(current: &str, candidate: &str) -> bool {
+    matches!(
+        (current, candidate),
+        ("lslv", "lsl") | ("lsrv", "lsr") | ("asrv", "asr") | ("rorv", "ror")
+    )
 }
 
 pub(crate) fn disassemble(instructions: &[u32]) -> Vec<Aarch64Opcode> {
@@ -9423,4 +9519,19 @@ pub(crate) fn operand_kinds() -> Vec<Aarch64Opnd> {
     }
 
     kinds
+}
+
+pub(crate) fn opcode_class_mnemonics(class_name: &str) -> Vec<&'static str> {
+    aarch64_opcode_table
+        .iter()
+        .filter(|opcode| opcode.class_name() == class_name)
+        .map(|opcode| opcode.mnemonic())
+        .collect()
+}
+
+pub(crate) fn opcode_class_row_count(class_name: &str) -> usize {
+    aarch64_opcode_table
+        .iter()
+        .filter(|opcode| opcode.class_name() == class_name)
+        .count()
 }

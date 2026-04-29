@@ -1,0 +1,17 @@
+# Generated from tests/fixtures/aarch64/exception.s with:
+#   clang -target arm64-apple-macos -c exception.s -o exception.o
+#   otool -s __TEXT __text exception.o
+#   otool -tvV exception.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 d4000001 svc #0
+0000000000000004 d4024681 svc #0x1234
+0000000000000008 d40468a2 hvc #0x2345
+000000000000000c d4068ac3 smc #0x3456
+0000000000000010 d428ace0 brk #0x4567
+0000000000000014 d44acf00 hlt #0x5678
+0000000000000018 d4a00001 dcps1
+000000000000001c d4a22221 dcps1 #0x1111
+0000000000000020 d4a44442 dcps2 #0x2222
+0000000000000024 d4a66663 dcps3 #0x3333

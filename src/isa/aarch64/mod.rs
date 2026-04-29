@@ -5,7 +5,6 @@
 //! foundation while the typed instruction and operand model is built out.
 
 mod operand;
-mod simple;
 pub(crate) mod table;
 
 use operand::{decode_operand, w_reg, DecodeContext, IMPLEMENTED_OPERAND_KINDS};
@@ -13,7 +12,6 @@ pub use operand::{
     AddressingMode, DecodeError, DecodedOperand, EncodeError, MemoryOffset, MemoryOperand,
     Register, RegisterClass, Shift, ShiftKind, ShiftedImmediate, ShiftedRegister,
 };
-pub use simple::{decode, encode, Instruction};
 
 /// Raw AArch64 instruction word.
 pub type Word = u32;
@@ -28,6 +26,12 @@ pub struct OperandKindCoverage {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OpcodeClassSummary {
+    pub row_count: usize,
+    pub mnemonics: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DecodedInstruction {
     pub address: u64,
     pub word: Word,
@@ -35,14 +39,64 @@ pub struct DecodedInstruction {
     pub operands: Vec<DecodedOperand>,
 }
 
-/// Decode one raw AArch64 instruction word.
-pub fn decode_word(word: Word) -> Instruction {
-    decode(word)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InstructionTemplate {
+    pub mnemonic: &'static str,
+    pub operands: Vec<DecodedOperand>,
 }
 
-/// Encode one placeholder AArch64 instruction.
-pub fn encode_word(instruction: &Instruction) -> Option<Word> {
-    encode(instruction)
+/// Decode one AArch64 instruction word using the opcode table.
+pub fn decode_instruction(address: u64, word: Word) -> Option<DecodedInstruction> {
+    decode_instruction_with_symbols(address, word, |_| None)
+}
+
+pub fn decode_instruction_with_symbols<F>(
+    address: u64,
+    word: Word,
+    symbol_for_address: F,
+) -> Option<DecodedInstruction>
+where
+    F: Fn(u64) -> Option<String>,
+{
+    let opcode = table::match_opcode(word)?;
+    let mnemonic = opcode.mnemonic();
+    let operands = opcode
+        .operands()
+        .into_iter()
+        .map(|kind| {
+            decode_operand(
+                kind,
+                DecodeContext {
+                    word,
+                    address,
+                    opcode: &opcode,
+                },
+            )
+            .unwrap_or(DecodedOperand::Unimplemented {
+                kind: "decode-error",
+            })
+        })
+        .collect();
+
+    let decoded = DecodedInstruction {
+        address,
+        word,
+        mnemonic,
+        operands,
+    };
+
+    let _ = symbol_for_address;
+    Some(decoded)
+}
+
+/// Encode one AArch64 instruction.
+///
+/// The public API shape exists so the encoder can grow alongside operand
+/// codecs. Actual table-driven encoding is not implemented yet.
+pub fn encode_instruction(_instruction: &InstructionTemplate) -> Result<Word, EncodeError> {
+    Err(EncodeError::Unimplemented {
+        kind: "instruction",
+    })
 }
 
 /// Match raw AArch64 instruction words against the opcode table.
@@ -95,6 +149,13 @@ pub fn operand_kind_coverage(fixture_words: &[Word]) -> OperandKindCoverage {
     }
 }
 
+pub fn opcode_class_summary(class_name: &str) -> OpcodeClassSummary {
+    OpcodeClassSummary {
+        row_count: table::opcode_class_row_count(class_name),
+        mnemonics: sorted_unique(table::opcode_class_mnemonics(class_name)),
+    }
+}
+
 pub fn disassemble_at_with_symbols<F>(
     address: u64,
     word: Word,
@@ -103,39 +164,11 @@ pub fn disassemble_at_with_symbols<F>(
 where
     F: Fn(u64) -> Option<String>,
 {
-    let opcode = table::match_opcode(word)?;
-    let mnemonic = opcode.mnemonic();
-    let operands = opcode
-        .operands()
-        .into_iter()
-        .map(|kind| {
-            decode_operand(
-                kind,
-                DecodeContext {
-                    word,
-                    address,
-                    opcode: &opcode,
-                },
-            )
-            .unwrap_or(DecodedOperand::Unimplemented {
-                kind: "decode-error",
-            })
-        })
-        .collect();
-
-    let decoded = DecodedInstruction {
-        address,
-        word,
-        mnemonic,
-        operands,
-    };
-
-    let _ = symbol_for_address;
-    Some(decoded)
+    decode_instruction_with_symbols(address, word, symbol_for_address)
 }
 
 pub fn disassemble_at(address: u64, word: Word) -> Option<DecodedInstruction> {
-    disassemble_at_with_symbols(address, word, |_| None)
+    decode_instruction(address, word)
 }
 
 impl DecodedInstruction {
@@ -204,6 +237,13 @@ where
         }
         "fcmp" => format_operand_list(operands, Some("#")),
         "fmov" => format_operand_list(operands, Some("#")),
+        "scvtf" | "ucvtf" | "fcvtns" | "fcvtnu" | "fcvtas" | "fcvtau" | "fcvtps" | "fcvtpu"
+        | "fcvtms" | "fcvtmu" | "fcvtzs" | "fcvtzu" => format_operand_list(operands, Some("#")),
+        "svc" | "hvc" | "smc" | "brk" | "hlt" => format_exception_operands(operands),
+        "dcps1" | "dcps2" | "dcps3" => match operands.first() {
+            Some(DecodedOperand::Immediate(0)) | None => String::new(),
+            _ => format_exception_operands(operands),
+        },
         "ret" => match operands.first() {
             Some(DecodedOperand::Register(register)) if register.index == 30 => String::new(),
             Some(operand) => format_operand_with_symbols(operand, &symbol_for_address, None),
@@ -257,6 +297,17 @@ where
             .map(|operand| format_operand_with_symbols(operand, symbol_for_address, Some("#"))),
     );
     parts.join(", ")
+}
+
+fn format_exception_operands(operands: &[DecodedOperand]) -> String {
+    operands
+        .iter()
+        .map(|operand| match operand {
+            DecodedOperand::Immediate(0) => "#0".to_string(),
+            _ => format_operand_with_symbols(operand, &|_| None, Some("#")),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_operand_list(operands: &[DecodedOperand], immediate_prefix: Option<&str>) -> String {

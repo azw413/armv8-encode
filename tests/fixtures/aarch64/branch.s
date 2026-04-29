@@ -2,6 +2,7 @@
 .globl _fixture_branch
 _fixture_branch:
     b Ltarget
+    bl Ltarget
     b.eq Ltarget
     b.ne Ltarget
     tbz x0, #3, Ltarget
@@ -15,3 +16,5 @@ _fixture_branch:
     ccmp x10, #7, #0, lt
 Ltarget:
     ret
+    eret
+    drps

@@ -75,7 +75,7 @@ pub enum DecodedOperand {
     Memory(MemoryOperand),
     BranchTarget(u64),
     Condition(&'static str),
-    FloatImmediate(&'static str),
+    FloatImmediate(String),
     Unimplemented { kind: &'static str },
 }
 
@@ -120,14 +120,15 @@ impl OperandCodec for Aarch64Opnd {
         let _ = ctx.opcode.mnemonic();
 
         match self {
-            Aarch64Opnd::Rd => Ok(DecodedOperand::Register(x_reg(rd(ctx.word)))),
-            Aarch64Opnd::Rn => Ok(DecodedOperand::Register(x_reg(rn(ctx.word)))),
-            Aarch64Opnd::Rm => Ok(DecodedOperand::Register(x_reg(rm(ctx.word)))),
+            Aarch64Opnd::Rd => Ok(DecodedOperand::Register(rd_reg(ctx.word, ctx.opcode))),
+            Aarch64Opnd::Rn => Ok(DecodedOperand::Register(rn_reg(ctx.word, ctx.opcode))),
+            Aarch64Opnd::Rm => Ok(DecodedOperand::Register(rm_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::RmSft => Ok(DecodedOperand::ShiftedRegister(rm_shifted(ctx.word))),
             Aarch64Opnd::RdSp => Ok(DecodedOperand::Register(x_or_sp(rd(ctx.word)))),
             Aarch64Opnd::RnSp => Ok(DecodedOperand::Register(x_or_sp(rn(ctx.word)))),
             Aarch64Opnd::Rt => Ok(DecodedOperand::Register(rt_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::Rt2 => Ok(DecodedOperand::Register(x_reg(rt2(ctx.word)))),
+            Aarch64Opnd::Ra => Ok(DecodedOperand::Register(ra_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::Rs => Ok(DecodedOperand::Register(w_reg(rs(ctx.word)))),
             Aarch64Opnd::Fd => Ok(DecodedOperand::Register(fp_reg(rd(ctx.word), ctx.word))),
             Aarch64Opnd::Fn => Ok(DecodedOperand::Register(fp_reg(rn(ctx.word), ctx.word))),
@@ -148,12 +149,14 @@ impl OperandCodec for Aarch64Opnd {
                 ctx.word, ctx.opcode,
             ))),
             Aarch64Opnd::BitNum => Ok(DecodedOperand::Immediate(bit_num(ctx.word))),
+            Aarch64Opnd::Exc => Ok(DecodedOperand::Immediate(exc(ctx.word))),
             Aarch64Opnd::CcmpImm => Ok(DecodedOperand::Immediate(ccmp_imm(ctx.word))),
             Aarch64Opnd::Nzcv => Ok(DecodedOperand::Immediate(nzcv(ctx.word))),
             Aarch64Opnd::Cond => Ok(DecodedOperand::Condition(condition(ctx.word))),
             Aarch64Opnd::Cond1 => Ok(DecodedOperand::Condition(inverted_condition(ctx.word))),
-            Aarch64Opnd::Fpimm0 => Ok(DecodedOperand::FloatImmediate("0.0")),
+            Aarch64Opnd::Fpimm0 => Ok(DecodedOperand::FloatImmediate("0.0".to_string())),
             Aarch64Opnd::Fpimm => Ok(DecodedOperand::FloatImmediate(fpimm(ctx.word))),
+            Aarch64Opnd::Fbits => Ok(DecodedOperand::Immediate(fbits(ctx.word))),
             Aarch64Opnd::AddrSimm7 => Ok(DecodedOperand::Memory(MemoryOperand {
                 base: x_or_sp(rn(ctx.word)),
                 offset: MemoryOffset::Immediate(simm7_pair_offset(ctx.word)),
@@ -321,6 +324,7 @@ pub(crate) const IMPLEMENTED_OPERAND_KINDS: &[&str] = &[
     "RnSp",
     "Rt",
     "Rt2",
+    "Ra",
     "Rs",
     "Fd",
     "Fn",
@@ -334,12 +338,14 @@ pub(crate) const IMPLEMENTED_OPERAND_KINDS: &[&str] = &[
     "Imm",
     "Width",
     "BitNum",
+    "Exc",
     "CcmpImm",
     "Nzcv",
     "Cond",
     "Cond1",
     "Fpimm0",
     "Fpimm",
+    "Fbits",
     "AddrSimm7",
     "AddrSimple",
     "AddrRegoff",
@@ -389,6 +395,55 @@ fn rt_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
     }
 }
 
+fn rd_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
+    match opcode.mnemonic() {
+        "adr" | "adrp" => x_reg(rd(word)),
+        mnemonic if is_crc32(mnemonic) => w_reg(rd(word)),
+        _ => gp_reg(rd(word), word),
+    }
+}
+
+fn rn_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
+    if has_32_bit_multiply_inputs(opcode.mnemonic()) || is_crc32(opcode.mnemonic()) {
+        w_reg(rn(word))
+    } else {
+        gp_reg(rn(word), word)
+    }
+}
+
+fn rm_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
+    if has_32_bit_multiply_inputs(opcode.mnemonic()) || is_32_bit_crc32_source(opcode.mnemonic()) {
+        w_reg(rm(word))
+    } else {
+        gp_reg(rm(word), word)
+    }
+}
+
+fn ra_reg(word: Word, _opcode: &Aarch64Opcode) -> Register {
+    gp_reg(ra(word), word)
+}
+
+fn has_32_bit_multiply_inputs(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "smaddl" | "smsubl" | "smull" | "smnegl" | "umaddl" | "umsubl" | "umull" | "umnegl"
+    )
+}
+
+fn is_crc32(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "crc32b" | "crc32h" | "crc32w" | "crc32x" | "crc32cb" | "crc32ch" | "crc32cw" | "crc32cx"
+    )
+}
+
+fn is_32_bit_crc32_source(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "crc32b" | "crc32h" | "crc32w" | "crc32cb" | "crc32ch" | "crc32cw"
+    )
+}
+
 fn fp_reg(reg: u8, word: Word) -> Register {
     let class = if ((word >> 22) & 0x3) == 1 {
         RegisterClass::D
@@ -399,15 +454,31 @@ fn fp_reg(reg: u8, word: Word) -> Register {
     Register { class, index: reg }
 }
 
-fn fpimm(word: Word) -> &'static str {
-    match (word >> 13) & 0xff {
-        0x70 => "1.00000000",
-        _ => "<fpimm>",
-    }
+fn fpimm(word: Word) -> String {
+    let imm8 = (word >> 13) & 0xff;
+    let sign = if imm8 & 0x80 == 0 { 1.0 } else { -1.0 };
+    let high_exponent_bit = (imm8 >> 6) & 1;
+    let low_exponent_bits = ((imm8 >> 4) & 0x3) as i32;
+    let fraction = (imm8 & 0xf) as f64 / 16.0;
+    let exponent = if high_exponent_bit == 0 {
+        low_exponent_bits + 1
+    } else {
+        low_exponent_bits - 3
+    };
+
+    format!("{:.8}", sign * (1.0 + fraction) * 2f64.powi(exponent))
+}
+
+fn fbits(word: Word) -> i64 {
+    64 - ((word >> 10) & 0x3f) as i64
 }
 
 fn bit_num(word: Word) -> i64 {
     ((((word >> 31) & 1) << 5) | ((word >> 19) & 0x1f)) as i64
+}
+
+fn exc(word: Word) -> i64 {
+    ((word >> 5) & 0xffff) as i64
 }
 
 fn ccmp_imm(word: Word) -> i64 {
@@ -458,7 +529,7 @@ fn aimm(word: Word) -> i64 {
 
 fn rm_shifted(word: Word) -> ShiftedRegister {
     ShiftedRegister {
-        register: x_reg(rm(word)),
+        register: gp_reg(rm(word), word),
         shift: Shift {
             kind: match (word >> 22) & 0x3 {
                 0 => ShiftKind::Lsl,
@@ -643,6 +714,14 @@ fn x_reg(reg: u8) -> Register {
     Register {
         class: RegisterClass::X,
         index: reg,
+    }
+}
+
+fn gp_reg(reg: u8, word: Word) -> Register {
+    if (word >> 31) & 1 == 0 {
+        w_reg(reg)
+    } else {
+        x_reg(reg)
     }
 }
 
