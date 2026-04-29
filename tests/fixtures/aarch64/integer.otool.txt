@@ -1,0 +1,19 @@
+# Generated from tests/fixtures/aarch64/integer.s with:
+#   clang -target arm64-apple-macos -c integer.s -o integer.o
+#   otool -s __TEXT __text integer.o
+#   otool -tvV integer.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 8b060ca4 add x4, x5, x6, lsl #3
+0000000000000004 92401ce7 and x7, x7, #0xff
+0000000000000008 d2781d08 eor x8, x8, #0xff00
+000000000000000c d2824689 mov x9, #0x1234
+0000000000000010 f2b579a9 movk x9, #0xabcd, lsl #16
+0000000000000014 92800aaa mov x10, #-0x56
+0000000000000018 d3485d8b ubfx x11, x12, #8, #16
+000000000000001c b3443dcd bfxil x13, x14, #4, #12
+0000000000000020 d37bea0f lsl x15, x16, #5
+0000000000000024 d346fe51 lsr x17, x18, #6
+0000000000000028 10000033 adr x19, #4
+000000000000002c d503201f nop

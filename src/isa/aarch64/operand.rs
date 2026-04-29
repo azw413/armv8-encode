@@ -9,8 +9,35 @@ pub struct Register {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RegisterClass {
+    W,
     X,
     XOrSp,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ShiftedRegister {
+    pub register: Register,
+    pub shift: Shift,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct Shift {
+    pub kind: ShiftKind,
+    pub amount: u8,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ShiftKind {
+    Lsl,
+    Lsr,
+    Asr,
+    Ror,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ShiftedImmediate {
+    pub value: i64,
+    pub shift: u8,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -30,9 +57,12 @@ pub enum AddressingMode {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DecodedOperand {
     Register(Register),
+    ShiftedRegister(ShiftedRegister),
     Immediate(i64),
+    ShiftedImmediate(ShiftedImmediate),
     Memory(MemoryOperand),
     BranchTarget(u64),
+    Condition(&'static str),
     Unimplemented { kind: &'static str },
 }
 
@@ -80,16 +110,37 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Rd => Ok(DecodedOperand::Register(x_reg(rd(ctx.word)))),
             Aarch64Opnd::Rn => Ok(DecodedOperand::Register(x_reg(rn(ctx.word)))),
             Aarch64Opnd::Rm => Ok(DecodedOperand::Register(x_reg(rm(ctx.word)))),
+            Aarch64Opnd::RmSft => Ok(DecodedOperand::ShiftedRegister(rm_shifted(ctx.word))),
             Aarch64Opnd::RdSp => Ok(DecodedOperand::Register(x_or_sp(rd(ctx.word)))),
             Aarch64Opnd::RnSp => Ok(DecodedOperand::Register(x_or_sp(rn(ctx.word)))),
             Aarch64Opnd::Rt => Ok(DecodedOperand::Register(x_reg(rt(ctx.word)))),
             Aarch64Opnd::Rt2 => Ok(DecodedOperand::Register(x_reg(rt2(ctx.word)))),
             Aarch64Opnd::Aimm => Ok(DecodedOperand::Immediate(aimm(ctx.word))),
+            Aarch64Opnd::Limm => Ok(DecodedOperand::Immediate(
+                logical_immediate(ctx.word).ok_or(DecodeError::InvalidOperand("Limm"))? as i64,
+            )),
+            Aarch64Opnd::Half => Ok(DecodedOperand::ShiftedImmediate(half(ctx.word))),
+            Aarch64Opnd::ImmMov => Ok(DecodedOperand::Immediate(imm_mov(ctx.word))),
+            Aarch64Opnd::Imm => Ok(DecodedOperand::Immediate(bitfield_imm(
+                ctx.word, ctx.opcode,
+            ))),
+            Aarch64Opnd::Width => Ok(DecodedOperand::Immediate(bitfield_width(
+                ctx.word, ctx.opcode,
+            ))),
+            Aarch64Opnd::BitNum => Ok(DecodedOperand::Immediate(bit_num(ctx.word))),
+            Aarch64Opnd::CcmpImm => Ok(DecodedOperand::Immediate(ccmp_imm(ctx.word))),
+            Aarch64Opnd::Nzcv => Ok(DecodedOperand::Immediate(nzcv(ctx.word))),
+            Aarch64Opnd::Cond => Ok(DecodedOperand::Condition(condition(ctx.word))),
+            Aarch64Opnd::Cond1 => Ok(DecodedOperand::Condition(inverted_condition(ctx.word))),
             Aarch64Opnd::AddrSimm7 => Ok(DecodedOperand::Memory(MemoryOperand {
                 base: x_or_sp(rn(ctx.word)),
                 offset: simm7_pair_offset(ctx.word),
                 mode: pair_addressing_mode(ctx.word),
             })),
+            Aarch64Opnd::AddrPcrel14 => Ok(DecodedOperand::BranchTarget(branch_target(
+                ctx.address,
+                imm14(ctx.word),
+            ))),
             Aarch64Opnd::AddrPcrel19 => Ok(DecodedOperand::BranchTarget(branch_target(
                 ctx.address,
                 imm19(ctx.word),
@@ -98,6 +149,7 @@ impl OperandCodec for Aarch64Opnd {
                 ctx.address,
                 imm26(ctx.word),
             ))),
+            Aarch64Opnd::AddrPcrel21 => Ok(DecodedOperand::Immediate(imm21(ctx.word))),
             _ => Ok(DecodedOperand::Unimplemented { kind: self.name() }),
         }
     }
@@ -219,13 +271,26 @@ pub(crate) const IMPLEMENTED_OPERAND_KINDS: &[&str] = &[
     "Rd",
     "Rn",
     "Rm",
+    "RmSft",
     "RdSp",
     "RnSp",
     "Rt",
     "Rt2",
     "Aimm",
+    "Limm",
+    "Half",
+    "ImmMov",
+    "Imm",
+    "Width",
+    "BitNum",
+    "CcmpImm",
+    "Nzcv",
+    "Cond",
+    "Cond1",
     "AddrSimm7",
+    "AddrPcrel14",
     "AddrPcrel19",
+    "AddrPcrel21",
     "AddrPcrel26",
 ];
 
@@ -249,6 +314,47 @@ fn rt2(word: Word) -> u8 {
     ((word >> 10) & 0x1f) as u8
 }
 
+fn bit_num(word: Word) -> i64 {
+    ((((word >> 31) & 1) << 5) | ((word >> 19) & 0x1f)) as i64
+}
+
+fn ccmp_imm(word: Word) -> i64 {
+    ((word >> 16) & 0x1f) as i64
+}
+
+fn nzcv(word: Word) -> i64 {
+    (word & 0xf) as i64
+}
+
+fn condition(word: Word) -> &'static str {
+    condition_name(((word >> 12) & 0xf) as u8)
+}
+
+fn inverted_condition(word: Word) -> &'static str {
+    condition_name((((word >> 12) & 0xf) as u8) ^ 1)
+}
+
+fn condition_name(condition: u8) -> &'static str {
+    match condition {
+        0x0 => "eq",
+        0x1 => "ne",
+        0x2 => "hs",
+        0x3 => "lo",
+        0x4 => "mi",
+        0x5 => "pl",
+        0x6 => "vs",
+        0x7 => "vc",
+        0x8 => "hi",
+        0x9 => "ls",
+        0xa => "ge",
+        0xb => "lt",
+        0xc => "gt",
+        0xd => "le",
+        0xe => "al",
+        _ => "nv",
+    }
+}
+
 fn aimm(word: Word) -> i64 {
     let imm = ((word >> 10) & 0xfff) as i64;
     if (word >> 22) & 1 == 0 {
@@ -258,8 +364,127 @@ fn aimm(word: Word) -> i64 {
     }
 }
 
+fn rm_shifted(word: Word) -> ShiftedRegister {
+    ShiftedRegister {
+        register: x_reg(rm(word)),
+        shift: Shift {
+            kind: match (word >> 22) & 0x3 {
+                0 => ShiftKind::Lsl,
+                1 => ShiftKind::Lsr,
+                2 => ShiftKind::Asr,
+                _ => ShiftKind::Ror,
+            },
+            amount: ((word >> 10) & 0x3f) as u8,
+        },
+    }
+}
+
+fn half(word: Word) -> ShiftedImmediate {
+    ShiftedImmediate {
+        value: ((word >> 5) & 0xffff) as i64,
+        shift: (((word >> 21) & 0x3) * 16) as u8,
+    }
+}
+
+fn imm_mov(word: Word) -> i64 {
+    let value = ((word >> 5) & 0xffff) as i64;
+    let shift = (((word >> 21) & 0x3) * 16) as u8;
+    let shifted = value << shift;
+
+    match (word >> 29) & 0x3 {
+        0 => !shifted,
+        _ => shifted,
+    }
+}
+
+fn bitfield_imm(word: Word, opcode: &Aarch64Opcode) -> i64 {
+    let immr = ((word >> 16) & 0x3f) as i64;
+    let imms = ((word >> 10) & 0x3f) as i64;
+
+    match opcode.mnemonic() {
+        "lsl" => 63 - imms,
+        "lsr" | "asr" => immr,
+        "ubfx" | "bfxil" => immr,
+        _ => immr,
+    }
+}
+
+fn bitfield_width(word: Word, opcode: &Aarch64Opcode) -> i64 {
+    let immr = ((word >> 16) & 0x3f) as i64;
+    let imms = ((word >> 10) & 0x3f) as i64;
+
+    match opcode.mnemonic() {
+        "ubfx" | "bfxil" => imms - immr + 1,
+        _ => imms + 1,
+    }
+}
+
+fn logical_immediate(word: Word) -> Option<u64> {
+    let n = ((word >> 22) & 1) as u8;
+    let immr = ((word >> 16) & 0x3f) as u8;
+    let imms = ((word >> 10) & 0x3f) as u8;
+    let value = ((n as u8) << 6) | (!imms & 0x3f);
+    let len = highest_set_bit(value)?;
+    let size = 1u32 << len;
+    let levels = size - 1;
+    let s = (imms as u32) & levels;
+    let r = (immr as u32) & levels;
+
+    if s == levels {
+        return None;
+    }
+
+    let pattern = ones(s + 1);
+    let rotated = rotate_right_with_width(pattern, r, size);
+    Some(replicate(rotated, size))
+}
+
+fn highest_set_bit(value: u8) -> Option<u32> {
+    (0..=6).rev().find(|bit| value & (1 << bit) != 0)
+}
+
+fn ones(width: u32) -> u64 {
+    if width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
+fn rotate_right_with_width(value: u64, rotate: u32, width: u32) -> u64 {
+    let mask = ones(width);
+    let rotate = rotate % width;
+    if rotate == 0 {
+        return value & mask;
+    }
+
+    ((value >> rotate) | (value << (width - rotate))) & mask
+}
+
+fn replicate(value: u64, width: u32) -> u64 {
+    let mut result = 0;
+    let mut shift = 0;
+
+    while shift < 64 {
+        result |= value << shift;
+        shift += width;
+    }
+
+    result
+}
+
 fn imm19(word: Word) -> i64 {
     sign_extend(((word >> 5) & 0x7ffff) as i64, 19) << 2
+}
+
+fn imm14(word: Word) -> i64 {
+    sign_extend(((word >> 5) & 0x3fff) as i64, 14) << 2
+}
+
+fn imm21(word: Word) -> i64 {
+    let immlo = ((word >> 29) & 0x3) as i64;
+    let immhi = ((word >> 5) & 0x7ffff) as i64;
+    sign_extend((immhi << 2) | immlo, 21)
 }
 
 fn imm26(word: Word) -> i64 {
@@ -290,6 +515,13 @@ fn branch_target(address: u64, offset: i64) -> u64 {
 fn x_reg(reg: u8) -> Register {
     Register {
         class: RegisterClass::X,
+        index: reg,
+    }
+}
+
+pub(crate) fn w_reg(reg: u8) -> Register {
+    Register {
+        class: RegisterClass::W,
         index: reg,
     }
 }

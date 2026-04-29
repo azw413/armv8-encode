@@ -1,0 +1,20 @@
+# Generated from tests/fixtures/aarch64/branch.s with:
+#   clang -target arm64-apple-macos -c branch.s -o branch.o
+#   otool -s __TEXT __text branch.o
+#   otool -tvV branch.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 1400000c b 0x30
+0000000000000004 54000160 b.eq 0x30
+0000000000000008 54000141 b.ne 0x30
+000000000000000c 36180120 tbz w0, #0x3, 0x30
+0000000000000010 37200101 tbnz w1, #0x4, 0x30
+0000000000000014 d61f0040 br x2
+0000000000000018 d63f0060 blr x3
+000000000000001c d65f0080 ret x4
+0000000000000020 9a8700c5 csel x5, x6, x7, eq
+0000000000000024 9a890528 cinc x8, x9, ne
+0000000000000028 fa4bb140 ccmp x10, x11, #0x0, lt
+000000000000002c fa47b940 ccmp x10, #0x7, #0x0, lt
+0000000000000030 d65f03c0 ret

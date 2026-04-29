@@ -362,6 +362,14 @@ impl Aarch64Opcode {
         self.name
     }
 
+    fn is_alias(&self) -> bool {
+        self.flags & F_ALIAS != 0
+    }
+
+    fn is_conversion_alias(&self) -> bool {
+        self.flags & F_CONV != 0
+    }
+
     pub(crate) fn operands(&self) -> Vec<Aarch64Opnd> {
         match self.operands {
             Operands::Op0 => Vec::new(),
@@ -9343,9 +9351,12 @@ pub(crate) fn match_opcode(instruction: Aarch64Insn) -> Option<Aarch64Opcode> {
         if instruction & opcode.mask != opcode.opcode {
             continue;
         }
+        if !alias_applies(instruction, opcode) {
+            continue;
+        }
 
         let replace = best
-            .map(|current| opcode.mask.count_ones() >= current.mask.count_ones())
+            .map(|current| should_replace_match(current, opcode))
             .unwrap_or(true);
 
         if replace {
@@ -9354,6 +9365,43 @@ pub(crate) fn match_opcode(instruction: Aarch64Insn) -> Option<Aarch64Opcode> {
     }
 
     best.copied()
+}
+
+fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
+    let immr = (instruction >> 16) & 0x3f;
+    let imms = (instruction >> 10) & 0x3f;
+    let sf = (instruction >> 31) & 1 != 0;
+    let max = if sf { 63 } else { 31 };
+
+    match opcode.name {
+        "ubfiz" | "bfi" => imms < immr,
+        "ubfx" | "bfxil" => imms >= immr,
+        "lsl" => imms + 1 == immr,
+        "lsr" | "asr" => imms == max,
+        _ => true,
+    }
+}
+
+fn should_replace_match(current: &Aarch64Opcode, candidate: &Aarch64Opcode) -> bool {
+    let current_bits = current.mask.count_ones();
+    let candidate_bits = candidate.mask.count_ones();
+
+    if candidate_bits != current_bits {
+        return candidate_bits > current_bits;
+    }
+
+    if candidate.is_conversion_alias() != current.is_conversion_alias() {
+        return candidate.is_conversion_alias();
+    }
+    if candidate.is_conversion_alias() && current.is_conversion_alias() {
+        return true;
+    }
+
+    if candidate.is_alias() != current.is_alias() {
+        return !candidate.is_alias();
+    }
+
+    false
 }
 
 pub(crate) fn disassemble(instructions: &[u32]) -> Vec<Aarch64Opcode> {

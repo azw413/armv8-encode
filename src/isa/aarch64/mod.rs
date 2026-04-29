@@ -8,10 +8,10 @@ mod operand;
 mod simple;
 pub(crate) mod table;
 
-use operand::{decode_operand, DecodeContext, IMPLEMENTED_OPERAND_KINDS};
+use operand::{decode_operand, w_reg, DecodeContext, IMPLEMENTED_OPERAND_KINDS};
 pub use operand::{
     AddressingMode, DecodeError, DecodedOperand, EncodeError, MemoryOperand, Register,
-    RegisterClass,
+    RegisterClass, Shift, ShiftKind, ShiftedImmediate, ShiftedRegister,
 };
 pub use simple::{decode, encode, Instruction};
 
@@ -139,6 +139,26 @@ pub fn disassemble_at(address: u64, word: Word) -> Option<DecodedInstruction> {
 }
 
 impl DecodedInstruction {
+    pub fn format_mnemonic(&self) -> String {
+        match self.mnemonic {
+            "beq" => "b.eq".to_string(),
+            "bne" => "b.ne".to_string(),
+            "bcs" => "b.hs".to_string(),
+            "bcc" => "b.lo".to_string(),
+            "bmi" => "b.mi".to_string(),
+            "bpl" => "b.pl".to_string(),
+            "bvs" => "b.vs".to_string(),
+            "bvc" => "b.vc".to_string(),
+            "bhi" => "b.hi".to_string(),
+            "bls" => "b.ls".to_string(),
+            "bge" => "b.ge".to_string(),
+            "blt" => "b.lt".to_string(),
+            "bgt" => "b.gt".to_string(),
+            "ble" => "b.le".to_string(),
+            mnemonic => mnemonic.to_string(),
+        }
+    }
+
     pub fn format_operands_with_symbols<F>(&self, symbol_for_address: F) -> String
     where
         F: Fn(u64) -> Option<String>,
@@ -158,17 +178,31 @@ where
     match mnemonic {
         "add" | "sub" => format_operand_list(operands, Some("#")),
         "adc" | "adcs" | "sbc" | "sbcs" => format_operand_list(operands, None),
+        "and" | "eor" | "orr" | "ands" => format_operand_list(operands, Some("#")),
+        "movk" | "movz" | "movn" => format_operand_list(operands, Some("#")),
+        "ubfx" | "bfxil" | "lsl" | "lsr" | "asr" => {
+            format_operand_list_decimal(operands, Some("#"))
+        }
+        "adr" => format_operand_list_decimal(operands, Some("#")),
+        "mov" if operands.iter().any(is_immediate_operand) => {
+            format_operand_list(operands, Some("#"))
+        }
         "mov" => format_operand_list(operands, None),
         "cbz" => format_operand_list_with_symbols(operands, &symbol_for_address),
-        "bl" => operands
+        "b" | "beq" | "bne" | "bcs" | "bcc" | "bmi" | "bpl" | "bvs" | "bvc" | "bhi" | "bls"
+        | "bge" | "blt" | "bgt" | "ble" | "bl" => operands
             .first()
             .map(|operand| format_operand_with_symbols(operand, &symbol_for_address, None))
             .unwrap_or_default(),
+        "tbz" | "tbnz" => format_test_branch_operands(operands, &symbol_for_address),
+        "br" | "blr" => format_operand_list(operands, None),
         "ret" => match operands.first() {
             Some(DecodedOperand::Register(register)) if register.index == 30 => String::new(),
             Some(operand) => format_operand_with_symbols(operand, &symbol_for_address, None),
             None => String::new(),
         },
+        "csel" | "cinc" => format_operand_list(operands, None),
+        "ccmp" | "ccmn" => format_operand_list(operands, Some("#")),
         "stp" | "ldp" => {
             let Some((first, rest)) = operands.split_first() else {
                 return String::new();
@@ -195,12 +229,52 @@ where
     }
 }
 
+fn format_test_branch_operands<F>(operands: &[DecodedOperand], symbol_for_address: &F) -> String
+where
+    F: Fn(u64) -> Option<String>,
+{
+    let Some((first, rest)) = operands.split_first() else {
+        return String::new();
+    };
+    let formatted_first = match first {
+        DecodedOperand::Register(register) if register.index < 32 => {
+            format_register(&w_reg(register.index))
+        }
+        _ => format_operand_with_symbols(first, symbol_for_address, None),
+    };
+
+    let mut parts = vec![formatted_first];
+    parts.extend(
+        rest.iter()
+            .map(|operand| format_operand_with_symbols(operand, symbol_for_address, Some("#"))),
+    );
+    parts.join(", ")
+}
+
 fn format_operand_list(operands: &[DecodedOperand], immediate_prefix: Option<&str>) -> String {
     operands
         .iter()
         .map(|operand| format_operand_with_symbols(operand, &|_| None, immediate_prefix))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_operand_list_decimal(
+    operands: &[DecodedOperand],
+    immediate_prefix: Option<&str>,
+) -> String {
+    operands
+        .iter()
+        .map(|operand| format_operand_decimal(operand, immediate_prefix))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn is_immediate_operand(operand: &DecodedOperand) -> bool {
+    matches!(
+        operand,
+        DecodedOperand::Immediate(_) | DecodedOperand::ShiftedImmediate(_)
+    )
 }
 
 fn format_operand_list_with_symbols<F>(
@@ -227,14 +301,39 @@ where
 {
     match operand {
         DecodedOperand::Register(register) => format_register(register),
+        DecodedOperand::ShiftedRegister(shifted) => {
+            let register = format_register(&shifted.register);
+            if shifted.shift.amount == 0 {
+                register
+            } else {
+                format!(
+                    "{register}, {} #{}",
+                    format_shift_kind(shifted.shift.kind),
+                    shifted.shift.amount
+                )
+            }
+        }
         DecodedOperand::Immediate(value) => format!(
             "{}{}",
             immediate_prefix.unwrap_or_default(),
             format_hex(*value)
         ),
+        DecodedOperand::ShiftedImmediate(immediate) => {
+            let value = format!(
+                "{}{}",
+                immediate_prefix.unwrap_or_default(),
+                format_hex(immediate.value)
+            );
+            if immediate.shift == 0 {
+                value
+            } else {
+                format!("{value}, lsl #{}", immediate.shift)
+            }
+        }
         DecodedOperand::BranchTarget(target) => {
             symbol_for_address(*target).unwrap_or_else(|| format!("0x{target:x}"))
         }
+        DecodedOperand::Condition(condition) => condition.to_string(),
         DecodedOperand::Memory(memory) => {
             let base = format_register(&memory.base);
             let offset = format_hex(memory.offset);
@@ -248,8 +347,27 @@ where
     }
 }
 
+fn format_operand_decimal(operand: &DecodedOperand, immediate_prefix: Option<&str>) -> String {
+    match operand {
+        DecodedOperand::Immediate(value) => {
+            format!("{}{}", immediate_prefix.unwrap_or_default(), value)
+        }
+        _ => format_operand_with_symbols(operand, &|_| None, immediate_prefix),
+    }
+}
+
+fn format_shift_kind(kind: ShiftKind) -> &'static str {
+    match kind {
+        ShiftKind::Lsl => "lsl",
+        ShiftKind::Lsr => "lsr",
+        ShiftKind::Asr => "asr",
+        ShiftKind::Ror => "ror",
+    }
+}
+
 fn format_register(register: &Register) -> String {
     match register.class {
+        RegisterClass::W => format!("w{}", register.index),
         RegisterClass::X => format!("x{}", register.index),
         RegisterClass::XOrSp if register.index == 31 => "sp".to_string(),
         RegisterClass::XOrSp => format!("x{}", register.index),

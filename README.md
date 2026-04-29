@@ -124,6 +124,10 @@ The initial fixture records a small function as:
 - source assembly: `basic.s`
 - encoded instruction words plus `otool` mnemonics: `basic.otool.txt`
 
+Additional focused fixtures, such as `integer.s`, widen coverage by operand
+family. Each fixture should stay small enough that a mismatch points at a
+specific instruction class or operand decoder.
+
 The test harness parses the encoded words and checks that the ISA table matcher
 selects the same mnemonic as `otool`. These tests currently validate opcode
 matching only; operand decoding and full formatted disassembly are later
