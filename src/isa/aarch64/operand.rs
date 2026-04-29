@@ -9,6 +9,8 @@ pub struct Register {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RegisterClass {
+    S,
+    D,
     W,
     X,
     XOrSp,
@@ -43,8 +45,18 @@ pub struct ShiftedImmediate {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MemoryOperand {
     pub base: Register,
-    pub offset: i64,
+    pub offset: MemoryOffset,
     pub mode: AddressingMode,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MemoryOffset {
+    None,
+    Immediate(i64),
+    Register {
+        register: Register,
+        shift: Option<Shift>,
+    },
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -63,6 +75,7 @@ pub enum DecodedOperand {
     Memory(MemoryOperand),
     BranchTarget(u64),
     Condition(&'static str),
+    FloatImmediate(&'static str),
     Unimplemented { kind: &'static str },
 }
 
@@ -113,8 +126,15 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::RmSft => Ok(DecodedOperand::ShiftedRegister(rm_shifted(ctx.word))),
             Aarch64Opnd::RdSp => Ok(DecodedOperand::Register(x_or_sp(rd(ctx.word)))),
             Aarch64Opnd::RnSp => Ok(DecodedOperand::Register(x_or_sp(rn(ctx.word)))),
-            Aarch64Opnd::Rt => Ok(DecodedOperand::Register(x_reg(rt(ctx.word)))),
+            Aarch64Opnd::Rt => Ok(DecodedOperand::Register(rt_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::Rt2 => Ok(DecodedOperand::Register(x_reg(rt2(ctx.word)))),
+            Aarch64Opnd::Rs => Ok(DecodedOperand::Register(w_reg(rs(ctx.word)))),
+            Aarch64Opnd::Fd => Ok(DecodedOperand::Register(fp_reg(rd(ctx.word), ctx.word))),
+            Aarch64Opnd::Fn => Ok(DecodedOperand::Register(fp_reg(rn(ctx.word), ctx.word))),
+            Aarch64Opnd::Fm => Ok(DecodedOperand::Register(fp_reg(rm(ctx.word), ctx.word))),
+            Aarch64Opnd::Fa => Ok(DecodedOperand::Register(fp_reg(ra(ctx.word), ctx.word))),
+            Aarch64Opnd::Ft => Ok(DecodedOperand::Register(fp_reg(rt(ctx.word), ctx.word))),
+            Aarch64Opnd::Ft2 => Ok(DecodedOperand::Register(fp_reg(rt2(ctx.word), ctx.word))),
             Aarch64Opnd::Aimm => Ok(DecodedOperand::Immediate(aimm(ctx.word))),
             Aarch64Opnd::Limm => Ok(DecodedOperand::Immediate(
                 logical_immediate(ctx.word).ok_or(DecodeError::InvalidOperand("Limm"))? as i64,
@@ -132,10 +152,35 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Nzcv => Ok(DecodedOperand::Immediate(nzcv(ctx.word))),
             Aarch64Opnd::Cond => Ok(DecodedOperand::Condition(condition(ctx.word))),
             Aarch64Opnd::Cond1 => Ok(DecodedOperand::Condition(inverted_condition(ctx.word))),
+            Aarch64Opnd::Fpimm0 => Ok(DecodedOperand::FloatImmediate("0.0")),
+            Aarch64Opnd::Fpimm => Ok(DecodedOperand::FloatImmediate(fpimm(ctx.word))),
             Aarch64Opnd::AddrSimm7 => Ok(DecodedOperand::Memory(MemoryOperand {
                 base: x_or_sp(rn(ctx.word)),
-                offset: simm7_pair_offset(ctx.word),
+                offset: MemoryOffset::Immediate(simm7_pair_offset(ctx.word)),
                 mode: pair_addressing_mode(ctx.word),
+            })),
+            Aarch64Opnd::AddrSimple => Ok(DecodedOperand::Memory(MemoryOperand {
+                base: x_or_sp(rn(ctx.word)),
+                offset: MemoryOffset::None,
+                mode: AddressingMode::Offset,
+            })),
+            Aarch64Opnd::AddrRegoff => Ok(DecodedOperand::Memory(MemoryOperand {
+                base: x_or_sp(rn(ctx.word)),
+                offset: MemoryOffset::Register {
+                    register: x_reg(rm(ctx.word)),
+                    shift: regoff_shift(ctx.word),
+                },
+                mode: AddressingMode::Offset,
+            })),
+            Aarch64Opnd::AddrSimm9 => Ok(DecodedOperand::Memory(MemoryOperand {
+                base: x_or_sp(rn(ctx.word)),
+                offset: MemoryOffset::Immediate(simm9_offset(ctx.word)),
+                mode: simm9_addressing_mode(ctx.word),
+            })),
+            Aarch64Opnd::AddrUimm12 => Ok(DecodedOperand::Memory(MemoryOperand {
+                base: x_or_sp(rn(ctx.word)),
+                offset: MemoryOffset::Immediate(uimm12_offset(ctx.word)),
+                mode: AddressingMode::Offset,
             })),
             Aarch64Opnd::AddrPcrel14 => Ok(DecodedOperand::BranchTarget(branch_target(
                 ctx.address,
@@ -276,6 +321,12 @@ pub(crate) const IMPLEMENTED_OPERAND_KINDS: &[&str] = &[
     "RnSp",
     "Rt",
     "Rt2",
+    "Rs",
+    "Fd",
+    "Fn",
+    "Fm",
+    "Fa",
+    "Ft",
     "Aimm",
     "Limm",
     "Half",
@@ -287,7 +338,13 @@ pub(crate) const IMPLEMENTED_OPERAND_KINDS: &[&str] = &[
     "Nzcv",
     "Cond",
     "Cond1",
+    "Fpimm0",
+    "Fpimm",
     "AddrSimm7",
+    "AddrSimple",
+    "AddrRegoff",
+    "AddrSimm9",
+    "AddrUimm12",
     "AddrPcrel14",
     "AddrPcrel19",
     "AddrPcrel21",
@@ -312,6 +369,41 @@ fn rt(word: Word) -> u8 {
 
 fn rt2(word: Word) -> u8 {
     ((word >> 10) & 0x1f) as u8
+}
+
+fn rs(word: Word) -> u8 {
+    ((word >> 16) & 0x1f) as u8
+}
+
+fn ra(word: Word) -> u8 {
+    ((word >> 10) & 0x1f) as u8
+}
+
+fn rt_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
+    match opcode.mnemonic() {
+        "str" | "ldr" if ((word >> 26) & 0x3f) == 0b111101 => fp_reg(rt(word), word),
+        "ldr" if (word >> 31) & 1 == 0 && (word >> 30) & 1 == 0 => w_reg(rt(word)),
+        "str" | "ldr" if ((word >> 30) & 0x3) == 0b10 => w_reg(rt(word)),
+        "strb" | "ldrb" | "strh" | "ldrh" => w_reg(rt(word)),
+        _ => x_reg(rt(word)),
+    }
+}
+
+fn fp_reg(reg: u8, word: Word) -> Register {
+    let class = if ((word >> 22) & 0x3) == 1 {
+        RegisterClass::D
+    } else {
+        RegisterClass::S
+    };
+
+    Register { class, index: reg }
+}
+
+fn fpimm(word: Word) -> &'static str {
+    match (word >> 13) & 0xff {
+        0x70 => "1.00000000",
+        _ => "<fpimm>",
+    }
 }
 
 fn bit_num(word: Word) -> i64 {
@@ -493,6 +585,41 @@ fn imm26(word: Word) -> i64 {
 
 fn simm7_pair_offset(word: Word) -> i64 {
     sign_extend(((word >> 15) & 0x7f) as i64, 7) << 3
+}
+
+fn simm9_offset(word: Word) -> i64 {
+    sign_extend(((word >> 12) & 0x1ff) as i64, 9)
+}
+
+fn simm9_addressing_mode(word: Word) -> AddressingMode {
+    match (word >> 10) & 0x3 {
+        0b01 => AddressingMode::PostIndex,
+        0b11 => AddressingMode::PreIndex,
+        _ => AddressingMode::Offset,
+    }
+}
+
+fn uimm12_offset(word: Word) -> i64 {
+    let size = ((word >> 30) & 0x3) as i64;
+    let imm = ((word >> 10) & 0xfff) as i64;
+    imm << size
+}
+
+fn regoff_shift(word: Word) -> Option<Shift> {
+    let amount = if (word >> 12) & 1 == 0 {
+        0
+    } else {
+        ((word >> 30) & 0x3) as u8
+    };
+
+    if amount == 0 {
+        None
+    } else {
+        Some(Shift {
+            kind: ShiftKind::Lsl,
+            amount,
+        })
+    }
 }
 
 fn pair_addressing_mode(word: Word) -> AddressingMode {

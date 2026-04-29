@@ -10,8 +10,8 @@ pub(crate) mod table;
 
 use operand::{decode_operand, w_reg, DecodeContext, IMPLEMENTED_OPERAND_KINDS};
 pub use operand::{
-    AddressingMode, DecodeError, DecodedOperand, EncodeError, MemoryOperand, Register,
-    RegisterClass, Shift, ShiftKind, ShiftedImmediate, ShiftedRegister,
+    AddressingMode, DecodeError, DecodedOperand, EncodeError, MemoryOffset, MemoryOperand,
+    Register, RegisterClass, Shift, ShiftKind, ShiftedImmediate, ShiftedRegister,
 };
 pub use simple::{decode, encode, Instruction};
 
@@ -196,6 +196,14 @@ where
             .unwrap_or_default(),
         "tbz" | "tbnz" => format_test_branch_operands(operands, &symbol_for_address),
         "br" | "blr" => format_operand_list(operands, None),
+        "ldr" | "str" | "ldrsw" | "ldxr" | "stxr" | "ldur" | "stur" => {
+            format_operand_list(operands, None)
+        }
+        "fadd" | "fsub" | "fmul" | "fdiv" | "fmadd" | "fmsub" | "fcsel" => {
+            format_operand_list(operands, None)
+        }
+        "fcmp" => format_operand_list(operands, Some("#")),
+        "fmov" => format_operand_list(operands, Some("#")),
         "ret" => match operands.first() {
             Some(DecodedOperand::Register(register)) if register.index == 30 => String::new(),
             Some(operand) => format_operand_with_symbols(operand, &symbol_for_address, None),
@@ -334,13 +342,33 @@ where
             symbol_for_address(*target).unwrap_or_else(|| format!("0x{target:x}"))
         }
         DecodedOperand::Condition(condition) => condition.to_string(),
+        DecodedOperand::FloatImmediate(value) => {
+            format!("{}{}", immediate_prefix.unwrap_or_default(), value)
+        }
         DecodedOperand::Memory(memory) => {
             let base = format_register(&memory.base);
-            let offset = format_hex(memory.offset);
-            match memory.mode {
-                AddressingMode::Offset => format!("[{base}, #{offset}]"),
-                AddressingMode::PreIndex => format!("[{base}, #{offset}]!"),
-                AddressingMode::PostIndex => format!("[{base}], #{offset}"),
+            match (&memory.offset, memory.mode) {
+                (MemoryOffset::None, _) => format!("[{base}]"),
+                (MemoryOffset::Immediate(offset), AddressingMode::Offset) => {
+                    format!("[{base}, #{}]", format_hex(*offset))
+                }
+                (MemoryOffset::Immediate(offset), AddressingMode::PreIndex) => {
+                    format!("[{base}, #{}]!", format_hex(*offset))
+                }
+                (MemoryOffset::Immediate(offset), AddressingMode::PostIndex) => {
+                    format!("[{base}], #{}", format_hex(*offset))
+                }
+                (MemoryOffset::Register { register, shift }, _) => {
+                    let register = format_register(register);
+                    match shift {
+                        Some(shift) => format!(
+                            "[{base}, {register}, {} #{}]",
+                            format_shift_kind(shift.kind),
+                            shift.amount
+                        ),
+                        None => format!("[{base}, {register}]"),
+                    }
+                }
             }
         }
         DecodedOperand::Unimplemented { kind } => format!("<unimplemented:{kind}>"),
@@ -367,6 +395,8 @@ fn format_shift_kind(kind: ShiftKind) -> &'static str {
 
 fn format_register(register: &Register) -> String {
     match register.class {
+        RegisterClass::S => format!("s{}", register.index),
+        RegisterClass::D => format!("d{}", register.index),
         RegisterClass::W => format!("w{}", register.index),
         RegisterClass::X => format!("x{}", register.index),
         RegisterClass::XOrSp if register.index == 31 => "sp".to_string(),

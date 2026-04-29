@@ -9348,7 +9348,7 @@ pub(crate) fn match_opcode(instruction: Aarch64Insn) -> Option<Aarch64Opcode> {
     let mut best: Option<&Aarch64Opcode> = None;
 
     for opcode in &aarch64_opcode_table {
-        if instruction & opcode.mask != opcode.opcode {
+        if instruction & opcode.mask != opcode.opcode & opcode.mask {
             continue;
         }
         if !alias_applies(instruction, opcode) {

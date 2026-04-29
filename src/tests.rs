@@ -4,6 +4,8 @@ use crate::isa::aarch64::Instruction;
 const BASIC_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/basic.otool.txt");
 const INTEGER_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/integer.otool.txt");
 const BRANCH_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/branch.otool.txt");
+const LOADSTORE_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/loadstore.otool.txt");
+const FLOAT_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/float.otool.txt");
 
 #[derive(Debug, Eq, PartialEq)]
 struct OtoolFixtureInsn {
@@ -82,6 +84,8 @@ fn decoded_operands_match_otool_fixture() {
     });
     assert_decoded_fixture_matches_otool(INTEGER_OTOOL_FIXTURE, |_| None);
     assert_decoded_fixture_matches_otool(BRANCH_OTOOL_FIXTURE, |_| None);
+    assert_decoded_fixture_matches_otool(LOADSTORE_OTOOL_FIXTURE, |_| None);
+    assert_decoded_fixture_matches_otool(FLOAT_OTOOL_FIXTURE, |_| None);
 }
 
 fn assert_decoded_fixture_matches_otool<F>(fixture_text: &str, symbol_for_address: F)
@@ -134,6 +138,8 @@ fn operand_kind_coverage_snapshot() {
         .into_iter()
         .chain(parse_otool_fixture(INTEGER_OTOOL_FIXTURE))
         .chain(parse_otool_fixture(BRANCH_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(LOADSTORE_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(FLOAT_OTOOL_FIXTURE))
         .collect::<Vec<_>>();
     let fixture_words = fixture
         .iter()
@@ -152,6 +158,18 @@ fn operand_kind_coverage_snapshot() {
     assert!(coverage.fixture_covered.contains(&"Cond"));
     assert!(coverage.fixture_covered.contains(&"Cond1"));
     assert!(coverage.fixture_covered.contains(&"BitNum"));
+    assert!(coverage.fixture_covered.contains(&"AddrUimm12"));
+    assert!(coverage.fixture_covered.contains(&"AddrSimm9"));
+    assert!(coverage.fixture_covered.contains(&"AddrRegoff"));
+    assert!(coverage.fixture_covered.contains(&"AddrSimple"));
+    assert!(coverage.fixture_covered.contains(&"Rs"));
+    assert!(coverage.fixture_covered.contains(&"Fd"));
+    assert!(coverage.fixture_covered.contains(&"Fn"));
+    assert!(coverage.fixture_covered.contains(&"Fm"));
+    assert!(coverage.fixture_covered.contains(&"Fa"));
+    assert!(coverage.fixture_covered.contains(&"Ft"));
+    assert!(coverage.fixture_covered.contains(&"Fpimm0"));
+    assert!(coverage.fixture_covered.contains(&"Fpimm"));
     assert!(coverage.unimplemented.contains(&"Sysreg"));
     assert!(
         coverage.implemented_but_uncovered.is_empty(),

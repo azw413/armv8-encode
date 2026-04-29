@@ -1,0 +1,19 @@
+# Generated from tests/fixtures/aarch64/float.s with:
+#   clang -target arm64-apple-macos -c float.s -o float.o
+#   otool -s __TEXT __text float.o
+#   otool -tvV float.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 1e222820 fadd s0, s1, s2
+0000000000000004 1e653883 fsub d3, d4, d5
+0000000000000008 1e2808e6 fmul s6, s7, s8
+000000000000000c 1e6b1949 fdiv d9, d10, d11
+0000000000000010 1f0e3dac fmadd s12, s13, s14, s15
+0000000000000014 1f52ce30 fmsub d16, d17, d18, d19
+0000000000000018 1e212000 fcmp s0, s1
+000000000000001c 1e602048 fcmp d2, #0.0
+0000000000000020 1e360eb4 fcsel s20, s21, s22, eq
+0000000000000024 1e2e1017 fmov s23, #1.00000000
+0000000000000028 bd000418 str s24, [x0, #0x4]
+000000000000002c fd400439 ldr d25, [x1, #0x8]

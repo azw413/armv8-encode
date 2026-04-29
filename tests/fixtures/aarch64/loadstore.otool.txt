@@ -1,0 +1,19 @@
+# Generated from tests/fixtures/aarch64/loadstore.s with:
+#   clang -target arm64-apple-macos -c loadstore.s -o loadstore.o
+#   otool -s __TEXT __text loadstore.o
+#   otool -tvV loadstore.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 f9000820 str x0, [x1, #0x10]
+0000000000000004 f9400c62 ldr x2, [x3, #0x18]
+0000000000000008 f81f80a4 stur x4, [x5, #-0x8]
+000000000000000c f85f00e6 ldur x6, [x7, #-0x10]
+0000000000000010 f8008528 str x8, [x9], #0x8
+0000000000000014 f8408d6a ldr x10, [x11, #0x8]!
+0000000000000018 f86e69ac ldr x12, [x13, x14]
+000000000000001c f8717a0f ldr x15, [x16, x17, lsl #3]
+0000000000000020 18000092 ldr w18, 0x30
+0000000000000024 98000073 ldrsw x19, 0x30
+0000000000000028 c85f7eb4 ldxr x20, [x21]
+000000000000002c c8167f17 stxr w22, x23, [x24]
