@@ -56,6 +56,7 @@ pub enum RegisterClass {
     D,
     W,
     X,
+    WOrSp,
     XOrSp,
 }
 
@@ -195,8 +196,8 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Rm => Ok(DecodedOperand::Register(rm_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::RmSft => Ok(DecodedOperand::ShiftedRegister(rm_shifted(ctx.word))),
             Aarch64Opnd::RmExt => Ok(DecodedOperand::ExtendedRegister(rm_extended(ctx.word))),
-            Aarch64Opnd::RdSp => Ok(DecodedOperand::Register(x_or_sp(rd(ctx.word)))),
-            Aarch64Opnd::RnSp => Ok(DecodedOperand::Register(x_or_sp(rn(ctx.word)))),
+            Aarch64Opnd::RdSp => Ok(DecodedOperand::Register(gp_or_sp(rd(ctx.word), ctx.word))),
+            Aarch64Opnd::RnSp => Ok(DecodedOperand::Register(gp_or_sp(rn(ctx.word), ctx.word))),
             Aarch64Opnd::Rt => Ok(DecodedOperand::Register(rt_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::Rt2 => Ok(DecodedOperand::Register(x_reg(rt2(ctx.word)))),
             Aarch64Opnd::Ra => Ok(DecodedOperand::Register(ra_reg(ctx.word, ctx.opcode))),
@@ -276,7 +277,7 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Imms => Ok(DecodedOperand::Immediate(imms(ctx.word))),
             Aarch64Opnd::Aimm => Ok(DecodedOperand::Immediate(aimm(ctx.word))),
             Aarch64Opnd::Limm => Ok(DecodedOperand::Immediate(
-                logical_immediate(ctx.word).ok_or(DecodeError::InvalidOperand("Limm"))? as i64,
+                logical_immediate(ctx.word).ok_or(DecodeError::InvalidOperand("Limm"))?,
             )),
             Aarch64Opnd::Half => Ok(DecodedOperand::ShiftedImmediate(half(ctx.word))),
             Aarch64Opnd::ImmMov => Ok(DecodedOperand::Immediate(imm_mov(ctx.word))),
@@ -620,7 +621,10 @@ fn rt_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
         "str" | "ldr" if ((word >> 26) & 0x3f) == 0b111101 => fp_reg(rt(word), word),
         "ldr" if (word >> 31) & 1 == 0 && (word >> 30) & 1 == 0 => w_reg(rt(word)),
         "str" | "ldr" if ((word >> 30) & 0x3) == 0b10 => w_reg(rt(word)),
-        "strb" | "ldrb" | "strh" | "ldrh" => w_reg(rt(word)),
+        "strb" | "ldrb" | "strh" | "ldrh" | "sturb" | "ldurb" | "sturh" | "ldurh" => {
+            w_reg(rt(word))
+        }
+        "stur" | "ldur" if ((word >> 30) & 0x3) == 0b10 => w_reg(rt(word)),
         _ => x_reg(rt(word)),
     }
 }
@@ -1205,6 +1209,7 @@ fn imm_mov(word: Word) -> i64 {
     let shifted = value << shift;
 
     match (word >> 29) & 0x3 {
+        0 if (word >> 31) & 1 == 0 => (((!shifted) & 0xffff_ffff) as i32) as i64,
         0 => !shifted,
         _ => shifted,
     }
@@ -1213,9 +1218,10 @@ fn imm_mov(word: Word) -> i64 {
 fn bitfield_imm(word: Word, opcode: &Aarch64Opcode) -> i64 {
     let immr = ((word >> 16) & 0x3f) as i64;
     let imms = ((word >> 10) & 0x3f) as i64;
+    let max = if (word >> 31) & 1 == 0 { 31 } else { 63 };
 
     match opcode.mnemonic() {
-        "lsl" => 63 - imms,
+        "lsl" => max - imms,
         "lsr" | "asr" => immr,
         "ubfx" | "bfxil" => immr,
         _ => immr,
@@ -1232,7 +1238,7 @@ fn bitfield_width(word: Word, opcode: &Aarch64Opcode) -> i64 {
     }
 }
 
-fn logical_immediate(word: Word) -> Option<u64> {
+fn logical_immediate(word: Word) -> Option<i64> {
     let n = ((word >> 22) & 1) as u8;
     let immr = ((word >> 16) & 0x3f) as u8;
     let imms = ((word >> 10) & 0x3f) as u8;
@@ -1249,7 +1255,12 @@ fn logical_immediate(word: Word) -> Option<u64> {
 
     let pattern = ones(s + 1);
     let rotated = rotate_right_with_width(pattern, r, size);
-    Some(replicate(rotated, size))
+    let value = replicate(rotated, size);
+    if (word >> 31) & 1 == 0 {
+        Some((value & 0xffff_ffff) as i64)
+    } else {
+        Some(value as i64)
+    }
 }
 
 fn highest_set_bit(value: u8) -> Option<u32> {
@@ -1532,6 +1543,17 @@ fn gp_reg(reg: u8, word: Word) -> Register {
         w_reg(reg)
     } else {
         x_reg(reg)
+    }
+}
+
+fn gp_or_sp(reg: u8, word: Word) -> Register {
+    if (word >> 31) & 1 == 0 {
+        Register {
+            class: RegisterClass::WOrSp,
+            index: reg,
+        }
+    } else {
+        x_or_sp(reg)
     }
 }
 

@@ -1,0 +1,19 @@
+# Generated from tests/fixtures/aarch64/formatting.s with:
+#   clang -target arm64-apple-macos -c formatting.s -o formatting.o
+#   otool -s __TEXT __text formatting.o
+#   otool -tvV formatting.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 90000068 adrp x8, 12 ; 0xc000
+0000000000000004 f9000abf str xzr, [x21, #0x10]
+0000000000000008 b900311f str wzr, [x8, #0x30]
+000000000000000c 3903431f strb wzr, [x24, #0xd0]
+0000000000000010 b81f83a8 stur w8, [x29, #-0x8]
+0000000000000014 381d73a9 sturb w9, [x29, #-0x29]
+0000000000000018 785a23a0 ldurh w0, [x29, #-0x5e]
+000000000000001c 9a9f9210 csel x16, x16, xzr, ls
+0000000000000020 12b00002 mov w2, #0x7fffffff
+0000000000000024 12800000 mov w0, #-0x1
+0000000000000028 1280822a mov w10, #-0x412
+000000000000002c 121e7b29 and w9, w25, #0xfffffffd

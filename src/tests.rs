@@ -32,6 +32,8 @@ const SIMD_REMAINING_OTOOL_FIXTURE: &str =
     include_str!("../tests/fixtures/aarch64/simd_remaining.otool.txt");
 const WHOLE_FUNCTIONS_OTOOL_FIXTURE: &str =
     include_str!("../tests/fixtures/aarch64/whole_functions.otool.txt");
+const FORMATTING_OTOOL_FIXTURE: &str =
+    include_str!("../tests/fixtures/aarch64/formatting.otool.txt");
 const DIRECT_TESTED_OPERAND_KINDS: &[&str] = &[
     "AddrAdrp",
     "Barrier",
@@ -291,6 +293,11 @@ fn decoded_simd_remaining_operands_match_otool() {
 #[test]
 fn decoded_whole_functions_match_otool() {
     assert_decoded_fixture_matches_otool(WHOLE_FUNCTIONS_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_formatting_cases_match_otool() {
+    assert_decoded_fixture_matches_otool(FORMATTING_OTOOL_FIXTURE, |_| None);
 }
 
 #[test]
@@ -653,6 +660,7 @@ fn operand_kind_coverage_snapshot() {
         .chain(parse_otool_fixture(SHLL_OTOOL_FIXTURE))
         .chain(parse_otool_fixture(SIMD_REMAINING_OTOOL_FIXTURE))
         .chain(parse_otool_fixture(WHOLE_FUNCTIONS_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(FORMATTING_OTOOL_FIXTURE))
         .collect::<Vec<_>>();
     let fixture_words = fixture
         .iter()

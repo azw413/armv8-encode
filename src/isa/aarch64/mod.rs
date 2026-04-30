@@ -240,6 +240,10 @@ impl DecodedInstruction {
     where
         F: Fn(u64) -> Option<String>,
     {
+        if self.mnemonic == "adrp" {
+            return format_adrp_operands(self.address, &self.operands, &symbol_for_address);
+        }
+
         format_operands(self.mnemonic, &self.operands, symbol_for_address)
     }
 
@@ -265,7 +269,7 @@ where
         "ext" | "extr" => format_operand_list(operands, Some("#")),
         "movi" | "mvni" => format_operand_list(operands, Some("#")),
         "adr" => format_operand_list_decimal(operands, Some("#")),
-        "adrp" => format_adrp_operands(operands, &symbol_for_address),
+        "adrp" => format_adrp_operands(0, operands, &symbol_for_address),
         "mov" if operands.iter().any(is_immediate_operand) => {
             format_operand_list(operands, Some("#"))
         }
@@ -608,7 +612,11 @@ fn format_operand_decimal(operand: &DecodedOperand, immediate_prefix: Option<&st
     }
 }
 
-fn format_adrp_operands<F>(operands: &[DecodedOperand], symbol_for_address: &F) -> String
+fn format_adrp_operands<F>(
+    address: u64,
+    operands: &[DecodedOperand],
+    symbol_for_address: &F,
+) -> String
 where
     F: Fn(u64) -> Option<String>,
 {
@@ -622,8 +630,19 @@ where
     format!(
         "{}, {}",
         format_operand_with_symbols(first, symbol_for_address, None),
-        format_operand_with_symbols(second, symbol_for_address, None)
+        format_adrp_target(address, second, symbol_for_address)
     )
+}
+
+fn format_adrp_target<F>(address: u64, operand: &DecodedOperand, symbol_for_address: &F) -> String
+where
+    F: Fn(u64) -> Option<String>,
+{
+    match operand {
+        DecodedOperand::PageTarget(target) => symbol_for_address(*target)
+            .unwrap_or_else(|| format_page_target_from_address(address, *target)),
+        _ => format_operand_with_symbols(operand, symbol_for_address, None),
+    }
 }
 
 fn format_shift_kind(kind: ShiftKind) -> &'static str {
@@ -702,14 +721,23 @@ fn format_page_target(target: u64) -> String {
     format!("{} ; 0x{target:x}", signed_target >> 12)
 }
 
+fn format_page_target_from_address(address: u64, target: u64) -> String {
+    let signed_delta = target.wrapping_sub(address & !0xfff) as i64;
+    format!("{} ; 0x{target:x}", signed_delta >> 12)
+}
+
 fn format_register(register: &Register) -> String {
     match register.class {
         RegisterClass::B => format!("b{}", register.index),
         RegisterClass::H => format!("h{}", register.index),
         RegisterClass::S => format!("s{}", register.index),
         RegisterClass::D => format!("d{}", register.index),
+        RegisterClass::W if register.index == 31 => "wzr".to_string(),
         RegisterClass::W => format!("w{}", register.index),
+        RegisterClass::X if register.index == 31 => "xzr".to_string(),
         RegisterClass::X => format!("x{}", register.index),
+        RegisterClass::WOrSp if register.index == 31 => "sp".to_string(),
+        RegisterClass::WOrSp => format!("w{}", register.index),
         RegisterClass::XOrSp if register.index == 31 => "sp".to_string(),
         RegisterClass::XOrSp => format!("x{}", register.index),
     }
