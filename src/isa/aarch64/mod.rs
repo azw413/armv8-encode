@@ -149,6 +149,10 @@ pub fn encode_instruction(instruction: &InstructionTemplate) -> Result<Word, Enc
         }
 
         if matched {
+            word |= encode_implicit_alias_operands(&opcode, &instruction.operands)?;
+            if word & opcode.mask() != opcode.base_opcode() & opcode.mask() {
+                continue;
+            }
             return Ok(word);
         }
     }
@@ -156,6 +160,25 @@ pub fn encode_instruction(instruction: &InstructionTemplate) -> Result<Word, Enc
     Err(last_error.unwrap_or(EncodeError::NoMatchingForm {
         mnemonic: instruction.mnemonic.table_name(),
     }))
+}
+
+fn encode_implicit_alias_operands(
+    opcode: &table::Aarch64Opcode,
+    operands: &[DecodedOperand],
+) -> Result<Word, EncodeError> {
+    match opcode.mnemonic() {
+        "cinc" => {
+            let Some(DecodedOperand::Register(rn)) = operands.get(1) else {
+                return Err(EncodeError::InvalidOperand { kind: "Rn" });
+            };
+            if !matches!(rn.class, RegisterClass::W | RegisterClass::X) || rn.index > 31 {
+                return Err(EncodeError::InvalidOperand { kind: "Rn" });
+            }
+
+            Ok((rn.index as Word) << 16)
+        }
+        _ => Ok(0),
+    }
 }
 
 /// Match raw AArch64 instruction words against the opcode table.

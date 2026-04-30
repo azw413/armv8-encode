@@ -24,8 +24,11 @@ pub enum Aarch64Mnemonic {
     Bfxil,
     Cbnz,
     Cbz,
+    Ccmp,
+    Cinc,
     Cmn,
     Cmp,
+    Csel,
     Ldp,
     Ldr,
     Ldur,
@@ -66,8 +69,11 @@ impl Aarch64Mnemonic {
             "bfxil" => Self::Bfxil,
             "cbnz" => Self::Cbnz,
             "cbz" => Self::Cbz,
+            "ccmp" => Self::Ccmp,
+            "cinc" => Self::Cinc,
             "cmn" => Self::Cmn,
             "cmp" => Self::Cmp,
+            "csel" => Self::Csel,
             "ldp" => Self::Ldp,
             "ldr" => Self::Ldr,
             "ldur" => Self::Ldur,
@@ -108,8 +114,11 @@ impl Aarch64Mnemonic {
             Self::Bfxil => "bfxil",
             Self::Cbnz => "cbnz",
             Self::Cbz => "cbz",
+            Self::Ccmp => "ccmp",
+            Self::Cinc => "cinc",
             Self::Cmn => "cmn",
             Self::Cmp => "cmp",
+            Self::Csel => "csel",
             Self::Ldp => "ldp",
             Self::Ldr => "ldr",
             Self::Ldur => "ldur",
@@ -497,6 +506,10 @@ impl Aarch64Opcode {
 
     pub(crate) fn base_opcode(&self) -> Aarch64Insn {
         self.opcode
+    }
+
+    pub(crate) fn mask(&self) -> Aarch64Insn {
+        self.mask
     }
 
     fn is_alias(&self) -> bool {

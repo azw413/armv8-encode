@@ -994,6 +994,404 @@ fn encoded_adrp_operand_matches_otool_fixture() {
 }
 
 #[test]
+fn encoded_condition_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(BRANCH_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "csel x5, x6, x7, eq",
+            template(
+                0x3c,
+                Aarch64Mnemonic::Csel,
+                vec![
+                    DecodedOperand::Register(x_reg(5)),
+                    DecodedOperand::Register(x_reg(6)),
+                    DecodedOperand::Register(x_reg(7)),
+                    DecodedOperand::Condition("eq"),
+                ],
+            ),
+        ),
+        (
+            "cinc x8, x9, ne",
+            template(
+                0x40,
+                Aarch64Mnemonic::Cinc,
+                vec![
+                    DecodedOperand::Register(x_reg(8)),
+                    DecodedOperand::Register(x_reg(9)),
+                    DecodedOperand::Condition("ne"),
+                ],
+            ),
+        ),
+        (
+            "ccmp x10, x11, #0x0, lt",
+            template(
+                0x44,
+                Aarch64Mnemonic::Ccmp,
+                vec![
+                    DecodedOperand::Register(x_reg(10)),
+                    DecodedOperand::Register(x_reg(11)),
+                    DecodedOperand::Immediate(0),
+                    DecodedOperand::Condition("lt"),
+                ],
+            ),
+        ),
+        (
+            "ccmp x10, #0x7, #0x0, lt",
+            template(
+                0x48,
+                Aarch64Mnemonic::Ccmp,
+                vec![
+                    DecodedOperand::Register(x_reg(10)),
+                    DecodedOperand::Immediate(7),
+                    DecodedOperand::Immediate(0),
+                    DecodedOperand::Condition("lt"),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_fp_register_and_immediate_operands_match_otool_fixture() {
+    let float_fixture = parse_otool_fixture(FLOAT_OTOOL_FIXTURE);
+    let fpimm_fixture = parse_otool_fixture(FPIMM_OTOOL_FIXTURE);
+    let cases = [
+        (
+            &float_fixture,
+            "fadd s0, s1, s2",
+            template(
+                0,
+                Aarch64Mnemonic::Other("fadd"),
+                vec![
+                    DecodedOperand::Register(s_reg(0)),
+                    DecodedOperand::Register(s_reg(1)),
+                    DecodedOperand::Register(s_reg(2)),
+                ],
+            ),
+        ),
+        (
+            &float_fixture,
+            "fsub d3, d4, d5",
+            template(
+                4,
+                Aarch64Mnemonic::Other("fsub"),
+                vec![
+                    DecodedOperand::Register(d_reg(3)),
+                    DecodedOperand::Register(d_reg(4)),
+                    DecodedOperand::Register(d_reg(5)),
+                ],
+            ),
+        ),
+        (
+            &float_fixture,
+            "fmadd s12, s13, s14, s15",
+            template(
+                0x10,
+                Aarch64Mnemonic::Other("fmadd"),
+                vec![
+                    DecodedOperand::Register(s_reg(12)),
+                    DecodedOperand::Register(s_reg(13)),
+                    DecodedOperand::Register(s_reg(14)),
+                    DecodedOperand::Register(s_reg(15)),
+                ],
+            ),
+        ),
+        (
+            &float_fixture,
+            "fcmp d2, #0.0",
+            template(
+                0x1c,
+                Aarch64Mnemonic::Other("fcmp"),
+                vec![
+                    DecodedOperand::Register(d_reg(2)),
+                    DecodedOperand::FloatImmediate("0.0".to_string()),
+                ],
+            ),
+        ),
+        (
+            &float_fixture,
+            "fmov s23, #1.00000000",
+            template(
+                0x24,
+                Aarch64Mnemonic::Other("fmov"),
+                vec![
+                    DecodedOperand::Register(s_reg(23)),
+                    DecodedOperand::FloatImmediate("1.00000000".to_string()),
+                ],
+            ),
+        ),
+        (
+            &fpimm_fixture,
+            "fmov d0, #-1.93750000",
+            template(
+                0xdc,
+                Aarch64Mnemonic::Other("fmov"),
+                vec![
+                    DecodedOperand::Register(d_reg(0)),
+                    DecodedOperand::FloatImmediate("-1.93750000".to_string()),
+                ],
+            ),
+        ),
+    ];
+
+    for (fixture, expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_exception_immediate_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(EXCEPTION_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "svc #0x1234",
+            template(
+                4,
+                Aarch64Mnemonic::Other("svc"),
+                vec![DecodedOperand::Immediate(0x1234)],
+            ),
+        ),
+        (
+            "hvc #0x2345",
+            template(
+                8,
+                Aarch64Mnemonic::Other("hvc"),
+                vec![DecodedOperand::Immediate(0x2345)],
+            ),
+        ),
+        (
+            "brk #0x4567",
+            template(
+                0x10,
+                Aarch64Mnemonic::Other("brk"),
+                vec![DecodedOperand::Immediate(0x4567)],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_system_operands_match_otool_fixture() {
+    let system_fixture = parse_otool_fixture(SYSTEM_OTOOL_FIXTURE);
+    let sysreg_fixture = parse_otool_fixture(SYSREG_OTOOL_FIXTURE);
+    let generic_fixture = parse_otool_fixture(SYS_GENERIC_OTOOL_FIXTURE);
+    let prfm_fixture = parse_otool_fixture(PRFM_OTOOL_FIXTURE);
+    let cases = [
+        (
+            &system_fixture,
+            "dsb sy",
+            template(
+                0xc,
+                Aarch64Mnemonic::Other("dsb"),
+                vec![DecodedOperand::System("sy".to_string())],
+            ),
+        ),
+        (
+            &system_fixture,
+            "isb #3",
+            template(
+                0x18,
+                Aarch64Mnemonic::Other("isb"),
+                vec![DecodedOperand::System("#3".to_string())],
+            ),
+        ),
+        (
+            &system_fixture,
+            "msr DAIFClr, #0x4",
+            template(
+                0x24,
+                Aarch64Mnemonic::Other("msr"),
+                vec![
+                    DecodedOperand::System("DAIFClr".to_string()),
+                    DecodedOperand::Immediate(4),
+                ],
+            ),
+        ),
+        (
+            &sysreg_fixture,
+            "mrs x2, TPIDR_EL0",
+            template(
+                8,
+                Aarch64Mnemonic::Other("mrs"),
+                vec![
+                    DecodedOperand::Register(x_reg(2)),
+                    DecodedOperand::System("TPIDR_EL0".to_string()),
+                ],
+            ),
+        ),
+        (
+            &sysreg_fixture,
+            "msr NZCV, x1",
+            template(
+                4,
+                Aarch64Mnemonic::Other("msr"),
+                vec![
+                    DecodedOperand::System("NZCV".to_string()),
+                    DecodedOperand::Register(x_reg(1)),
+                ],
+            ),
+        ),
+        (
+            &generic_fixture,
+            "sys #0x1, c2, c3, #0x4, x5",
+            template(
+                0,
+                Aarch64Mnemonic::Other("sys"),
+                vec![
+                    DecodedOperand::Immediate(1),
+                    DecodedOperand::System("c2".to_string()),
+                    DecodedOperand::System("c3".to_string()),
+                    DecodedOperand::Immediate(4),
+                    DecodedOperand::Register(x_reg(5)),
+                ],
+            ),
+        ),
+        (
+            &generic_fixture,
+            "sysl x6, #0x1, c2, c3, #0x4",
+            template(
+                8,
+                Aarch64Mnemonic::Other("sysl"),
+                vec![
+                    DecodedOperand::Register(x_reg(6)),
+                    DecodedOperand::Immediate(1),
+                    DecodedOperand::System("c2".to_string()),
+                    DecodedOperand::System("c3".to_string()),
+                    DecodedOperand::Immediate(4),
+                ],
+            ),
+        ),
+        (
+            &prfm_fixture,
+            "prfm pldl2strm, [x1, #0x10]",
+            template(
+                4,
+                Aarch64Mnemonic::Other("prfm"),
+                vec![
+                    DecodedOperand::System("pldl2strm".to_string()),
+                    mem_imm(x_reg(1), 0x10, aarch64::AddressingMode::Offset),
+                ],
+            ),
+        ),
+    ];
+
+    for (fixture, expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_simd_operands_match_otool_fixture() {
+    let simd_same = parse_otool_fixture(SIMD_SAME_OTOOL_FIXTURE);
+    let simd_scalar = parse_otool_fixture(SIMD_SCALAR_OTOOL_FIXTURE);
+    let simd_list = parse_otool_fixture(SIMD_LIST_OTOOL_FIXTURE);
+    let simd_ldst = parse_otool_fixture(SIMD_LDST_OTOOL_FIXTURE);
+    let vector_d1 = parse_otool_fixture(VECTOR_D1_OTOOL_FIXTURE);
+    let cases = [
+        (
+            &simd_same,
+            "add.16b v3, v4, v5",
+            template(
+                4,
+                Aarch64Mnemonic::Add,
+                vec![
+                    DecodedOperand::VectorRegister(v_reg(3, aarch64::VectorArrangement::B16)),
+                    DecodedOperand::VectorRegister(v_reg(4, aarch64::VectorArrangement::B16)),
+                    DecodedOperand::VectorRegister(v_reg(5, aarch64::VectorArrangement::B16)),
+                ],
+            ),
+        ),
+        (
+            &simd_same,
+            "add.4s v15, v16, v17",
+            template(
+                0x14,
+                Aarch64Mnemonic::Add,
+                vec![
+                    DecodedOperand::VectorRegister(v_reg(15, aarch64::VectorArrangement::S4)),
+                    DecodedOperand::VectorRegister(v_reg(16, aarch64::VectorArrangement::S4)),
+                    DecodedOperand::VectorRegister(v_reg(17, aarch64::VectorArrangement::S4)),
+                ],
+            ),
+        ),
+        (
+            &simd_scalar,
+            "add d0, d1, d2",
+            template(
+                0,
+                Aarch64Mnemonic::Add,
+                vec![
+                    DecodedOperand::Register(d_reg(0)),
+                    DecodedOperand::Register(d_reg(1)),
+                    DecodedOperand::Register(d_reg(2)),
+                ],
+            ),
+        ),
+        (
+            &simd_list,
+            "tbl.16b v3, { v4, v5 }, v6",
+            template(
+                4,
+                Aarch64Mnemonic::Other("tbl"),
+                vec![
+                    DecodedOperand::VectorRegister(v_reg(3, aarch64::VectorArrangement::B16)),
+                    DecodedOperand::VectorList(v_list(4, 2, aarch64::VectorArrangement::B16)),
+                    DecodedOperand::VectorRegister(v_reg(6, aarch64::VectorArrangement::B16)),
+                ],
+            ),
+        ),
+        (
+            &simd_ldst,
+            "ld1.16b { v0 }, [x1]",
+            template(
+                0,
+                Aarch64Mnemonic::Other("ld1"),
+                vec![
+                    DecodedOperand::VectorList(v_list(0, 1, aarch64::VectorArrangement::B16)),
+                    mem_simple(x_reg(1)),
+                ],
+            ),
+        ),
+        (
+            &simd_ldst,
+            "st1.16b { v2 }, [x3], #16",
+            template(
+                4,
+                Aarch64Mnemonic::Other("st1"),
+                vec![
+                    DecodedOperand::VectorList(v_list(2, 1, aarch64::VectorArrangement::B16)),
+                    mem_imm(x_reg(3), 16, aarch64::AddressingMode::PostIndex),
+                ],
+            ),
+        ),
+        (
+            &vector_d1,
+            "fmov.d v0[1], x1",
+            template(
+                0,
+                Aarch64Mnemonic::Other("fmov"),
+                vec![
+                    DecodedOperand::VectorElement(v_element(0, 1, aarch64::VectorElementSize::D)),
+                    DecodedOperand::Register(x_reg(1)),
+                ],
+            ),
+        ),
+    ];
+
+    for (fixture, expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
 fn encode_instruction_normalizes_conditional_branch_mnemonics() {
     let instruction = template(
         0,
@@ -1027,6 +1425,41 @@ fn x_reg(index: u8) -> Register {
     Register {
         class: RegisterClass::X,
         index,
+    }
+}
+
+fn s_reg(index: u8) -> Register {
+    Register {
+        class: RegisterClass::S,
+        index,
+    }
+}
+
+fn d_reg(index: u8) -> Register {
+    Register {
+        class: RegisterClass::D,
+        index,
+    }
+}
+
+fn v_reg(index: u8, arrangement: aarch64::VectorArrangement) -> aarch64::VectorRegister {
+    aarch64::VectorRegister { index, arrangement }
+}
+
+fn v_element(index: u8, element: u8, size: aarch64::VectorElementSize) -> aarch64::VectorElement {
+    aarch64::VectorElement {
+        index,
+        element,
+        size,
+    }
+}
+
+fn v_list(first: u8, count: u8, arrangement: aarch64::VectorArrangement) -> aarch64::VectorList {
+    aarch64::VectorList {
+        first,
+        count,
+        arrangement,
+        element: None,
     }
 }
 
@@ -1244,6 +1677,13 @@ fn decoded_whole_functions_match_otool() {
 #[test]
 fn decoded_formatting_cases_match_otool() {
     assert_decoded_fixture_matches_otool(FORMATTING_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_fixture_instructions_roundtrip_through_encoder() {
+    for (fixture_name, fixture_text) in all_otool_fixtures() {
+        assert_decode_encode_roundtrip_fixture(fixture_name, fixture_text);
+    }
 }
 
 #[test]
@@ -1538,6 +1978,116 @@ where
             "operand mismatch at {:#x} for word {:#010x}",
             expected.address, expected.word
         );
+    }
+}
+
+fn all_otool_fixtures() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("basic", BASIC_OTOOL_FIXTURE),
+        ("integer", INTEGER_OTOOL_FIXTURE),
+        ("branch", BRANCH_OTOOL_FIXTURE),
+        ("loadstore", LOADSTORE_OTOOL_FIXTURE),
+        ("float", FLOAT_OTOOL_FIXTURE),
+        ("fpimm", FPIMM_OTOOL_FIXTURE),
+        ("convert", CONVERT_OTOOL_FIXTURE),
+        ("exception", EXCEPTION_OTOOL_FIXTURE),
+        ("dataproc", DATAPROC_OTOOL_FIXTURE),
+        ("extend", EXTEND_OTOOL_FIXTURE),
+        ("fppair", FPPAIR_OTOOL_FIXTURE),
+        ("adrp", ADRP_OTOOL_FIXTURE),
+        ("system", SYSTEM_OTOOL_FIXTURE),
+        ("sysreg", SYSREG_OTOOL_FIXTURE),
+        ("sys_alias", SYS_ALIAS_OTOOL_FIXTURE),
+        ("sys_generic", SYS_GENERIC_OTOOL_FIXTURE),
+        ("prfm", PRFM_OTOOL_FIXTURE),
+        ("simd_same", SIMD_SAME_OTOOL_FIXTURE),
+        ("simd_scalar", SIMD_SCALAR_OTOOL_FIXTURE),
+        ("pairreg", PAIRREG_OTOOL_FIXTURE),
+        ("vector_d1", VECTOR_D1_OTOOL_FIXTURE),
+        ("simd_list", SIMD_LIST_OTOOL_FIXTURE),
+        ("simd_ldst", SIMD_LDST_OTOOL_FIXTURE),
+        ("shll", SHLL_OTOOL_FIXTURE),
+        ("simd_remaining", SIMD_REMAINING_OTOOL_FIXTURE),
+        ("whole_functions", WHOLE_FUNCTIONS_OTOOL_FIXTURE),
+        ("formatting", FORMATTING_OTOOL_FIXTURE),
+        ("encode_basic", ENCODE_BASIC_OTOOL_FIXTURE),
+    ]
+}
+
+fn assert_decode_encode_roundtrip_fixture(fixture_name: &str, fixture_text: &str) {
+    let fixture = parse_otool_fixture(fixture_text);
+
+    assert!(!fixture.is_empty(), "empty fixture: {fixture_name}");
+
+    for expected in fixture {
+        let decoded =
+            aarch64::decode_instruction(expected.address, expected.word).unwrap_or_else(|| {
+                panic!(
+                    "no opcode match while roundtripping {fixture_name} at {:#x}",
+                    expected.address
+                )
+            });
+        let mnemonic = roundtrip_mnemonic(&decoded);
+        let template = aarch64::InstructionTemplate {
+            address: decoded.address,
+            mnemonic,
+            operands: decoded.operands.clone(),
+        };
+        let encoded = aarch64::encode_instruction(&template).unwrap_or_else(|err| {
+            panic!(
+                "failed to re-encode {fixture_name} at {:#x} ({} {}; decoded {} {}): {err:?}",
+                expected.address,
+                expected.mnemonic,
+                expected.operands,
+                decoded.format_mnemonic(),
+                decoded.format_operands()
+            )
+        });
+
+        let decoded_again =
+            aarch64::decode_instruction(expected.address, encoded).expect("roundtrip word decodes");
+        assert_eq!(
+            decoded_again.format_mnemonic(),
+            decoded.format_mnemonic(),
+            "roundtrip mnemonic mismatch for {fixture_name} at {:#x} (original word {:#010x}, encoded word {:#010x})",
+            expected.address,
+            expected.word,
+            encoded
+        );
+        assert_eq!(
+            decoded_again.format_operands(),
+            decoded.format_operands(),
+            "roundtrip operand mismatch for {fixture_name} at {:#x} (original word {:#010x}, encoded word {:#010x})",
+            expected.address,
+            expected.word,
+            encoded
+        );
+    }
+}
+
+fn roundtrip_mnemonic(decoded: &aarch64::DecodedInstruction) -> Aarch64Mnemonic {
+    let formatted = decoded.format_mnemonic();
+    if formatted.starts_with("b.") {
+        return Aarch64Mnemonic::parse(decoded.mnemonic);
+    }
+
+    match formatted.split_once('.').map(|(mnemonic, _)| mnemonic) {
+        Some("dup") => Aarch64Mnemonic::Other("dup"),
+        Some("fmov") => Aarch64Mnemonic::Other("fmov"),
+        Some("ld1") => Aarch64Mnemonic::Other("ld1"),
+        Some("ld2") => Aarch64Mnemonic::Other("ld2"),
+        Some("ld3") => Aarch64Mnemonic::Other("ld3"),
+        Some("ld4") => Aarch64Mnemonic::Other("ld4"),
+        Some("mov") => Aarch64Mnemonic::Mov,
+        Some("movi") => Aarch64Mnemonic::Other("movi"),
+        Some("mvni") => Aarch64Mnemonic::Other("mvni"),
+        Some("shll") => Aarch64Mnemonic::Other("shll"),
+        Some("st1") => Aarch64Mnemonic::Other("st1"),
+        Some("st2") => Aarch64Mnemonic::Other("st2"),
+        Some("st3") => Aarch64Mnemonic::Other("st3"),
+        Some("st4") => Aarch64Mnemonic::Other("st4"),
+        Some(_) => Aarch64Mnemonic::parse(decoded.mnemonic),
+        None => Aarch64Mnemonic::parse(decoded.mnemonic),
     }
 }
 
