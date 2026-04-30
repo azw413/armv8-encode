@@ -156,6 +156,9 @@ pub enum DecodeError {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EncodeError {
+    UnknownMnemonic { mnemonic: &'static str },
+    NoMatchingForm { mnemonic: &'static str },
+    InvalidOperand { kind: &'static str },
     Unimplemented { kind: &'static str },
 }
 
@@ -375,13 +378,42 @@ impl OperandCodec for Aarch64Opnd {
         }
     }
 
-    fn encode(
-        self,
-        _operand: &DecodedOperand,
-        ctx: EncodeContext<'_>,
-    ) -> Result<Word, EncodeError> {
+    fn encode(self, operand: &DecodedOperand, ctx: EncodeContext<'_>) -> Result<Word, EncodeError> {
         let _ = (ctx.base_word, ctx.address, ctx.opcode.mnemonic());
-        Err(EncodeError::Unimplemented { kind: self.name() })
+
+        match self {
+            Aarch64Opnd::Rd => encode_rd_register(self, operand, ctx.opcode),
+            Aarch64Opnd::Rn => encode_gp_register(self, operand, 5),
+            Aarch64Opnd::Rm => encode_gp_register(self, operand, 16),
+            Aarch64Opnd::RdSp => encode_gp_or_sp_register(self, operand, 0),
+            Aarch64Opnd::RnSp => encode_gp_or_sp_register(self, operand, 5),
+            Aarch64Opnd::Ra => encode_gp_register(self, operand, 10),
+            Aarch64Opnd::RmExt => encode_rm_extended(self, operand),
+            Aarch64Opnd::RmSft => encode_rm_shifted(self, operand),
+            Aarch64Opnd::Rt => encode_rt_register(self, operand, ctx.opcode),
+            Aarch64Opnd::Rt2 => encode_gp_register(self, operand, 10),
+            Aarch64Opnd::Rs => encode_status_register(self, operand),
+            Aarch64Opnd::Aimm => encode_aimm(self, operand),
+            Aarch64Opnd::Half => encode_half(self, operand),
+            Aarch64Opnd::ImmMov => encode_imm_mov(self, operand, ctx.opcode),
+            Aarch64Opnd::Imm => encode_bitfield_imm(self, operand, ctx.opcode, ctx.base_word),
+            Aarch64Opnd::Immr => encode_raw_immediate(self, operand, 16, 6),
+            Aarch64Opnd::Imms => encode_raw_immediate(self, operand, 10, 6),
+            Aarch64Opnd::Limm => encode_logical_immediate(self, operand, ctx.base_word),
+            Aarch64Opnd::Width => encode_bitfield_width(self, operand, ctx.opcode, ctx.base_word),
+            Aarch64Opnd::BitNum => encode_bit_num(self, operand),
+            Aarch64Opnd::AddrSimple => encode_addr_simple(self, operand),
+            Aarch64Opnd::AddrRegoff => encode_addr_regoff(self, operand, ctx.base_word),
+            Aarch64Opnd::AddrSimm7 => encode_addr_simm7(self, operand, ctx.opcode),
+            Aarch64Opnd::AddrSimm9 => encode_addr_simm9(self, operand, ctx.opcode),
+            Aarch64Opnd::AddrUimm12 => encode_addr_uimm12(self, operand, ctx.base_word),
+            Aarch64Opnd::AddrPcrel14 => encode_pcrel(self, operand, ctx.address, 14, 5),
+            Aarch64Opnd::AddrPcrel19 => encode_pcrel(self, operand, ctx.address, 19, 5),
+            Aarch64Opnd::AddrPcrel21 => encode_pcrel21(self, operand),
+            Aarch64Opnd::AddrPcrel26 => encode_pcrel(self, operand, ctx.address, 26, 0),
+            Aarch64Opnd::AddrAdrp => encode_adrp(self, operand, ctx.address),
+            _ => Err(EncodeError::Unimplemented { kind: self.name() }),
+        }
     }
 }
 
@@ -390,6 +422,14 @@ pub(crate) fn decode_operand(
     ctx: DecodeContext<'_>,
 ) -> Result<DecodedOperand, DecodeError> {
     kind.decode(ctx)
+}
+
+pub(crate) fn encode_operand(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    ctx: EncodeContext<'_>,
+) -> Result<Word, EncodeError> {
+    kind.encode(operand, ctx)
 }
 
 impl Aarch64Opnd {
@@ -588,6 +628,544 @@ fn rn(word: Word) -> u8 {
 
 fn rm(word: Word) -> u8 {
     ((word >> 16) & 0x1f) as u8
+}
+
+fn encode_gp_register(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    bit_offset: u8,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Register(register) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if register.index > 31 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let sf = match register.class {
+        RegisterClass::W => 0,
+        RegisterClass::X => 1,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(((sf as Word) << 31) | ((register.index as Word) << bit_offset))
+}
+
+fn encode_rd_register(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+) -> Result<Word, EncodeError> {
+    if opcode.class_name() == "Pcreladdr" {
+        let DecodedOperand::Register(register) = operand else {
+            return Err(EncodeError::InvalidOperand { kind: kind.name() });
+        };
+        if register.class != RegisterClass::X || register.index > 31 {
+            return Err(EncodeError::InvalidOperand { kind: kind.name() });
+        }
+
+        return Ok(register.index as Word);
+    }
+
+    encode_gp_register(kind, operand, 0)
+}
+
+fn encode_gp_or_sp_register(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    bit_offset: u8,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Register(register) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if register.index > 31 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let sf = match register.class {
+        RegisterClass::W => 0,
+        RegisterClass::X => 1,
+        RegisterClass::WOrSp if register.index == 31 => 0,
+        RegisterClass::XOrSp if register.index == 31 => 1,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(((sf as Word) << 31) | ((register.index as Word) << bit_offset))
+}
+
+fn encode_rm_extended(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::ExtendedRegister(extended) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if extended.register.index > 31 || extended.amount > 4 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let option = match (extended.extend, extended.register.class) {
+        (ExtendKind::Uxtb, RegisterClass::W) => 0,
+        (ExtendKind::Uxth, RegisterClass::W) => 1,
+        (ExtendKind::Uxtw, RegisterClass::W) => 2,
+        (ExtendKind::Uxtx, RegisterClass::X) => 3,
+        (ExtendKind::Sxtb, RegisterClass::W) => 4,
+        (ExtendKind::Sxth, RegisterClass::W) => 5,
+        (ExtendKind::Sxtw, RegisterClass::W) => 6,
+        (ExtendKind::Sxtx, RegisterClass::X) => 7,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(((extended.register.index as Word) << 16)
+        | ((option as Word) << 13)
+        | ((extended.amount as Word) << 10))
+}
+
+fn encode_rm_shifted(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::ShiftedRegister(shifted) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if shifted.register.index > 31 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let max_shift = match shifted.register.class {
+        RegisterClass::W => 31,
+        RegisterClass::X => 63,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+    if shifted.shift.amount > max_shift {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let shift = match shifted.shift.kind {
+        ShiftKind::Lsl => 0,
+        ShiftKind::Lsr => 1,
+        ShiftKind::Asr => 2,
+        ShiftKind::Ror => 3,
+    };
+
+    Ok(((shifted.register.index as Word) << 16)
+        | ((shift as Word) << 22)
+        | ((shifted.shift.amount as Word) << 10))
+}
+
+fn encode_aimm(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(value) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if (0..=0xfff).contains(value) {
+        return Ok((*value as Word) << 10);
+    }
+    if *value > 0 && *value % 0x1000 == 0 {
+        let imm = *value / 0x1000;
+        if imm <= 0xfff {
+            return Ok((1 << 22) | ((imm as Word) << 10));
+        }
+    }
+
+    Err(EncodeError::InvalidOperand { kind: kind.name() })
+}
+
+fn encode_half(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::ShiftedImmediate(imm) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !(0..=0xffff).contains(&imm.value) || imm.shift % 16 != 0 || imm.shift > 48 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok(((imm.value as Word) << 5) | (((imm.shift / 16) as Word) << 21))
+}
+
+fn encode_imm_mov(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(value) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    let op = (opcode.base_opcode() >> 29) & 0x3;
+    match op {
+        0 => {
+            let imm = !*value;
+            if !(0..=0xffff).contains(&imm) {
+                return Err(EncodeError::InvalidOperand { kind: kind.name() });
+            }
+            Ok((imm as Word) << 5)
+        }
+        2 => {
+            if !(0..=0xffff).contains(value) {
+                return Err(EncodeError::InvalidOperand { kind: kind.name() });
+            }
+            Ok((*value as Word) << 5)
+        }
+        _ => Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    }
+}
+
+fn encode_raw_immediate(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    bit_offset: u8,
+    bits: u8,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(value) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if *value < 0 || *value >= (1_i64 << bits) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok((*value as Word) << bit_offset)
+}
+
+fn encode_bitfield_imm(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+    word: Word,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(value) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    let max = bitfield_max(word);
+    if *value < 0 || *value > max {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let immr = match opcode.mnemonic() {
+        "lsl" => (max + 1 - *value) & max,
+        "lsr" | "asr" | "ubfx" | "bfxil" => *value,
+        _ => *value,
+    };
+    let imms = match opcode.mnemonic() {
+        "lsl" => Some(max - *value),
+        "lsr" | "asr" => Some(max),
+        _ => None,
+    };
+
+    let n = if max == 63 { 1 << 22 } else { 0 };
+    Ok(n | ((immr as Word) << 16) | imms.map_or(0, |value| (value as Word) << 10))
+}
+
+fn encode_bitfield_width(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+    word: Word,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(width) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    let max = bitfield_max(word);
+    if *width <= 0 || *width > max + 1 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let immr = ((word >> 16) & 0x3f) as i64;
+    let imms = match opcode.mnemonic() {
+        "ubfx" | "bfxil" => immr + *width - 1,
+        _ => *width - 1,
+    };
+    if imms > max {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok((imms as Word) << 10)
+}
+
+fn bitfield_max(word: Word) -> i64 {
+    if (word >> 31) & 1 == 0 {
+        31
+    } else {
+        63
+    }
+}
+
+fn encode_logical_immediate(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    word: Word,
+) -> Result<Word, EncodeError> {
+    let value = match operand {
+        DecodedOperand::Immediate(value) => *value,
+        DecodedOperand::UnsignedImmediate(value) if *value <= i64::MAX as u64 => *value as i64,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    let sf = word & (1 << 31);
+    for n in 0..=1 {
+        for immr in 0..64 {
+            for imms in 0..64 {
+                let candidate = sf | (n << 22) | (immr << 16) | (imms << 10);
+                if logical_immediate(candidate) == Some(value) {
+                    return Ok(candidate & ((1 << 22) | (0x3f << 16) | (0x3f << 10)));
+                }
+            }
+        }
+    }
+
+    Err(EncodeError::InvalidOperand { kind: kind.name() })
+}
+
+fn encode_status_register(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Register(register) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if register.class != RegisterClass::W || register.index > 31 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok((register.index as Word) << 16)
+}
+
+fn encode_rt_register(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Register(register) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if register.index > 31 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let size_bits = match (opcode.class_name(), register.class) {
+        ("Ldstexcl", RegisterClass::W) => 0,
+        ("Ldstexcl", RegisterClass::X) => 1 << 30,
+        ("LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled", RegisterClass::W) => 0,
+        ("LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled", RegisterClass::X) => 1 << 30,
+        (_, RegisterClass::W) => 0,
+        (_, RegisterClass::X) => 1 << 31,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(size_bits | register.index as Word)
+}
+
+fn encode_pcrel(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    address: u64,
+    bits: u8,
+    bit_offset: u8,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::BranchTarget(target) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    let offset = (*target as i128) - (address as i128);
+    if offset % 4 != 0 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let imm = offset / 4;
+    let limit = 1_i128 << (bits - 1);
+    if !(-limit..limit).contains(&imm) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok(((imm as i32 as u32) & ((1_u32 << bits) - 1)) << bit_offset)
+}
+
+fn encode_pcrel21(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(value) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !(-(1 << 20)..(1 << 20)).contains(value) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let encoded = (*value as i32 as Word) & 0x1f_ffff;
+    Ok(((encoded & 0x3) << 29) | (((encoded >> 2) & 0x7ffff) << 5))
+}
+
+fn encode_adrp(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    address: u64,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::PageTarget(target) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if target & 0xfff != 0 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let page_delta = target.wrapping_sub(address & !0xfff) as i64;
+    let imm = page_delta >> 12;
+    if !(-(1 << 20)..(1 << 20)).contains(&imm) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let encoded = (imm as i32 as Word) & 0x1f_ffff;
+    Ok(((encoded & 0x3) << 29) | (((encoded >> 2) & 0x7ffff) << 5))
+}
+
+fn encode_bit_num(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::Immediate(bit) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !(0..=63).contains(bit) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let bit = *bit as Word;
+    Ok(((bit & 0x20) << 26) | ((bit & 0x1f) << 19))
+}
+
+fn encode_addr_simple(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
+    let DecodedOperand::Memory(memory) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !matches!(memory.base.class, RegisterClass::X | RegisterClass::XOrSp)
+        || memory.base.index > 31
+        || memory.mode != AddressingMode::Offset
+        || memory.offset != MemoryOffset::None
+    {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok((memory.base.index as Word) << 5)
+}
+
+fn encode_addr_regoff(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    word: Word,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Memory(memory) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    let MemoryOffset::Register { register, shift } = &memory.offset else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !matches!(memory.base.class, RegisterClass::X | RegisterClass::XOrSp)
+        || memory.base.index > 31
+        || memory.mode != AddressingMode::Offset
+        || register.class != RegisterClass::X
+        || register.index > 31
+    {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let size = ((word >> 30) & 0x3) as u8;
+    let shift_bit = match *shift {
+        None => 0,
+        Some(Shift {
+            kind: ShiftKind::Lsl,
+            amount,
+        }) if amount == size => 1 << 12,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(((memory.base.index as Word) << 5)
+        | ((register.index as Word) << 16)
+        | (0b011 << 13)
+        | shift_bit)
+}
+
+fn encode_addr_simm7(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Memory(memory) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !matches!(memory.base.class, RegisterClass::X | RegisterClass::XOrSp)
+        || memory.base.index > 31
+    {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let MemoryOffset::Immediate(offset) = memory.offset else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if offset % 8 != 0 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+    let imm = offset / 8;
+    if !(-64..64).contains(&imm) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let mode_bits = match (opcode.class_name(), memory.mode) {
+        ("LdstpairOff" | "LdstnapairOffs", AddressingMode::Offset) => 0,
+        ("LdstpairIndexed", AddressingMode::PostIndex) => 0,
+        ("LdstpairIndexed", AddressingMode::PreIndex) => 1 << 24,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(((memory.base.index as Word) << 5) | (((imm as i32 as Word) & 0x7f) << 15) | mode_bits)
+}
+
+fn encode_addr_simm9(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    opcode: &Aarch64Opcode,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Memory(memory) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !matches!(memory.base.class, RegisterClass::X | RegisterClass::XOrSp)
+        || memory.base.index > 31
+    {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let MemoryOffset::Immediate(offset) = memory.offset else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !(-256..=255).contains(&offset) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let mode_bits = match (opcode.class_name(), memory.mode) {
+        ("LdstUnscaled", AddressingMode::Offset) => 0,
+        ("LdstImm9", AddressingMode::PostIndex) => 0,
+        ("LdstImm9", AddressingMode::PreIndex) => 1 << 11,
+        _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+    };
+
+    Ok(((memory.base.index as Word) << 5) | (((offset as i32 as Word) & 0x1ff) << 12) | mode_bits)
+}
+
+fn encode_addr_uimm12(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    word: Word,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::Memory(memory) = operand else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if !matches!(memory.base.class, RegisterClass::X | RegisterClass::XOrSp)
+        || memory.base.index > 31
+        || memory.mode != AddressingMode::Offset
+    {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let MemoryOffset::Immediate(offset) = memory.offset else {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    };
+    if offset < 0 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    let scale = (word >> 30) & 0x3;
+    let unit = 1_i64 << scale;
+    if offset % unit != 0 {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+    let imm = offset / unit;
+    if !(0..=0xfff).contains(&imm) {
+        return Err(EncodeError::InvalidOperand { kind: kind.name() });
+    }
+
+    Ok(((memory.base.index as Word) << 5) | ((imm as Word) << 10))
 }
 
 fn rt(word: Word) -> u8 {

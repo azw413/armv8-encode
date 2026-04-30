@@ -1,0 +1,9 @@
+# Generated from tests/fixtures/aarch64/encode_basic.s with:
+#   clang -target arm64-apple-macos -c encode_basic.s -o encode_basic.o
+#   otool -s __TEXT __text encode_basic.o
+#   otool -tvV encode_basic.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 1a020020 adc w0, w1, w2
+0000000000000004 9a030042 adc x2, x2, x3

@@ -1,5 +1,6 @@
 use crate::isa::aarch64;
-use crate::isa::aarch64::EncodeError;
+use crate::isa::aarch64::table;
+use crate::isa::aarch64::{Aarch64Mnemonic, DecodedOperand, EncodeError, Register, RegisterClass};
 use std::collections::BTreeSet;
 
 const BASIC_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/basic.otool.txt");
@@ -34,6 +35,8 @@ const WHOLE_FUNCTIONS_OTOOL_FIXTURE: &str =
     include_str!("../tests/fixtures/aarch64/whole_functions.otool.txt");
 const FORMATTING_OTOOL_FIXTURE: &str =
     include_str!("../tests/fixtures/aarch64/formatting.otool.txt");
+const ENCODE_BASIC_OTOOL_FIXTURE: &str =
+    include_str!("../tests/fixtures/aarch64/encode_basic.otool.txt");
 const DIRECT_TESTED_OPERAND_KINDS: &[&str] = &[
     "AddrAdrp",
     "Barrier",
@@ -120,18 +123,961 @@ fn parse_otool_fixture(text: &str) -> Vec<OtoolFixtureInsn> {
 }
 
 #[test]
-fn encode_instruction_is_explicitly_unimplemented() {
-    let instruction = aarch64::InstructionTemplate {
-        mnemonic: "adc",
-        operands: Vec::new(),
-    };
+fn mnemonic_index_returns_ordered_candidate_rows() {
+    let candidates = table::opcodes_for_mnemonic(Aarch64Mnemonic::Adc);
+
+    assert!(!candidates.is_empty());
+    assert_eq!(candidates[0].mnemonic(), "adc");
+    assert_eq!(candidates[0].class_name(), "AddsubCarry");
+    assert_eq!(candidates[0].base_opcode(), 0x1a000000);
+    assert_eq!(
+        candidates[0]
+            .operands()
+            .into_iter()
+            .map(|kind| kind.name())
+            .collect::<Vec<_>>(),
+        vec!["Rd", "Rn", "Rm"]
+    );
+}
+
+#[test]
+fn encode_instruction_reports_unknown_mnemonic() {
+    let instruction = template(0, Aarch64Mnemonic::Other("not-an-opcode"), Vec::new());
 
     assert_eq!(
         aarch64::encode_instruction(&instruction),
-        Err(EncodeError::Unimplemented {
-            kind: "instruction"
+        Err(EncodeError::UnknownMnemonic {
+            mnemonic: "not-an-opcode"
         })
     );
+}
+
+#[test]
+fn encode_instruction_reports_no_matching_operand_count() {
+    let instruction = template(0, Aarch64Mnemonic::Adc, Vec::new());
+
+    assert_eq!(
+        aarch64::encode_instruction(&instruction),
+        Err(EncodeError::NoMatchingForm { mnemonic: "adc" })
+    );
+}
+
+#[test]
+fn encode_instruction_can_emit_operandless_table_rows() {
+    let instruction = template(0, Aarch64Mnemonic::Nop, Vec::new());
+
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0xd503201f));
+}
+
+#[test]
+fn encode_instruction_can_emit_register_operands() {
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::Adc,
+        vec![
+            DecodedOperand::Register(w_reg(0)),
+            DecodedOperand::Register(w_reg(1)),
+            DecodedOperand::Register(w_reg(2)),
+        ],
+    );
+
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0x1a020020));
+}
+
+#[test]
+fn encoded_register_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(ENCODE_BASIC_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "adc w0, w1, w2",
+            template(
+                0,
+                Aarch64Mnemonic::Adc,
+                vec![
+                    DecodedOperand::Register(w_reg(0)),
+                    DecodedOperand::Register(w_reg(1)),
+                    DecodedOperand::Register(w_reg(2)),
+                ],
+            ),
+        ),
+        (
+            "adc x2, x2, x3",
+            template(
+                4,
+                Aarch64Mnemonic::Adc,
+                vec![
+                    DecodedOperand::Register(x_reg(2)),
+                    DecodedOperand::Register(x_reg(2)),
+                    DecodedOperand::Register(x_reg(3)),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_ra_operand_matches_otool_fixture() {
+    let fixture = parse_otool_fixture(DATAPROC_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "madd w9, w10, w11, w12",
+            template(
+                0x7c,
+                Aarch64Mnemonic::Madd,
+                vec![
+                    DecodedOperand::Register(w_reg(9)),
+                    DecodedOperand::Register(w_reg(10)),
+                    DecodedOperand::Register(w_reg(11)),
+                    DecodedOperand::Register(w_reg(12)),
+                ],
+            ),
+        ),
+        (
+            "madd x0, x1, x2, x3",
+            template(
+                0x80,
+                Aarch64Mnemonic::Madd,
+                vec![
+                    DecodedOperand::Register(x_reg(0)),
+                    DecodedOperand::Register(x_reg(1)),
+                    DecodedOperand::Register(x_reg(2)),
+                    DecodedOperand::Register(x_reg(3)),
+                ],
+            ),
+        ),
+        (
+            "msub w4, w5, w6, w7",
+            template(
+                0x84,
+                Aarch64Mnemonic::Msub,
+                vec![
+                    DecodedOperand::Register(w_reg(4)),
+                    DecodedOperand::Register(w_reg(5)),
+                    DecodedOperand::Register(w_reg(6)),
+                    DecodedOperand::Register(w_reg(7)),
+                ],
+            ),
+        ),
+        (
+            "msub x13, x14, x15, x16",
+            template(
+                0x88,
+                Aarch64Mnemonic::Msub,
+                vec![
+                    DecodedOperand::Register(x_reg(13)),
+                    DecodedOperand::Register(x_reg(14)),
+                    DecodedOperand::Register(x_reg(15)),
+                    DecodedOperand::Register(x_reg(16)),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_rt_and_pcrel19_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(BRANCH_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "b.eq 0x4c",
+            template(
+                0x8,
+                Aarch64Mnemonic::Beq,
+                vec![DecodedOperand::BranchTarget(0x4c)],
+            ),
+        ),
+        (
+            "b.ne 0x4c",
+            template(
+                0xc,
+                Aarch64Mnemonic::Bne,
+                vec![DecodedOperand::BranchTarget(0x4c)],
+            ),
+        ),
+        (
+            "cbz w0, 0x4c",
+            template(
+                0x10,
+                Aarch64Mnemonic::Cbz,
+                vec![
+                    DecodedOperand::Register(w_reg(0)),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+        (
+            "cbz x1, 0x4c",
+            template(
+                0x14,
+                Aarch64Mnemonic::Cbz,
+                vec![
+                    DecodedOperand::Register(x_reg(1)),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+        (
+            "cbnz w2, 0x4c",
+            template(
+                0x18,
+                Aarch64Mnemonic::Cbnz,
+                vec![
+                    DecodedOperand::Register(w_reg(2)),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+        (
+            "cbnz x3, 0x4c",
+            template(
+                0x1c,
+                Aarch64Mnemonic::Cbnz,
+                vec![
+                    DecodedOperand::Register(x_reg(3)),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_pcrel26_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(BRANCH_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "b 0x4c",
+            template(
+                0,
+                Aarch64Mnemonic::B,
+                vec![DecodedOperand::BranchTarget(0x4c)],
+            ),
+        ),
+        (
+            "bl 0x4c",
+            template(
+                4,
+                Aarch64Mnemonic::Bl,
+                vec![DecodedOperand::BranchTarget(0x4c)],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_bitnum_and_pcrel14_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(BRANCH_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "tbz w0, #0x3, 0x4c",
+            template(
+                0x20,
+                Aarch64Mnemonic::Tbz,
+                vec![
+                    DecodedOperand::Register(w_reg(0)),
+                    DecodedOperand::Immediate(3),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+        (
+            "tbnz w1, #0x4, 0x4c",
+            template(
+                0x24,
+                Aarch64Mnemonic::Tbnz,
+                vec![
+                    DecodedOperand::Register(w_reg(1)),
+                    DecodedOperand::Immediate(4),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+        (
+            "tbz x2, #0x28, 0x4c",
+            template(
+                0x28,
+                Aarch64Mnemonic::Tbz,
+                vec![
+                    DecodedOperand::Register(x_reg(2)),
+                    DecodedOperand::Immediate(0x28),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+        (
+            "tbnz x3, #0x29, 0x4c",
+            template(
+                0x2c,
+                Aarch64Mnemonic::Tbnz,
+                vec![
+                    DecodedOperand::Register(x_reg(3)),
+                    DecodedOperand::Immediate(0x29),
+                    DecodedOperand::BranchTarget(0x4c),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_rt2_and_simm7_pair_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(BASIC_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "stp x29, x30, [sp, #-0x10]!",
+            template(
+                0,
+                Aarch64Mnemonic::Stp,
+                vec![
+                    DecodedOperand::Register(x_reg(29)),
+                    DecodedOperand::Register(x_reg(30)),
+                    mem_imm(sp_reg(), -0x10, aarch64::AddressingMode::PreIndex),
+                ],
+            ),
+        ),
+        (
+            "ldp x29, x30, [sp], #0x10",
+            template(
+                0x1c,
+                Aarch64Mnemonic::Ldp,
+                vec![
+                    DecodedOperand::Register(x_reg(29)),
+                    DecodedOperand::Register(x_reg(30)),
+                    mem_imm(sp_reg(), 0x10, aarch64::AddressingMode::PostIndex),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_rs_and_simple_address_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(LOADSTORE_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "ldxr x20, [x21]",
+            template(
+                0x28,
+                Aarch64Mnemonic::Ldxr,
+                vec![DecodedOperand::Register(x_reg(20)), mem_simple(x_reg(21))],
+            ),
+        ),
+        (
+            "stxr w22, x23, [x24]",
+            template(
+                0x2c,
+                Aarch64Mnemonic::Stxr,
+                vec![
+                    DecodedOperand::Register(w_reg(22)),
+                    DecodedOperand::Register(x_reg(23)),
+                    mem_simple(x_reg(24)),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_uimm12_address_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(LOADSTORE_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "str x0, [x1, #0x10]",
+            template(
+                0,
+                Aarch64Mnemonic::Str,
+                vec![
+                    DecodedOperand::Register(x_reg(0)),
+                    mem_imm(x_reg(1), 0x10, aarch64::AddressingMode::Offset),
+                ],
+            ),
+        ),
+        (
+            "ldr x2, [x3, #0x18]",
+            template(
+                4,
+                Aarch64Mnemonic::Ldr,
+                vec![
+                    DecodedOperand::Register(x_reg(2)),
+                    mem_imm(x_reg(3), 0x18, aarch64::AddressingMode::Offset),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_simm9_address_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(LOADSTORE_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "stur x4, [x5, #-0x8]",
+            template(
+                0x8,
+                Aarch64Mnemonic::Stur,
+                vec![
+                    DecodedOperand::Register(x_reg(4)),
+                    mem_imm(x_reg(5), -0x8, aarch64::AddressingMode::Offset),
+                ],
+            ),
+        ),
+        (
+            "ldur x6, [x7, #-0x10]",
+            template(
+                0xc,
+                Aarch64Mnemonic::Ldur,
+                vec![
+                    DecodedOperand::Register(x_reg(6)),
+                    mem_imm(x_reg(7), -0x10, aarch64::AddressingMode::Offset),
+                ],
+            ),
+        ),
+        (
+            "str x8, [x9], #0x8",
+            template(
+                0x10,
+                Aarch64Mnemonic::Str,
+                vec![
+                    DecodedOperand::Register(x_reg(8)),
+                    mem_imm(x_reg(9), 0x8, aarch64::AddressingMode::PostIndex),
+                ],
+            ),
+        ),
+        (
+            "ldr x10, [x11, #0x8]!",
+            template(
+                0x14,
+                Aarch64Mnemonic::Ldr,
+                vec![
+                    DecodedOperand::Register(x_reg(10)),
+                    mem_imm(x_reg(11), 0x8, aarch64::AddressingMode::PreIndex),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_register_offset_address_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(LOADSTORE_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "ldr x12, [x13, x14]",
+            template(
+                0x18,
+                Aarch64Mnemonic::Ldr,
+                vec![
+                    DecodedOperand::Register(x_reg(12)),
+                    mem_reg(x_reg(13), x_reg(14), None),
+                ],
+            ),
+        ),
+        (
+            "ldr x15, [x16, x17, lsl #3]",
+            template(
+                0x1c,
+                Aarch64Mnemonic::Ldr,
+                vec![
+                    DecodedOperand::Register(x_reg(15)),
+                    mem_reg(
+                        x_reg(16),
+                        x_reg(17),
+                        Some(aarch64::Shift {
+                            kind: aarch64::ShiftKind::Lsl,
+                            amount: 3,
+                        }),
+                    ),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_sp_and_extended_register_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(EXTEND_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "add x0, x1, w2, uxtb",
+            template(
+                0,
+                Aarch64Mnemonic::Add,
+                vec![
+                    DecodedOperand::Register(x_reg(0)),
+                    DecodedOperand::Register(x_reg(1)),
+                    DecodedOperand::ExtendedRegister(ext_reg(
+                        w_reg(2),
+                        aarch64::ExtendKind::Uxtb,
+                        0,
+                    )),
+                ],
+            ),
+        ),
+        (
+            "add x3, sp, w4, uxth #1",
+            template(
+                4,
+                Aarch64Mnemonic::Add,
+                vec![
+                    DecodedOperand::Register(x_reg(3)),
+                    DecodedOperand::Register(sp_reg()),
+                    DecodedOperand::ExtendedRegister(ext_reg(
+                        w_reg(4),
+                        aarch64::ExtendKind::Uxth,
+                        1,
+                    )),
+                ],
+            ),
+        ),
+        (
+            "adds x5, x6, w7, uxtw #2",
+            template(
+                8,
+                Aarch64Mnemonic::Adds,
+                vec![
+                    DecodedOperand::Register(x_reg(5)),
+                    DecodedOperand::Register(x_reg(6)),
+                    DecodedOperand::ExtendedRegister(ext_reg(
+                        w_reg(7),
+                        aarch64::ExtendKind::Uxtw,
+                        2,
+                    )),
+                ],
+            ),
+        ),
+        (
+            "sub x10, x11, x12, uxtx #4",
+            template(
+                0x10,
+                Aarch64Mnemonic::Sub,
+                vec![
+                    DecodedOperand::Register(x_reg(10)),
+                    DecodedOperand::Register(x_reg(11)),
+                    DecodedOperand::ExtendedRegister(ext_reg(
+                        x_reg(12),
+                        aarch64::ExtendKind::Uxtx,
+                        4,
+                    )),
+                ],
+            ),
+        ),
+        (
+            "subs x13, x14, w15, sxth #1",
+            template(
+                0x14,
+                Aarch64Mnemonic::Subs,
+                vec![
+                    DecodedOperand::Register(x_reg(13)),
+                    DecodedOperand::Register(x_reg(14)),
+                    DecodedOperand::ExtendedRegister(ext_reg(
+                        w_reg(15),
+                        aarch64::ExtendKind::Sxth,
+                        1,
+                    )),
+                ],
+            ),
+        ),
+        (
+            "sub sp, sp, x17, sxtx",
+            template(
+                0x1c,
+                Aarch64Mnemonic::Sub,
+                vec![
+                    DecodedOperand::Register(sp_reg()),
+                    DecodedOperand::Register(sp_reg()),
+                    DecodedOperand::ExtendedRegister(ext_reg(
+                        x_reg(17),
+                        aarch64::ExtendKind::Sxtx,
+                        0,
+                    )),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_shifted_register_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(INTEGER_OTOOL_FIXTURE);
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::Add,
+        vec![
+            DecodedOperand::Register(x_reg(4)),
+            DecodedOperand::Register(x_reg(5)),
+            DecodedOperand::ShiftedRegister(shift_reg(x_reg(6), aarch64::ShiftKind::Lsl, 3)),
+        ],
+    );
+
+    assert_encoded_instruction_matches_fixture(&fixture, "add x4, x5, x6, lsl #3", &instruction);
+}
+
+#[test]
+fn encoded_arithmetic_immediate_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(BASIC_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "add x0, x0, #0x1",
+            template(
+                0x8,
+                Aarch64Mnemonic::Add,
+                vec![
+                    DecodedOperand::Register(x_reg(0)),
+                    DecodedOperand::Register(x_reg(0)),
+                    DecodedOperand::Immediate(1),
+                ],
+            ),
+        ),
+        (
+            "sub x1, x1, #0x2",
+            template(
+                0xc,
+                Aarch64Mnemonic::Sub,
+                vec![
+                    DecodedOperand::Register(x_reg(1)),
+                    DecodedOperand::Register(x_reg(1)),
+                    DecodedOperand::Immediate(2),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_move_wide_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(INTEGER_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "mov x9, #0x1234",
+            template(
+                0xc,
+                Aarch64Mnemonic::Mov,
+                vec![
+                    DecodedOperand::Register(x_reg(9)),
+                    DecodedOperand::Immediate(0x1234),
+                ],
+            ),
+        ),
+        (
+            "movk x9, #0xabcd, lsl #16",
+            template(
+                0x10,
+                Aarch64Mnemonic::Movk,
+                vec![
+                    DecodedOperand::Register(x_reg(9)),
+                    DecodedOperand::ShiftedImmediate(aarch64::ShiftedImmediate {
+                        value: 0xabcd,
+                        shift: 16,
+                    }),
+                ],
+            ),
+        ),
+        (
+            "mov x10, #-0x56",
+            template(
+                0x14,
+                Aarch64Mnemonic::Mov,
+                vec![
+                    DecodedOperand::Register(x_reg(10)),
+                    DecodedOperand::Immediate(-0x56),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_bitfield_immediate_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(INTEGER_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "ubfx x11, x12, #8, #16",
+            template(
+                0x18,
+                Aarch64Mnemonic::Ubfx,
+                vec![
+                    DecodedOperand::Register(x_reg(11)),
+                    DecodedOperand::Register(x_reg(12)),
+                    DecodedOperand::Immediate(8),
+                    DecodedOperand::Immediate(16),
+                ],
+            ),
+        ),
+        (
+            "bfxil x13, x14, #4, #12",
+            template(
+                0x1c,
+                Aarch64Mnemonic::Bfxil,
+                vec![
+                    DecodedOperand::Register(x_reg(13)),
+                    DecodedOperand::Register(x_reg(14)),
+                    DecodedOperand::Immediate(4),
+                    DecodedOperand::Immediate(12),
+                ],
+            ),
+        ),
+        (
+            "lsl x15, x16, #5",
+            template(
+                0x20,
+                Aarch64Mnemonic::Lsl,
+                vec![
+                    DecodedOperand::Register(x_reg(15)),
+                    DecodedOperand::Register(x_reg(16)),
+                    DecodedOperand::Immediate(5),
+                ],
+            ),
+        ),
+        (
+            "lsr x17, x18, #6",
+            template(
+                0x24,
+                Aarch64Mnemonic::Lsr,
+                vec![
+                    DecodedOperand::Register(x_reg(17)),
+                    DecodedOperand::Register(x_reg(18)),
+                    DecodedOperand::Immediate(6),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_logical_immediate_operands_match_otool_fixture() {
+    let fixture = parse_otool_fixture(INTEGER_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "and x7, x7, #0xff",
+            template(
+                4,
+                Aarch64Mnemonic::And,
+                vec![
+                    DecodedOperand::Register(x_reg(7)),
+                    DecodedOperand::Register(x_reg(7)),
+                    DecodedOperand::Immediate(0xff),
+                ],
+            ),
+        ),
+        (
+            "eor x8, x8, #0xff00",
+            template(
+                8,
+                Aarch64Mnemonic::Eor,
+                vec![
+                    DecodedOperand::Register(x_reg(8)),
+                    DecodedOperand::Register(x_reg(8)),
+                    DecodedOperand::Immediate(0xff00),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encoded_pcrel21_operand_matches_otool_fixture() {
+    let fixture = parse_otool_fixture(INTEGER_OTOOL_FIXTURE);
+    let instruction = template(
+        0x28,
+        Aarch64Mnemonic::Adr,
+        vec![
+            DecodedOperand::Register(x_reg(19)),
+            DecodedOperand::Immediate(4),
+        ],
+    );
+
+    assert_encoded_instruction_matches_fixture(&fixture, "adr x19, #4", &instruction);
+}
+
+#[test]
+fn encoded_adrp_operand_matches_otool_fixture() {
+    let fixture = parse_otool_fixture(ADRP_OTOOL_FIXTURE);
+    let cases = [
+        (
+            "adrp x0, 0 ; 0x0",
+            template(
+                0,
+                Aarch64Mnemonic::Adrp,
+                vec![
+                    DecodedOperand::Register(x_reg(0)),
+                    DecodedOperand::PageTarget(0),
+                ],
+            ),
+        ),
+        (
+            "adrp x1, 1 ; 0x1000",
+            template(
+                4,
+                Aarch64Mnemonic::Adrp,
+                vec![
+                    DecodedOperand::Register(x_reg(1)),
+                    DecodedOperand::PageTarget(0x1000),
+                ],
+            ),
+        ),
+        (
+            "adrp x2, -1 ; 0xfffffffffffff000",
+            template(
+                8,
+                Aarch64Mnemonic::Adrp,
+                vec![
+                    DecodedOperand::Register(x_reg(2)),
+                    DecodedOperand::PageTarget(0xffff_ffff_ffff_f000),
+                ],
+            ),
+        ),
+    ];
+
+    for (expected_case, instruction) in cases {
+        assert_encoded_instruction_matches_fixture(&fixture, expected_case, &instruction);
+    }
+}
+
+#[test]
+fn encode_instruction_normalizes_conditional_branch_mnemonics() {
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::parse("b.ne"),
+        vec![DecodedOperand::BranchTarget(0x1000)],
+    );
+
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0x54008001));
+}
+
+fn template(
+    address: u64,
+    mnemonic: Aarch64Mnemonic,
+    operands: Vec<DecodedOperand>,
+) -> aarch64::InstructionTemplate {
+    aarch64::InstructionTemplate {
+        address,
+        mnemonic,
+        operands,
+    }
+}
+
+fn w_reg(index: u8) -> Register {
+    Register {
+        class: RegisterClass::W,
+        index,
+    }
+}
+
+fn x_reg(index: u8) -> Register {
+    Register {
+        class: RegisterClass::X,
+        index,
+    }
+}
+
+fn sp_reg() -> Register {
+    Register {
+        class: RegisterClass::XOrSp,
+        index: 31,
+    }
+}
+
+fn mem_imm(base: Register, offset: i64, mode: aarch64::AddressingMode) -> DecodedOperand {
+    DecodedOperand::Memory(aarch64::MemoryOperand {
+        base,
+        offset: aarch64::MemoryOffset::Immediate(offset),
+        mode,
+    })
+}
+
+fn mem_simple(base: Register) -> DecodedOperand {
+    DecodedOperand::Memory(aarch64::MemoryOperand {
+        base,
+        offset: aarch64::MemoryOffset::None,
+        mode: aarch64::AddressingMode::Offset,
+    })
+}
+
+fn mem_reg(base: Register, register: Register, shift: Option<aarch64::Shift>) -> DecodedOperand {
+    DecodedOperand::Memory(aarch64::MemoryOperand {
+        base,
+        offset: aarch64::MemoryOffset::Register { register, shift },
+        mode: aarch64::AddressingMode::Offset,
+    })
+}
+
+fn ext_reg(
+    register: Register,
+    extend: aarch64::ExtendKind,
+    amount: u8,
+) -> aarch64::ExtendedRegister {
+    aarch64::ExtendedRegister {
+        register,
+        extend,
+        amount,
+    }
+}
+
+fn shift_reg(register: Register, kind: aarch64::ShiftKind, amount: u8) -> aarch64::ShiftedRegister {
+    aarch64::ShiftedRegister {
+        register,
+        shift: aarch64::Shift { kind, amount },
+    }
 }
 
 #[test]
@@ -613,6 +1559,29 @@ fn assert_fixture_covers_exact_cases(
         .collect::<BTreeSet<_>>();
 
     assert_eq!(actual, expected);
+}
+
+fn assert_encoded_instruction_matches_fixture(
+    fixture: &[OtoolFixtureInsn],
+    expected_case: &str,
+    instruction: &aarch64::InstructionTemplate,
+) {
+    let expected = fixture
+        .iter()
+        .find(|entry| format_instruction_case(entry) == expected_case)
+        .unwrap_or_else(|| panic!("missing fixture case: {expected_case}"));
+    let encoded = aarch64::encode_instruction(instruction)
+        .unwrap_or_else(|err| panic!("failed to encode {expected_case}: {err:?}"));
+
+    assert_eq!(
+        encoded, expected.word,
+        "encoded word mismatch for {expected_case}"
+    );
+
+    let decoded =
+        aarch64::decode_instruction(expected.address, encoded).expect("encoded word decodes");
+    assert_eq!(decoded.format_mnemonic(), expected.mnemonic);
+    assert_eq!(decoded.format_operands(), expected.operands);
 }
 
 fn format_instruction_case(instruction: &OtoolFixtureInsn) -> String {

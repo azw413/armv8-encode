@@ -3,9 +3,138 @@
 use self::Aarch64InsnClass::*;
 use self::Aarch64Opnd::*;
 use self::Operands::*;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 type Aarch64Insn = u32;
 type Aarch64Flags = u32;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum Aarch64Mnemonic {
+    Adc,
+    Add,
+    Adds,
+    And,
+    Adr,
+    Adrp,
+    B,
+    Beq,
+    Bl,
+    Bne,
+    Bfxil,
+    Cbnz,
+    Cbz,
+    Cmn,
+    Cmp,
+    Ldp,
+    Ldr,
+    Ldur,
+    Ldxr,
+    Lsl,
+    Lsr,
+    Madd,
+    Mov,
+    Movk,
+    Msub,
+    Eor,
+    Nop,
+    Stp,
+    Str,
+    Stur,
+    Stxr,
+    Sub,
+    Subs,
+    Tbnz,
+    Tbz,
+    Ubfx,
+    Other(&'static str),
+}
+
+impl Aarch64Mnemonic {
+    pub fn parse(mnemonic: &'static str) -> Self {
+        match mnemonic {
+            "adc" => Self::Adc,
+            "add" => Self::Add,
+            "adds" => Self::Adds,
+            "and" => Self::And,
+            "adr" => Self::Adr,
+            "adrp" => Self::Adrp,
+            "b" => Self::B,
+            "b.eq" | "beq" => Self::Beq,
+            "bl" => Self::Bl,
+            "b.ne" | "bne" => Self::Bne,
+            "bfxil" => Self::Bfxil,
+            "cbnz" => Self::Cbnz,
+            "cbz" => Self::Cbz,
+            "cmn" => Self::Cmn,
+            "cmp" => Self::Cmp,
+            "ldp" => Self::Ldp,
+            "ldr" => Self::Ldr,
+            "ldur" => Self::Ldur,
+            "ldxr" => Self::Ldxr,
+            "lsl" => Self::Lsl,
+            "lsr" => Self::Lsr,
+            "madd" => Self::Madd,
+            "mov" => Self::Mov,
+            "movk" => Self::Movk,
+            "msub" => Self::Msub,
+            "eor" => Self::Eor,
+            "nop" => Self::Nop,
+            "stp" => Self::Stp,
+            "str" => Self::Str,
+            "stur" => Self::Stur,
+            "stxr" => Self::Stxr,
+            "sub" => Self::Sub,
+            "subs" => Self::Subs,
+            "tbnz" => Self::Tbnz,
+            "tbz" => Self::Tbz,
+            "ubfx" => Self::Ubfx,
+            other => Self::Other(other),
+        }
+    }
+
+    pub(crate) fn table_name(self) -> &'static str {
+        match self {
+            Self::Adc => "adc",
+            Self::Add => "add",
+            Self::Adds => "adds",
+            Self::And => "and",
+            Self::Adr => "adr",
+            Self::Adrp => "adrp",
+            Self::B => "b",
+            Self::Beq => "beq",
+            Self::Bl => "bl",
+            Self::Bne => "bne",
+            Self::Bfxil => "bfxil",
+            Self::Cbnz => "cbnz",
+            Self::Cbz => "cbz",
+            Self::Cmn => "cmn",
+            Self::Cmp => "cmp",
+            Self::Ldp => "ldp",
+            Self::Ldr => "ldr",
+            Self::Ldur => "ldur",
+            Self::Ldxr => "ldxr",
+            Self::Lsl => "lsl",
+            Self::Lsr => "lsr",
+            Self::Madd => "madd",
+            Self::Mov => "mov",
+            Self::Movk => "movk",
+            Self::Msub => "msub",
+            Self::Eor => "eor",
+            Self::Nop => "nop",
+            Self::Stp => "stp",
+            Self::Str => "str",
+            Self::Stur => "stur",
+            Self::Stxr => "stxr",
+            Self::Sub => "sub",
+            Self::Subs => "subs",
+            Self::Tbnz => "tbnz",
+            Self::Tbz => "tbz",
+            Self::Ubfx => "ubfx",
+            Self::Other(mnemonic) => mnemonic,
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 enum Aarch64OperandClass {
@@ -362,6 +491,14 @@ impl Aarch64Opcode {
         self.name
     }
 
+    pub(crate) fn mnemonic_id(&self) -> Aarch64Mnemonic {
+        Aarch64Mnemonic::parse(self.name)
+    }
+
+    pub(crate) fn base_opcode(&self) -> Aarch64Insn {
+        self.opcode
+    }
+
     fn is_alias(&self) -> bool {
         self.flags & F_ALIAS != 0
     }
@@ -385,6 +522,27 @@ impl Aarch64Opcode {
         self.iclass.name()
     }
 }
+
+struct OpcodeIndex {
+    by_mnemonic: HashMap<Aarch64Mnemonic, Vec<&'static Aarch64Opcode>>,
+}
+
+impl OpcodeIndex {
+    fn build() -> Self {
+        let mut by_mnemonic: HashMap<Aarch64Mnemonic, Vec<&'static Aarch64Opcode>> = HashMap::new();
+
+        for opcode in &aarch64_opcode_table {
+            by_mnemonic
+                .entry(opcode.mnemonic_id())
+                .or_default()
+                .push(opcode);
+        }
+
+        Self { by_mnemonic }
+    }
+}
+
+static OPCODE_INDEX: OnceLock<OpcodeIndex> = OnceLock::new();
 
 impl Aarch64InsnClass {
     fn name(self) -> &'static str {
@@ -9599,6 +9757,15 @@ pub(crate) fn operand_kinds() -> Vec<Aarch64Opnd> {
     }
 
     kinds
+}
+
+pub(crate) fn opcodes_for_mnemonic(mnemonic: Aarch64Mnemonic) -> Vec<Aarch64Opcode> {
+    OPCODE_INDEX
+        .get_or_init(OpcodeIndex::build)
+        .by_mnemonic
+        .get(&mnemonic)
+        .map(|opcodes| opcodes.iter().map(|opcode| **opcode).collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn opcode_class_mnemonics(class_name: &str) -> Vec<&'static str> {

@@ -7,13 +7,16 @@
 mod operand;
 pub(crate) mod table;
 
-use operand::{decode_operand, w_reg, DecodeContext, IMPLEMENTED_OPERAND_KINDS};
+use operand::{
+    decode_operand, encode_operand, w_reg, DecodeContext, EncodeContext, IMPLEMENTED_OPERAND_KINDS,
+};
 pub use operand::{
     AddressingMode, DecodeError, DecodedOperand, EncodeError, ExtendKind, ExtendedRegister,
     MemoryOffset, MemoryOperand, Register, RegisterClass, Shift, ShiftKind, ShiftedImmediate,
     ShiftedRegister, VectorArrangement, VectorElement, VectorElementSize, VectorList,
     VectorRegister,
 };
+pub use table::Aarch64Mnemonic;
 
 /// Raw AArch64 instruction word.
 pub type Word = u32;
@@ -46,7 +49,8 @@ pub struct DecodedInstruction {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InstructionTemplate {
-    pub mnemonic: &'static str,
+    pub address: u64,
+    pub mnemonic: Aarch64Mnemonic,
     pub operands: Vec<DecodedOperand>,
 }
 
@@ -98,12 +102,60 @@ where
 
 /// Encode one AArch64 instruction.
 ///
-/// The public API shape exists so the encoder can grow alongside operand
-/// codecs. Actual table-driven encoding is not implemented yet.
-pub fn encode_instruction(_instruction: &InstructionTemplate) -> Result<Word, EncodeError> {
-    Err(EncodeError::Unimplemented {
-        kind: "instruction",
-    })
+/// Encoding is table-driven, but operand encoders are still being built out.
+/// At this stage the encoder indexes candidate rows by mnemonic and reaches
+/// the relevant operand codec, which may still report `Unimplemented`.
+pub fn encode_instruction(instruction: &InstructionTemplate) -> Result<Word, EncodeError> {
+    let candidates = table::opcodes_for_mnemonic(instruction.mnemonic);
+
+    if candidates.is_empty() {
+        return Err(EncodeError::UnknownMnemonic {
+            mnemonic: instruction.mnemonic.table_name(),
+        });
+    }
+
+    let mut last_error = None;
+    for opcode in candidates {
+        let operand_kinds = opcode.operands();
+        if operand_kinds.len() != instruction.operands.len() {
+            continue;
+        }
+
+        let mut word = opcode.base_opcode();
+        let mut matched = true;
+        for (kind, operand) in operand_kinds.into_iter().zip(&instruction.operands) {
+            match encode_operand(
+                kind,
+                operand,
+                EncodeContext {
+                    base_word: word,
+                    address: instruction.address,
+                    opcode: &opcode,
+                },
+            ) {
+                Ok(bits) => word |= bits,
+                Err(EncodeError::InvalidOperand { kind }) => {
+                    last_error = Some(EncodeError::InvalidOperand { kind });
+                    matched = false;
+                    break;
+                }
+                Err(EncodeError::Unimplemented { kind }) => {
+                    last_error = Some(EncodeError::Unimplemented { kind });
+                    matched = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if matched {
+            return Ok(word);
+        }
+    }
+
+    Err(last_error.unwrap_or(EncodeError::NoMatchingForm {
+        mnemonic: instruction.mnemonic.table_name(),
+    }))
 }
 
 /// Match raw AArch64 instruction words against the opcode table.
