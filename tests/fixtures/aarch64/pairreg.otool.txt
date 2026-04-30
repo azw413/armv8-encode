@@ -1,0 +1,9 @@
+# Generated from tests/fixtures/aarch64/pairreg.s with:
+#   clang -target arm64-apple-macos -march=armv8.1-a -c pairreg.s -o pairreg.o
+#   otool -s __TEXT __text pairreg.o
+#   otool -tvV pairreg.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 08207c82 casp w0, w1, w2, w3, [x4]
+0000000000000004 48267d48 casp x6, x7, x8, x9, [x10]

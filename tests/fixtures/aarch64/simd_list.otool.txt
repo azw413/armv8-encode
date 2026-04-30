@@ -1,0 +1,9 @@
+# Generated from tests/fixtures/aarch64/simd_list.s with:
+#   clang -target arm64-apple-macos -c simd_list.s -o simd_list.o
+#   otool -s __TEXT __text simd_list.o
+#   otool -tvV simd_list.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 4e020020 tbl.16b v0, { v1 }, v2
+0000000000000004 4e062083 tbl.16b v3, { v4, v5 }, v6

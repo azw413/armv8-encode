@@ -1,0 +1,17 @@
+# Generated from tests/fixtures/aarch64/system.s with:
+#   clang -target arm64-apple-macos -c system.s -o system.o
+#   otool -s __TEXT __text system.o
+#   otool -tvV system.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 d503227f hint #0x13
+0000000000000004 d5033f5f clrex
+0000000000000008 d503335f clrex #0x3
+000000000000000c d5033f9f dsb sy
+0000000000000010 d5033b9f dsb ish
+0000000000000014 d5033abf dmb ishst
+0000000000000018 d50333df isb #3
+000000000000001c d5033fdf isb
+0000000000000020 d50342df msr DAIFSet, #0x2
+0000000000000024 d50344ff msr DAIFClr, #0x4

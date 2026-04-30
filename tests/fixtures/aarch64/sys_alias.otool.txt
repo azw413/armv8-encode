@@ -1,0 +1,13 @@
+# Generated from tests/fixtures/aarch64/sys_alias.s with:
+#   clang -target arm64-apple-macos -c sys_alias.s -o sys_alias.o
+#   otool -s __TEXT __text sys_alias.o
+#   otool -tvV sys_alias.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 d5087800 at s1e1r, x0
+0000000000000004 d50b7421 dc zva, x1
+0000000000000008 d50b7522 ic ivau, x2
+000000000000000c d508751f ic iallu
+0000000000000010 d50887a3 tlbi vale1, x3
+0000000000000014 d508871f tlbi vmalle1

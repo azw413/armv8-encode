@@ -1,0 +1,28 @@
+# Generated from tests/fixtures/aarch64/simd_remaining.s with:
+#   clang -target arm64-apple-macos -c simd_remaining.s -o simd_remaining.o
+#   otool -s __TEXT __text simd_remaining.o
+#   otool -tvV simd_remaining.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 0f00e640 movi.8b v0, #0x12
+0000000000000004 0f01a681 movi.4h v1, #0x34, lsl #8
+0000000000000008 0f0246c2 movi.2s v2, #0x56, lsl #16
+000000000000000c 2f00a643 mvni.4h v3, #0x12, lsl #8
+0000000000000010 0f03f604 fmov.2s v4, #1.00000000
+0000000000000014 6f00f405 fmov.2d v5, #2.00000000
+0000000000000018 2f04e506 movi d6, #0xff000000ff000000
+000000000000001c 6e092907 ext.16b v7, v8, v9, #0x5
+0000000000000020 4e14056a dup.4s v10, v11[2]
+0000000000000024 0e0f2dac smov.b w12, v13[7]
+0000000000000028 4e183dee mov.d x14, v15[1]
+000000000000002c 4e071e30 mov.b v16[3], w17
+0000000000000030 6e0c4672 mov.s v18[1], v19[2]
+0000000000000034 4fb61ab4 fmla.4s v20, v21, v22[3]
+0000000000000038 4f390717 sshr.4s v23, v24, #0x7
+000000000000003c 4f135759 shl.8h v25, v26, #0x3
+0000000000000040 2f0c879b sqshrun.8b v27, v28, #0x4
+0000000000000044 0d401c00 ld1.b { v0 }[7], [x0]
+0000000000000048 0dff5821 ld2.h { v1, v2 }[3], [x1], #4
+000000000000004c 0da3b043 st4.s { v3, v4, v5, v6 }[1], [x2], x3
+0000000000000050 13862483 extr w3, w4, w6, #0x9

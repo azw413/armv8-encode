@@ -1,0 +1,10 @@
+# Generated from tests/fixtures/aarch64/simd_scalar.s with:
+#   clang -target arm64-apple-macos -c simd_scalar.s -o simd_scalar.o
+#   otool -s __TEXT __text simd_scalar.o
+#   otool -tvV simd_scalar.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 5ee28420 add d0, d1, d2
+0000000000000004 7ee58483 sub d3, d4, d5
+0000000000000008 5ee098e6 cmeq d6, d7, #0

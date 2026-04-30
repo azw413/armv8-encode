@@ -1,0 +1,15 @@
+# Generated from tests/fixtures/aarch64/extend.s with:
+#   clang -target arm64-apple-macos -c extend.s -o extend.o
+#   otool -s __TEXT __text extend.o
+#   otool -tvV extend.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 8b220020 add x0, x1, w2, uxtb
+0000000000000004 8b2427e3 add x3, sp, w4, uxth #1
+0000000000000008 ab2748c5 adds x5, x6, w7, uxtw #2
+000000000000000c ab298d1f cmn x8, w9, sxtb #3
+0000000000000010 cb2c716a sub x10, x11, x12, uxtx #4
+0000000000000014 eb2fa5cd subs x13, x14, w15, sxth #1
+0000000000000018 eb30f3ff cmp sp, x16, sxtx #4
+000000000000001c cb31e3ff sub sp, sp, x17, sxtx

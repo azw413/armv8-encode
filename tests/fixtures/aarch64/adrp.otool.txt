@@ -1,0 +1,10 @@
+# Generated from tests/fixtures/aarch64/adrp.s with:
+#   clang -target arm64-apple-macos -c adrp.s -o adrp.o
+#   otool -s __TEXT __text adrp.o
+#   otool -tvV adrp.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 90000000 adrp x0, 0 ; 0x0
+0000000000000004 b0000001 adrp x1, 1 ; 0x1000
+0000000000000008 f0ffffe2 adrp x2, -1 ; 0xfffffffffffff000

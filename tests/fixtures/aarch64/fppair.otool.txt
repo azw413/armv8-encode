@@ -1,0 +1,13 @@
+# Generated from tests/fixtures/aarch64/fppair.s with:
+#   clang -target arm64-apple-macos -c fppair.s -o fppair.o
+#   otool -s __TEXT __text fppair.o
+#   otool -tvV fppair.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 6d010440 stp d0, d1, [x2, #0x10]
+0000000000000004 6d7f10a3 ldp d3, d4, [x5, #-0x10]
+0000000000000008 6c811d06 stp d6, d7, [x8], #0x10
+000000000000000c 6dff2969 ldp d9, d10, [x11, #-0x10]!
+0000000000000010 6c0235cc stnp d12, d13, [x14, #0x20]
+0000000000000014 6c7e422f ldnp d15, d16, [x17, #-0x20]

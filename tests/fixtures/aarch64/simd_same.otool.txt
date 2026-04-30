@@ -1,0 +1,14 @@
+# Generated from tests/fixtures/aarch64/simd_same.s with:
+#   clang -target arm64-apple-macos -c simd_same.s -o simd_same.o
+#   otool -s __TEXT __text simd_same.o
+#   otool -tvV simd_same.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 0e228420 add.8b v0, v1, v2
+0000000000000004 4e258483 add.16b v3, v4, v5
+0000000000000008 2e6884e6 sub.4h v6, v7, v8
+000000000000000c 6e6b8549 sub.8h v9, v10, v11
+0000000000000010 0eae85ac add.2s v12, v13, v14
+0000000000000014 4eb1860f add.4s v15, v16, v17
+0000000000000018 4ef48672 add.2d v18, v19, v20

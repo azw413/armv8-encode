@@ -1,0 +1,9 @@
+# Generated from tests/fixtures/aarch64/vector_d1.s with:
+#   clang -target arm64-apple-macos -c vector_d1.s -o vector_d1.o
+#   otool -s __TEXT __text vector_d1.o
+#   otool -tvV vector_d1.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 9eaf0020 fmov.d v0[1], x1
+0000000000000004 9eae0062 fmov.d x2, v3[1]

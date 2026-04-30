@@ -11,6 +11,77 @@ const FPIMM_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/fpimm.
 const CONVERT_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/convert.otool.txt");
 const EXCEPTION_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/exception.otool.txt");
 const DATAPROC_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/dataproc.otool.txt");
+const EXTEND_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/extend.otool.txt");
+const FPPAIR_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/fppair.otool.txt");
+const ADRP_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/adrp.otool.txt");
+const SYSTEM_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/system.otool.txt");
+const SYSREG_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/sysreg.otool.txt");
+const SYS_ALIAS_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/sys_alias.otool.txt");
+const SYS_GENERIC_OTOOL_FIXTURE: &str =
+    include_str!("../tests/fixtures/aarch64/sys_generic.otool.txt");
+const PRFM_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/prfm.otool.txt");
+const SIMD_SAME_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/simd_same.otool.txt");
+const SIMD_SCALAR_OTOOL_FIXTURE: &str =
+    include_str!("../tests/fixtures/aarch64/simd_scalar.otool.txt");
+const PAIRREG_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/pairreg.otool.txt");
+const VECTOR_D1_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/vector_d1.otool.txt");
+const SIMD_LIST_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/simd_list.otool.txt");
+const SIMD_LDST_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/simd_ldst.otool.txt");
+const SHLL_OTOOL_FIXTURE: &str = include_str!("../tests/fixtures/aarch64/shll.otool.txt");
+const SIMD_REMAINING_OTOOL_FIXTURE: &str =
+    include_str!("../tests/fixtures/aarch64/simd_remaining.otool.txt");
+const WHOLE_FUNCTIONS_OTOOL_FIXTURE: &str =
+    include_str!("../tests/fixtures/aarch64/whole_functions.otool.txt");
+const DIRECT_TESTED_OPERAND_KINDS: &[&str] = &[
+    "AddrAdrp",
+    "Barrier",
+    "BarrierIsb",
+    "BarrierPsb",
+    "Cm",
+    "Cn",
+    "Ed",
+    "Em",
+    "En",
+    "Ft2",
+    "Idx",
+    "Imm0",
+    "ImmVlsl",
+    "ImmVlsr",
+    "Immr",
+    "Imms",
+    "Lvn",
+    "Lvt",
+    "LvtAl",
+    "Let",
+    "Pairreg",
+    "Pstatefield",
+    "Prfop",
+    "RmExt",
+    "RtSys",
+    "Sd",
+    "Sm",
+    "Sn",
+    "ShllImm",
+    "SimdAddrPost",
+    "SimdAddrSimple",
+    "SimdFpimm",
+    "SimdImm",
+    "SimdImmSft",
+    "Sysreg",
+    "SysregAt",
+    "SysregDc",
+    "SysregIc",
+    "SysregTlbi",
+    "Uimm3Op1",
+    "Uimm3Op2",
+    "Uimm4",
+    "Uimm7",
+    "Vd",
+    "VdD1",
+    "Vm",
+    "Vn",
+    "VnD1",
+];
 
 #[derive(Debug, Eq, PartialEq)]
 struct OtoolFixtureInsn {
@@ -127,6 +198,130 @@ fn decoded_exception_operands_match_otool() {
 #[test]
 fn decoded_dataproc_operands_match_otool() {
     assert_decoded_fixture_matches_otool(DATAPROC_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_extend_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(EXTEND_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_fppair_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(FPPAIR_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_adrp_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(ADRP_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_system_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SYSTEM_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_sysreg_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SYSREG_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_sys_alias_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SYS_ALIAS_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_psb_operand_is_csync() {
+    let decoded = aarch64::decode_instruction(0, 0xd503223f).expect("psb should match");
+
+    assert_eq!(decoded.format_mnemonic(), "psb");
+    assert_eq!(decoded.format_operands(), "csync");
+}
+
+#[test]
+fn decoded_sys_generic_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SYS_GENERIC_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_prfm_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(PRFM_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_simd_same_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SIMD_SAME_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_simd_scalar_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SIMD_SCALAR_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_pairreg_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(PAIRREG_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_vector_d1_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(VECTOR_D1_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_simd_list_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SIMD_LIST_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_simd_ldst_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SIMD_LDST_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_shll_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SHLL_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_simd_remaining_operands_match_otool() {
+    assert_decoded_fixture_matches_otool(SIMD_REMAINING_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn decoded_whole_functions_match_otool() {
+    assert_decoded_fixture_matches_otool(WHOLE_FUNCTIONS_OTOOL_FIXTURE, |_| None);
+}
+
+#[test]
+fn addsub_ext_group_is_complete() {
+    let summary = aarch64::opcode_class_summary("AddsubExt");
+
+    assert_eq!(summary.row_count, 6);
+    assert_eq!(
+        summary.mnemonics,
+        vec!["add", "adds", "cmn", "cmp", "sub", "subs"]
+    );
+
+    assert_fixture_covers_exact_cases(
+        EXTEND_OTOOL_FIXTURE,
+        &["cmn", "cmp"],
+        3,
+        &["cmn x8, w9, sxtb #3", "cmp sp, x16, sxtx #4"],
+    );
+    assert_fixture_covers_exact_cases(
+        EXTEND_OTOOL_FIXTURE,
+        &["add", "adds", "sub", "subs"],
+        4,
+        &[
+            "add x0, x1, w2, uxtb",
+            "add x3, sp, w4, uxth #1",
+            "adds x5, x6, w7, uxtw #2",
+            "sub x10, x11, x12, uxtx #4",
+            "subs x13, x14, w15, sxth #1",
+            "sub sp, sp, x17, sxtx",
+        ],
+    );
 }
 
 #[test]
@@ -295,7 +490,47 @@ fn branch_imm_group_is_complete() {
         BRANCH_OTOOL_FIXTURE,
         &["b", "bl"],
         1,
-        &["b 0x34", "bl 0x34"],
+        &["b 0x4c", "bl 0x4c"],
+    );
+}
+
+#[test]
+fn compbranch_group_is_complete() {
+    let summary = aarch64::opcode_class_summary("Compbranch");
+
+    assert_eq!(summary.row_count, 2);
+    assert_eq!(summary.mnemonics, vec!["cbnz", "cbz"]);
+
+    assert_fixture_covers_exact_cases(
+        BRANCH_OTOOL_FIXTURE,
+        &["cbz", "cbnz"],
+        2,
+        &[
+            "cbz w0, 0x4c",
+            "cbz x1, 0x4c",
+            "cbnz w2, 0x4c",
+            "cbnz x3, 0x4c",
+        ],
+    );
+}
+
+#[test]
+fn testbranch_group_is_complete() {
+    let summary = aarch64::opcode_class_summary("Testbranch");
+
+    assert_eq!(summary.row_count, 2);
+    assert_eq!(summary.mnemonics, vec!["tbnz", "tbz"]);
+
+    assert_fixture_covers_exact_cases(
+        BRANCH_OTOOL_FIXTURE,
+        &["tbz", "tbnz"],
+        3,
+        &[
+            "tbz w0, #0x3, 0x4c",
+            "tbnz w1, #0x4, 0x4c",
+            "tbz x2, #0x28, 0x4c",
+            "tbnz x3, #0x29, 0x4c",
+        ],
     );
 }
 
@@ -390,17 +625,6 @@ fn count_operands(operands: &str) -> usize {
 }
 
 #[test]
-fn unsupported_operands_are_visible_placeholders() {
-    let decoded = aarch64::decode_instruction(0, 0xd53b4200).expect("mrs should match");
-
-    assert_eq!(decoded.mnemonic, "mrs");
-    assert!(
-        decoded.format_operands().contains("<unimplemented:Sysreg>"),
-        "unsupported operand should be visible in formatted output"
-    );
-}
-
-#[test]
 fn operand_kind_coverage_snapshot() {
     let fixture = parse_otool_fixture(BASIC_OTOOL_FIXTURE)
         .into_iter()
@@ -412,20 +636,43 @@ fn operand_kind_coverage_snapshot() {
         .chain(parse_otool_fixture(CONVERT_OTOOL_FIXTURE))
         .chain(parse_otool_fixture(EXCEPTION_OTOOL_FIXTURE))
         .chain(parse_otool_fixture(DATAPROC_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(EXTEND_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(FPPAIR_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(ADRP_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SYSTEM_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SYSREG_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SYS_ALIAS_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SYS_GENERIC_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(PRFM_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SIMD_SAME_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SIMD_SCALAR_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(PAIRREG_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(VECTOR_D1_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SIMD_LIST_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SIMD_LDST_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SHLL_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(SIMD_REMAINING_OTOOL_FIXTURE))
+        .chain(parse_otool_fixture(WHOLE_FUNCTIONS_OTOOL_FIXTURE))
         .collect::<Vec<_>>();
     let fixture_words = fixture
         .iter()
         .map(|instruction| instruction.word)
+        .chain([0xd503223f])
         .collect::<Vec<_>>();
-    let coverage = aarch64::operand_kind_coverage(&fixture_words);
+    let coverage = aarch64::operand_kind_coverage(&fixture_words, DIRECT_TESTED_OPERAND_KINDS);
 
     assert!(coverage.table_operand_kinds.contains(&"Aimm"));
     assert!(coverage.table_operand_kinds.contains(&"ImmMov"));
     assert!(coverage.implemented.contains(&"Aimm"));
     assert!(coverage.implemented.contains(&"ImmMov"));
+    assert_eq!(
+        coverage.direct_tested_but_unimplemented,
+        Vec::<&'static str>::new()
+    );
     assert!(coverage.fixture_covered.contains(&"Aimm"));
     assert!(coverage.fixture_covered.contains(&"ImmMov"));
     assert!(coverage.fixture_covered.contains(&"AddrPcrel26"));
+    assert!(coverage.fixture_covered.contains(&"AddrAdrp"));
     assert!(coverage.fixture_covered.contains(&"AddrPcrel14"));
     assert!(coverage.fixture_covered.contains(&"Cond"));
     assert!(coverage.fixture_covered.contains(&"Cond1"));
@@ -440,15 +687,224 @@ fn operand_kind_coverage_snapshot() {
     assert!(coverage.fixture_covered.contains(&"Fm"));
     assert!(coverage.fixture_covered.contains(&"Fa"));
     assert!(coverage.fixture_covered.contains(&"Ft"));
+    assert!(coverage.fixture_covered.contains(&"Ft2"));
     assert!(coverage.fixture_covered.contains(&"Fpimm0"));
     assert!(coverage.fixture_covered.contains(&"Fpimm"));
     assert!(coverage.fixture_covered.contains(&"Fbits"));
     assert!(coverage.fixture_covered.contains(&"Exc"));
     assert!(coverage.fixture_covered.contains(&"Ra"));
-    assert!(coverage.unimplemented.contains(&"Sysreg"));
+    assert!(coverage.fixture_covered.contains(&"RmExt"));
+    assert!(coverage.fixture_covered.contains(&"Barrier"));
+    assert!(coverage.fixture_covered.contains(&"BarrierIsb"));
+    assert!(coverage.fixture_covered.contains(&"BarrierPsb"));
+    assert!(coverage.fixture_covered.contains(&"Pstatefield"));
+    assert!(coverage.fixture_covered.contains(&"Sysreg"));
+    assert!(coverage.fixture_covered.contains(&"SysregAt"));
+    assert!(coverage.fixture_covered.contains(&"SysregDc"));
+    assert!(coverage.fixture_covered.contains(&"SysregIc"));
+    assert!(coverage.fixture_covered.contains(&"SysregTlbi"));
+    assert!(coverage.fixture_covered.contains(&"RtSys"));
+    assert!(coverage.fixture_covered.contains(&"Uimm3Op1"));
+    assert!(coverage.fixture_covered.contains(&"Uimm3Op2"));
+    assert!(coverage.fixture_covered.contains(&"Cn"));
+    assert!(coverage.fixture_covered.contains(&"Cm"));
+    assert!(coverage.fixture_covered.contains(&"Prfop"));
+    assert!(coverage.fixture_covered.contains(&"Uimm4"));
+    assert!(coverage.fixture_covered.contains(&"Uimm7"));
+    assert!(coverage.fixture_covered.contains(&"Vd"));
+    assert!(coverage.fixture_covered.contains(&"Vn"));
+    assert!(coverage.fixture_covered.contains(&"Vm"));
+    assert!(coverage.fixture_covered.contains(&"Sd"));
+    assert!(coverage.fixture_covered.contains(&"Sn"));
+    assert!(coverage.fixture_covered.contains(&"Sm"));
+    assert!(coverage.fixture_covered.contains(&"Imm0"));
+    assert!(coverage.fixture_covered.contains(&"VdD1"));
+    assert!(coverage.fixture_covered.contains(&"VnD1"));
+    assert!(coverage.fixture_covered.contains(&"Lvn"));
+    assert!(coverage.fixture_covered.contains(&"Lvt"));
+    assert!(coverage.fixture_covered.contains(&"LvtAl"));
+    assert!(coverage.fixture_covered.contains(&"SimdAddrSimple"));
+    assert!(coverage.fixture_covered.contains(&"SimdAddrPost"));
+    assert!(coverage.fixture_covered.contains(&"ShllImm"));
+    assert!(coverage.fixture_covered.contains(&"Pairreg"));
+    assert!(coverage.fixture_covered.contains(&"SimdImmSft"));
+    assert!(coverage.fixture_covered.contains(&"SimdImm"));
+    assert!(coverage.fixture_covered.contains(&"SimdFpimm"));
+    assert!(coverage.fixture_covered.contains(&"Idx"));
+    assert!(coverage.fixture_covered.contains(&"Ed"));
+    assert!(coverage.fixture_covered.contains(&"En"));
+    assert!(coverage.fixture_covered.contains(&"Em"));
+    assert!(coverage.fixture_covered.contains(&"ImmVlsl"));
+    assert!(coverage.fixture_covered.contains(&"ImmVlsr"));
+    assert!(coverage.fixture_covered.contains(&"Let"));
+    assert!(coverage.fixture_covered.contains(&"Imms"));
+    assert_eq!(
+        coverage.direct_tested,
+        vec![
+            "AddrAdrp",
+            "Barrier",
+            "BarrierIsb",
+            "BarrierPsb",
+            "Cm",
+            "Cn",
+            "Ed",
+            "Em",
+            "En",
+            "Ft2",
+            "Idx",
+            "Imm0",
+            "ImmVlsl",
+            "ImmVlsr",
+            "Immr",
+            "Imms",
+            "Let",
+            "Lvn",
+            "Lvt",
+            "LvtAl",
+            "Pairreg",
+            "Prfop",
+            "Pstatefield",
+            "RmExt",
+            "RtSys",
+            "Sd",
+            "ShllImm",
+            "SimdAddrPost",
+            "SimdAddrSimple",
+            "SimdFpimm",
+            "SimdImm",
+            "SimdImmSft",
+            "Sm",
+            "Sn",
+            "Sysreg",
+            "SysregAt",
+            "SysregDc",
+            "SysregIc",
+            "SysregTlbi",
+            "Uimm3Op1",
+            "Uimm3Op2",
+            "Uimm4",
+            "Uimm7",
+            "Vd",
+            "VdD1",
+            "Vm",
+            "Vn",
+            "VnD1"
+        ]
+    );
     assert!(
         coverage.implemented_but_uncovered.is_empty(),
         "implemented operand kinds should have fixture coverage: {:?}",
         coverage.implemented_but_uncovered
     );
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"RmExt"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Ft2"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"AddrAdrp"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Barrier"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"BarrierIsb"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"BarrierPsb"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Pstatefield"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Sysreg"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SysregAt"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SysregDc"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SysregIc"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SysregTlbi"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"RtSys"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Uimm3Op1"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Uimm3Op2"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Cn"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Cm"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Prfop"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Vd"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Vn"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Vm"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"VdD1"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"VnD1"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Sd"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Sn"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Sm"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Imm0"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Lvn"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Lvt"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"LvtAl"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SimdAddrSimple"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SimdAddrPost"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"ShllImm"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Pairreg"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Uimm4"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"Uimm7"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Ed"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"En"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Em"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Idx"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"ImmVlsl"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"ImmVlsr"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Immr"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SimdImm"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SimdImmSft"));
+    assert!(!coverage
+        .implemented_but_not_direct_tested
+        .contains(&"SimdFpimm"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Let"));
+    assert!(!coverage.implemented_but_not_direct_tested.contains(&"Imms"));
+    assert_eq!(
+        coverage.implemented_but_not_direct_tested.len(),
+        coverage.implemented.len() - coverage.direct_tested.len(),
+        "all direct operand-specific tests should be removed from the not-direct-tested list"
+    );
+    assert_eq!(coverage.unimplemented, Vec::<&'static str>::new());
+    assert_eq!(coverage.table_operand_kinds.len(), 87);
+    assert_eq!(coverage.implemented.len(), 87);
+    assert_eq!(coverage.unimplemented.len(), 0);
 }

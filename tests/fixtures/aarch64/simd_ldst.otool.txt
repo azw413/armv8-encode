@@ -1,0 +1,12 @@
+# Generated from tests/fixtures/aarch64/simd_ldst.s with:
+#   clang -target arm64-apple-macos -c simd_ldst.s -o simd_ldst.o
+#   otool -s __TEXT __text simd_ldst.o
+#   otool -tvV simd_ldst.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 4c407020 ld1.16b { v0 }, [x1]
+0000000000000004 4c9f7062 st1.16b { v2 }, [x3], #16
+0000000000000008 4cc7a0c4 ld1.16b { v4, v5 }, [x6], x7
+000000000000000c 4d40c128 ld1r.16b { v8 }, [x9]
+0000000000000010 4ddfc16a ld1r.16b { v10 }, [x11], #1

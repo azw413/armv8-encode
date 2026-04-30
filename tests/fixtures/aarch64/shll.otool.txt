@@ -1,0 +1,10 @@
+# Generated from tests/fixtures/aarch64/shll.s with:
+#   clang -target arm64-apple-macos -c shll.s -o shll.o
+#   otool -s __TEXT __text shll.o
+#   otool -tvV shll.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 2e213820 shll.8h v0, v1, #8
+0000000000000004 2e613862 shll.4s v2, v3, #16
+0000000000000008 2ea138a4 shll.2d v4, v5, #32

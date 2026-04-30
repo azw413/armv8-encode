@@ -173,7 +173,7 @@ pub(crate) enum Aarch64Opnd {
     BarrierPsb,     /* Barrier operand for PSB.  */
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Aarch64InsnClass {
     AddsubCarry,
     AddsubExt,
@@ -9459,8 +9459,65 @@ fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
         "ubfx" | "bfxil" => imms >= immr,
         "lsl" if is_bitfield_alias(opcode) => imms + 1 == immr,
         "lsr" | "asr" if is_bitfield_alias(opcode) => imms == max,
+        "ror" if opcode.iclass == Aarch64InsnClass::Extract => {
+            ((instruction >> 5) & 0x1f) == ((instruction >> 16) & 0x1f)
+        }
+        "sxtl" | "sxtl2" | "uxtl" | "uxtl2" => false,
+        "at" => matches!(system_op_fields(instruction), (0, 7, 8, 0)),
+        "dc" => matches!(system_op_fields(instruction), (3, 7, 4, 1)),
+        "ic" => matches!(system_op_fields(instruction), (3, 7, 5, 1) | (0, 7, 5, 0)),
+        "tlbi" => matches!(system_op_fields(instruction), (0, 8, 7, 5) | (0, 8, 7, 0)),
+        "ld1" | "st1"
+            if matches!(
+                opcode.iclass,
+                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
+            ) =>
+        {
+            matches!(simd_ldst_list_count(instruction), Some(1 | 2))
+        }
+        "ld2" | "st2"
+            if matches!(
+                opcode.iclass,
+                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
+            ) =>
+        {
+            simd_ldst_list_count(instruction) == Some(2)
+        }
+        "ld3" | "st3"
+            if matches!(
+                opcode.iclass,
+                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
+            ) =>
+        {
+            simd_ldst_list_count(instruction) == Some(3)
+        }
+        "ld4" | "st4"
+            if matches!(
+                opcode.iclass,
+                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
+            ) =>
+        {
+            simd_ldst_list_count(instruction) == Some(4)
+        }
         _ => true,
     }
+}
+
+fn simd_ldst_list_count(instruction: Aarch64Insn) -> Option<u32> {
+    match (instruction >> 12) & 0xf {
+        0x7 => Some(1),
+        0xa => Some(2),
+        _ => None,
+    }
+}
+
+fn system_op_fields(instruction: Aarch64Insn) -> (u32, u32, u32, u32) {
+    (
+        (instruction >> 16) & 0x7,
+        (instruction >> 12) & 0xf,
+        (instruction >> 8) & 0xf,
+        (instruction >> 5) & 0x7,
+    )
 }
 
 fn is_bitfield_alias(opcode: &Aarch64Opcode) -> bool {
@@ -9476,6 +9533,12 @@ fn should_replace_match(current: &Aarch64Opcode, candidate: &Aarch64Opcode) -> b
     }
 
     if candidate.is_conversion_alias() != current.is_conversion_alias() {
+        if candidate.is_conversion_alias()
+            && !current.is_alias()
+            && candidate.iclass != current.iclass
+        {
+            return false;
+        }
         return candidate.is_conversion_alias();
     }
     if candidate.is_conversion_alias() && current.is_conversion_alias() {
@@ -9483,6 +9546,23 @@ fn should_replace_match(current: &Aarch64Opcode, candidate: &Aarch64Opcode) -> b
     }
 
     if is_variable_shift_alias(current.name, candidate.name) {
+        return true;
+    }
+
+    if current.name == "sys" && matches!(candidate.name, "at" | "dc" | "ic" | "tlbi") {
+        return true;
+    }
+
+    if current.name == "umov"
+        && candidate.name == "mov"
+        && candidate.iclass == Aarch64InsnClass::Asimdins
+    {
+        return true;
+    }
+    if current.name == "ins"
+        && candidate.name == "mov"
+        && candidate.iclass == Aarch64InsnClass::Asimdins
+    {
         return true;
     }
 

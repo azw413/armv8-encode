@@ -1,0 +1,11 @@
+# Generated from tests/fixtures/aarch64/prfm.s with:
+#   clang -target arm64-apple-macos -c prfm.s -o prfm.o
+#   otool -s __TEXT __text prfm.o
+#   otool -tvV prfm.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 f9800000 prfm pldl1keep, [x0]
+0000000000000004 f9800823 prfm pldl2strm, [x1, #0x10]
+0000000000000008 f9800047 prfm #0x7, [x2]
+000000000000000c d8000000 prfm pldl1keep, 0xc

@@ -1,0 +1,12 @@
+# Generated from tests/fixtures/aarch64/sysreg.s with:
+#   clang -target arm64-apple-macos -c sysreg.s -o sysreg.o
+#   otool -s __TEXT __text sysreg.o
+#   otool -tvV sysreg.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 d53b4200 mrs x0, NZCV
+0000000000000004 d51b4201 msr NZCV, x1
+0000000000000008 d53bd042 mrs x2, TPIDR_EL0
+000000000000000c d51bd043 msr TPIDR_EL0, x3
+0000000000000010 d53be044 mrs x4, CNTVCT_EL0

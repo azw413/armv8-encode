@@ -1,0 +1,10 @@
+# Generated from tests/fixtures/aarch64/sys_generic.s with:
+#   clang -target arm64-apple-macos -c sys_generic.s -o sys_generic.o
+#   otool -s __TEXT __text sys_generic.o
+#   otool -tvV sys_generic.o
+#
+# Columns:
+#   address  encoded-word  otool-mnemonic  otool-operands
+0000000000000000 d5092385 sys #0x1, c2, c3, #0x4, x5
+0000000000000004 d509239f sys #0x1, c2, c3, #0x4
+0000000000000008 d5292386 sysl x6, #0x1, c2, c3, #0x4
