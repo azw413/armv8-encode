@@ -151,7 +151,10 @@ pub enum DecodedOperand {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DecodeError {
-    InvalidOperand(&'static str),
+    /// No row in the opcode table matched the raw instruction word.
+    NoMatchingOpcode { word: Word },
+    /// An operand decoder rejected the encoded operand bits.
+    InvalidOperand { kind: &'static str },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -280,7 +283,8 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Imms => Ok(DecodedOperand::Immediate(imms(ctx.word))),
             Aarch64Opnd::Aimm => Ok(DecodedOperand::Immediate(aimm(ctx.word))),
             Aarch64Opnd::Limm => Ok(DecodedOperand::Immediate(
-                logical_immediate(ctx.word).ok_or(DecodeError::InvalidOperand("Limm"))?,
+                logical_immediate(ctx.word)
+                    .ok_or(DecodeError::InvalidOperand { kind: "Limm" })?,
             )),
             Aarch64Opnd::Half => Ok(DecodedOperand::ShiftedImmediate(half(ctx.word))),
             Aarch64Opnd::ImmMov => Ok(DecodedOperand::Immediate(imm_mov(ctx.word))),

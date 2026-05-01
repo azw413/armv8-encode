@@ -1,13 +1,23 @@
 //! Architecture-neutral machine-code model.
 //!
-//! This layer will hold decoded instructions, symbols, relocations, sections,
-//! and basic blocks independently of any single ISA.
+//! This layer holds the abstractions analysis and rewriting are written
+//! against — control-flow classification, basic blocks, the control-flow
+//! graph — independently of any particular ISA. ISA crates implement
+//! [`InstructionInfo`] on their decoded-instruction types and everything
+//! above this layer stays generic.
 
-/// Stable identifier for a basic block in a machine-code function.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct BasicBlockId(pub usize);
+pub mod cfg;
+pub mod control_flow;
 
-/// Stable identifier for a decoded instruction in a machine-code function.
+pub use cfg::{
+    build as build_cfg, BasicBlock, BasicBlockId, ControlFlowGraph, Edge, EdgeKind, EdgeTarget,
+};
+pub use control_flow::{ControlFlow, InstructionInfo};
+
+/// Stable identifier for a decoded instruction within a function.
+///
+/// Currently a thin index over the source instruction slice; will gain more
+/// structure once instructions, symbols, and relocations get a richer model.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct InstructionId(pub usize);
 
@@ -16,18 +26,4 @@ pub struct InstructionId(pub usize);
 pub enum Address {
     Absolute(u64),
     Symbol { name: String, addend: i64 },
-}
-
-/// Placeholder for an architecture-neutral instruction wrapper.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Instruction {
-    pub address: u64,
-    pub bytes: Vec<u8>,
-}
-
-/// Placeholder for a basic block.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct BasicBlock {
-    pub id: BasicBlockId,
-    pub instructions: Vec<InstructionId>,
 }

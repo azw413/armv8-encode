@@ -1,18 +1,50 @@
-//! Relocation-aware code rewriting.
+//! Symbolic, relocation-aware code rewriting.
 //!
-//! This layer will build control-flow graphs, split and lay out basic blocks,
-//! and emit relocatable code modifications.
+//! The rewrite layer turns a decoded code region into an editable IR whose
+//! branch operands are *symbolic*: instead of pointing at a hard-coded
+//! address, each PC-relative target carries a [`Target`] — a reference to
+//! a basic block, an extern symbol, a constant pool entry, or a literal
+//! address. This is what lets the layout pass freely insert, delete, and
+//! grow code without invalidating displacements.
+//!
+//! ## Pipeline
+//!
+//! ```text
+//!   bytes ──► sweep ──► instructions ──► CFG
+//!                                         │
+//!                                         ▼
+//!                                  RewritePlan::lift
+//!                                         │
+//!                                         ▼  edit operations
+//!                                  (mutate operands, blocks, terminators)
+//!                                         │
+//!                                         ▼
+//!                                    lay_out(plan, base)
+//!                                         │
+//!                                         ▼
+//!                                    emit(plan, layout) ──► bytes
+//! ```
+//!
+//! ## Status
+//!
+//! - In-place patches (no shifting), single-block edits, and inserts that
+//!   trigger conditional-branch widening: implemented and tested.
+//! - Out-of-range unconditional branches (>128 MiB), branch islands, and
+//!   literal-pool emission: not yet implemented; layout returns
+//!   [`LayoutError::DisplacementTooLarge`] in those cases.
+//! - Symbol and constant target resolution: types are defined, but no
+//!   resolver exists until binary-container ingest lands.
 
-use crate::mc::BasicBlock;
+pub mod emit;
+pub mod ir;
+pub mod layout;
+pub mod plan;
 
-/// Placeholder control-flow graph.
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub struct ControlFlowGraph {
-    pub blocks: Vec<BasicBlock>,
-}
+pub use emit::{emit, EmitError};
+pub use ir::{
+    ConstantId, RewriteBlock, RewriteInstruction, RewriteOperand, SymbolId, Target,
+};
+pub use layout::{lay_out, EmitStrategy, InstructionLayout, Layout, LayoutError};
+pub use plan::{EditError, RewritePlan};
 
-impl ControlFlowGraph {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
+pub use crate::mc::ControlFlowGraph;

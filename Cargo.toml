@@ -3,6 +3,25 @@ name = "armv8-encode"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+# Binary container parsing for the `container` layer. Defaults pull in
+# Wasm/PE/COFF support we don't need yet — keep the surface narrow and the
+# build fast. `write_std` is included so tests can synthesize tiny in-memory
+# Mach-O / ELF fixtures without committing binaries; production write
+# support arrives with PR 4.
+object = { version = "0.36", default-features = false, features = [
+    "read_core",
+    "write_std",
+    "macho",
+    "elf",
+    "std",
+] }
+
+# DWARF parsing for function boundaries and source-line lifting on top of
+# the container layer. `write` is included so tests can synthesize debug
+# sections in-memory alongside `object::write` fixtures.
+gimli = { version = "0.31", default-features = false, features = [
+    "read",
+    "write",
+    "std",
+] }

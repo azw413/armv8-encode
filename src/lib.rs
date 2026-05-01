@@ -5,6 +5,7 @@
 //! - `mc`: architecture-neutral machine-code representation.
 //! - `rewrite`: control-flow and relocation-aware code rewriting.
 
+pub mod container;
 pub mod isa;
 pub mod mc;
 pub mod rewrite;

@@ -4,8 +4,13 @@
 //! current implementation keeps the imported opcode table as the matching
 //! foundation while the typed instruction and operand model is built out.
 
+mod control_flow;
 mod operand;
+mod sweep;
 pub(crate) mod table;
+
+pub use control_flow::{invert_conditional_branch, pcrel_range_bytes};
+pub use sweep::{disassemble_bytes, DisassembleError};
 
 use operand::{
     decode_operand, encode_operand, w_reg, DecodeContext, EncodeContext, IMPLEMENTED_OPERAND_KINDS,
@@ -43,7 +48,7 @@ pub struct OpcodeClassSummary {
 pub struct DecodedInstruction {
     pub address: u64,
     pub word: Word,
-    pub mnemonic: &'static str,
+    pub mnemonic: Aarch64Mnemonic,
     pub operands: Vec<DecodedOperand>,
 }
 
@@ -55,7 +60,7 @@ pub struct InstructionTemplate {
 }
 
 /// Decode one AArch64 instruction word using the opcode table.
-pub fn decode_instruction(address: u64, word: Word) -> Option<DecodedInstruction> {
+pub fn decode_instruction(address: u64, word: Word) -> Result<DecodedInstruction, DecodeError> {
     decode_instruction_with_symbols(address, word, |_| None)
 }
 
@@ -63,12 +68,12 @@ pub fn decode_instruction_with_symbols<F>(
     address: u64,
     word: Word,
     symbol_for_address: F,
-) -> Option<DecodedInstruction>
+) -> Result<DecodedInstruction, DecodeError>
 where
     F: Fn(u64) -> Option<String>,
 {
-    let opcode = table::match_opcode(word)?;
-    let mnemonic = opcode.mnemonic();
+    let opcode = table::match_opcode(word).ok_or(DecodeError::NoMatchingOpcode { word })?;
+    let mnemonic = Aarch64Mnemonic::parse(opcode.mnemonic());
     let operands = opcode
         .operands()
         .into_iter()
@@ -83,21 +88,16 @@ where
                     operand_index,
                 },
             )
-            .unwrap_or(DecodedOperand::Unimplemented {
-                kind: "decode-error",
-            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let decoded = DecodedInstruction {
+    let _ = symbol_for_address;
+    Ok(DecodedInstruction {
         address,
         word,
         mnemonic,
         operands,
-    };
-
-    let _ = symbol_for_address;
-    Some(decoded)
+    })
 }
 
 /// Encode one AArch64 instruction.
@@ -110,7 +110,7 @@ pub fn encode_instruction(instruction: &InstructionTemplate) -> Result<Word, Enc
 
     if candidates.is_empty() {
         return Err(EncodeError::UnknownMnemonic {
-            mnemonic: instruction.mnemonic.table_name(),
+            mnemonic: instruction.mnemonic.as_str(),
         });
     }
 
@@ -149,8 +149,18 @@ pub fn encode_instruction(instruction: &InstructionTemplate) -> Result<Word, Enc
         }
 
         if matched {
-            word |= encode_implicit_alias_operands(&opcode, &instruction.operands)?;
-            if word & opcode.mask() != opcode.base_opcode() & opcode.mask() {
+            word |= alias_implicit_bits(instruction.mnemonic, &instruction.operands)?;
+
+            // The operand encoders may legitimately produce bits that don't
+            // satisfy the candidate row's mask — multiple opcode rows can
+            // share a mnemonic and only one is the right form. Record the
+            // mismatch as a fallback error and try the next candidate, so
+            // that if *no* row matches, the caller gets an explicit error
+            // instead of `NoMatchingForm` hiding a near-miss.
+            let masked = word & opcode.mask();
+            let expected = opcode.base_opcode() & opcode.mask();
+            if masked != expected {
+                last_error.get_or_insert(EncodeError::InvalidOperand { kind: "<mask>" });
                 continue;
             }
             return Ok(word);
@@ -158,27 +168,61 @@ pub fn encode_instruction(instruction: &InstructionTemplate) -> Result<Word, Enc
     }
 
     Err(last_error.unwrap_or(EncodeError::NoMatchingForm {
-        mnemonic: instruction.mnemonic.table_name(),
+        mnemonic: instruction.mnemonic.as_str(),
     }))
 }
 
-fn encode_implicit_alias_operands(
-    opcode: &table::Aarch64Opcode,
+/// Bits that an alias mnemonic encodes implicitly — fields present in the
+/// underlying instruction word but absent from the alias's operand list.
+///
+/// Example: `cinc Wd, Wn, cond` shares its base opcode with
+/// `csinc Wd, Wn, Wm, !cond`. The alias drops `Wm` from the operand list and
+/// implicitly sets `Wm = Wn`. The `Cond1` operand kind already encodes the
+/// condition inversion, so the only implicit work here is filling in the `Rm`
+/// field.
+///
+/// Adding `cset` / `cneg` will require new arms here. Keeping this function as
+/// the single home for that fix-up means the alias relationship is in one
+/// reviewable place rather than scattered across operand encoders.
+fn alias_implicit_bits(
+    mnemonic: Aarch64Mnemonic,
     operands: &[DecodedOperand],
 ) -> Result<Word, EncodeError> {
-    match opcode.mnemonic() {
-        "cinc" => {
-            let Some(DecodedOperand::Register(rn)) = operands.get(1) else {
-                return Err(EncodeError::InvalidOperand { kind: "Rn" });
-            };
-            if !matches!(rn.class, RegisterClass::W | RegisterClass::X) || rn.index > 31 {
-                return Err(EncodeError::InvalidOperand { kind: "Rn" });
-            }
-
-            Ok((rn.index as Word) << 16)
+    match alias_fixup(mnemonic) {
+        Some(AliasFixup::CopyRnToRm) => {
+            let rn = gp_register_at(operands, 1, "Rn")?;
+            Ok((rn as Word) << 16)
         }
-        _ => Ok(0),
+        None => Ok(0),
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum AliasFixup {
+    /// The alias drops the canonical `Rm` operand and the encoder must copy
+    /// `Rn` into the `Rm` field. Used by `cinc` (vs. `csinc`).
+    CopyRnToRm,
+}
+
+fn alias_fixup(mnemonic: Aarch64Mnemonic) -> Option<AliasFixup> {
+    match mnemonic {
+        Aarch64Mnemonic::Cinc => Some(AliasFixup::CopyRnToRm),
+        _ => None,
+    }
+}
+
+fn gp_register_at(
+    operands: &[DecodedOperand],
+    index: usize,
+    kind: &'static str,
+) -> Result<u8, EncodeError> {
+    let Some(DecodedOperand::Register(register)) = operands.get(index) else {
+        return Err(EncodeError::InvalidOperand { kind });
+    };
+    if !matches!(register.class, RegisterClass::W | RegisterClass::X) || register.index > 31 {
+        return Err(EncodeError::InvalidOperand { kind });
+    }
+    Ok(register.index)
 }
 
 /// Match raw AArch64 instruction words against the opcode table.
@@ -259,67 +303,56 @@ pub fn disassemble_at_with_symbols<F>(
     address: u64,
     word: Word,
     symbol_for_address: F,
-) -> Option<DecodedInstruction>
+) -> Result<DecodedInstruction, DecodeError>
 where
     F: Fn(u64) -> Option<String>,
 {
     decode_instruction_with_symbols(address, word, symbol_for_address)
 }
 
-pub fn disassemble_at(address: u64, word: Word) -> Option<DecodedInstruction> {
+pub fn disassemble_at(address: u64, word: Word) -> Result<DecodedInstruction, DecodeError> {
     decode_instruction(address, word)
 }
 
 impl DecodedInstruction {
     pub fn format_mnemonic(&self) -> String {
-        match self.mnemonic {
-            "beq" => "b.eq".to_string(),
-            "bne" => "b.ne".to_string(),
-            "bcs" => "b.hs".to_string(),
-            "bcc" => "b.lo".to_string(),
-            "bmi" => "b.mi".to_string(),
-            "bpl" => "b.pl".to_string(),
-            "bvs" => "b.vs".to_string(),
-            "bvc" => "b.vc".to_string(),
-            "bhi" => "b.hi".to_string(),
-            "bls" => "b.ls".to_string(),
-            "bge" => "b.ge".to_string(),
-            "blt" => "b.lt".to_string(),
-            "bgt" => "b.gt".to_string(),
-            "ble" => "b.le".to_string(),
-            mnemonic => {
-                if let Some(DecodedOperand::VectorRegister(register)) = self.operands.first() {
-                    format!(
-                        "{mnemonic}.{}",
-                        format_vector_arrangement(register.arrangement)
-                    )
-                } else if let Some(DecodedOperand::VectorList(list)) = self.operands.first() {
-                    if list.element.is_some() {
-                        format!(
-                            "{mnemonic}.{}",
-                            format_vector_element_arrangement(list.arrangement)
-                        )
-                    } else {
-                        format!("{mnemonic}.{}", format_vector_arrangement(list.arrangement))
-                    }
-                } else if let Some(size) = self.operands.iter().find_map(vector_element_size) {
-                    format!("{mnemonic}.{}", format_vector_element_size(size))
-                } else {
-                    mnemonic.to_string()
-                }
-            }
+        let raw = self.mnemonic.as_str();
+        if let Some(alias) = self.mnemonic.display_alias() {
+            return alias.to_string();
         }
+
+        if let Some(DecodedOperand::VectorRegister(register)) = self.operands.first() {
+            return format!(
+                "{raw}.{}",
+                format_vector_arrangement(register.arrangement)
+            );
+        }
+        if let Some(DecodedOperand::VectorList(list)) = self.operands.first() {
+            return if list.element.is_some() {
+                format!(
+                    "{raw}.{}",
+                    format_vector_element_arrangement(list.arrangement)
+                )
+            } else {
+                format!("{raw}.{}", format_vector_arrangement(list.arrangement))
+            };
+        }
+        if let Some(size) = self.operands.iter().find_map(vector_element_size) {
+            return format!("{raw}.{}", format_vector_element_size(size));
+        }
+
+        raw.to_string()
     }
 
     pub fn format_operands_with_symbols<F>(&self, symbol_for_address: F) -> String
     where
         F: Fn(u64) -> Option<String>,
     {
-        if self.mnemonic == "adrp" {
+        let raw = self.mnemonic.as_str();
+        if raw == "adrp" {
             return format_adrp_operands(self.address, &self.operands, &symbol_for_address);
         }
-
-        format_operands(self.mnemonic, &self.operands, symbol_for_address)
+        format_operands(raw, &self.operands, symbol_for_address)
     }
 
     pub fn format_operands(&self) -> String {
@@ -327,95 +360,172 @@ impl DecodedInstruction {
     }
 }
 
+/// Declarative formatting style for an instruction's operand list.
+#[derive(Debug, Copy, Clone)]
+enum FormatStyle {
+    /// Comma-separated operand list. `prefix` is prepended to immediate operands;
+    /// `decimal` switches integer immediates to base-10 rendering.
+    List {
+        prefix: Option<&'static str>,
+        decimal: bool,
+    },
+    /// One of a small set of mnemonic-shaped operand layouts that don't fit
+    /// the simple list form.
+    Special(Special),
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Special {
+    Branch,
+    TestBranch,
+    Adrp,
+    MovAuto,
+    Ret,
+    SimdLdSt,
+    LdpStp,
+    Sys,
+    IcTlbi,
+    Clrex,
+    Isb,
+    Dcps,
+    Exception,
+}
+
+const HASH: Option<&str> = Some("#");
+
+fn format_style_for(mnemonic: &str) -> FormatStyle {
+    let list = |prefix, decimal| FormatStyle::List { prefix, decimal };
+    let special = FormatStyle::Special;
+    match mnemonic {
+        "add" | "adds" | "cmn" | "sub" | "subs" | "cmp" => list(HASH, false),
+        "adc" | "adcs" | "sbc" | "sbcs" => list(None, false),
+        "and" | "eor" | "orr" | "ands" => list(HASH, false),
+        "movk" | "movz" | "movn" => list(HASH, false),
+        "ubfx" | "bfxil" | "lsl" | "lsr" | "asr" => list(HASH, true),
+        "shll" => list(HASH, true),
+        "sshr" | "shl" | "sqshrun" => list(HASH, false),
+        "ext" | "extr" => list(HASH, false),
+        "movi" | "mvni" => list(HASH, false),
+        "adr" => list(HASH, true),
+        "adrp" => special(Special::Adrp),
+        "mov" => special(Special::MovAuto),
+        "cbz" | "cbnz" => list(None, false),
+        "b" | "bl" | "beq" | "bne" | "bcs" | "bcc" | "bmi" | "bpl" | "bvs" | "bvc" | "bhi"
+        | "bls" | "bge" | "blt" | "bgt" | "ble" => special(Special::Branch),
+        "tbz" | "tbnz" => special(Special::TestBranch),
+        "br" | "blr" => list(None, false),
+        "ldr" | "str" | "ldrsw" | "ldxr" | "stxr" | "ldur" | "stur" => list(None, false),
+        "ld1" | "ld2" | "ld3" | "ld4" | "st1" | "st2" | "st3" | "st4" | "ld1r" => {
+            special(Special::SimdLdSt)
+        }
+        "prfm" => list(None, false),
+        "fadd" | "fsub" | "fmul" | "fdiv" | "fmadd" | "fmsub" | "fcsel" => list(None, false),
+        "fcmp" => list(HASH, false),
+        "cmeq" => special(Special::Exception),
+        "fmov" => list(HASH, false),
+        "scvtf" | "ucvtf" | "fcvtns" | "fcvtnu" | "fcvtas" | "fcvtau" | "fcvtps" | "fcvtpu"
+        | "fcvtms" | "fcvtmu" | "fcvtzs" | "fcvtzu" => list(HASH, false),
+        "svc" | "hvc" | "smc" | "brk" | "hlt" | "hint" => special(Special::Exception),
+        "msr" => list(HASH, false),
+        "sys" => special(Special::Sys),
+        "sysl" => list(HASH, false),
+        "at" | "dc" => list(None, false),
+        "ic" | "tlbi" => special(Special::IcTlbi),
+        "clrex" => special(Special::Clrex),
+        "dsb" | "dmb" => list(None, false),
+        "isb" => special(Special::Isb),
+        "dcps1" | "dcps2" | "dcps3" => special(Special::Dcps),
+        "ret" => special(Special::Ret),
+        "csel" | "cinc" => list(None, false),
+        "ccmp" | "ccmn" => list(HASH, false),
+        "stp" | "ldp" => special(Special::LdpStp),
+        _ => list(None, false),
+    }
+}
+
 fn format_operands<F>(mnemonic: &str, operands: &[DecodedOperand], symbol_for_address: F) -> String
 where
     F: Fn(u64) -> Option<String>,
 {
-    match mnemonic {
-        "add" | "adds" | "cmn" | "sub" | "subs" | "cmp" => format_operand_list(operands, Some("#")),
-        "adc" | "adcs" | "sbc" | "sbcs" => format_operand_list(operands, None),
-        "and" | "eor" | "orr" | "ands" => format_operand_list(operands, Some("#")),
-        "movk" | "movz" | "movn" => format_operand_list(operands, Some("#")),
-        "ubfx" | "bfxil" | "lsl" | "lsr" | "asr" => {
-            format_operand_list_decimal(operands, Some("#"))
+    match format_style_for(mnemonic) {
+        FormatStyle::List { prefix, decimal: false } => {
+            format_operand_list(operands, &symbol_for_address, prefix)
         }
-        "shll" => format_operand_list_decimal(operands, Some("#")),
-        "sshr" | "shl" | "sqshrun" => format_operand_list(operands, Some("#")),
-        "ext" | "extr" => format_operand_list(operands, Some("#")),
-        "movi" | "mvni" => format_operand_list(operands, Some("#")),
-        "adr" => format_operand_list_decimal(operands, Some("#")),
-        "adrp" => format_adrp_operands(0, operands, &symbol_for_address),
-        "mov" if operands.iter().any(is_immediate_operand) => {
-            format_operand_list(operands, Some("#"))
+        FormatStyle::List { prefix, decimal: true } => {
+            format_operand_list_decimal(operands, prefix)
         }
-        "mov" => format_operand_list(operands, None),
-        "cbz" => format_operand_list_with_symbols(operands, &symbol_for_address),
-        "b" | "beq" | "bne" | "bcs" | "bcc" | "bmi" | "bpl" | "bvs" | "bvc" | "bhi" | "bls"
-        | "bge" | "blt" | "bgt" | "ble" | "bl" => operands
+        FormatStyle::Special(special) => {
+            format_special(special, operands, &symbol_for_address)
+        }
+    }
+}
+
+fn format_special<F>(
+    special: Special,
+    operands: &[DecodedOperand],
+    symbol_for_address: &F,
+) -> String
+where
+    F: Fn(u64) -> Option<String>,
+{
+    match special {
+        Special::Adrp => format_adrp_operands(0, operands, symbol_for_address),
+        Special::MovAuto => {
+            let prefix = if operands.iter().any(is_immediate_operand) {
+                HASH
+            } else {
+                None
+            };
+            format_operand_list(operands, symbol_for_address, prefix)
+        }
+        Special::Branch => operands
             .first()
-            .map(|operand| format_operand_with_symbols(operand, &symbol_for_address, None))
+            .map(|operand| format_operand_with_symbols(operand, symbol_for_address, None))
             .unwrap_or_default(),
-        "tbz" | "tbnz" => format_test_branch_operands(operands, &symbol_for_address),
-        "br" | "blr" => format_operand_list(operands, None),
-        "ldr" | "str" | "ldrsw" | "ldxr" | "stxr" | "ldur" | "stur" => {
-            format_operand_list(operands, None)
-        }
-        "ld1" | "ld2" | "ld3" | "ld4" | "st1" | "st2" | "st3" | "st4" | "ld1r" => {
-            format_simd_ldst_operands(operands)
-        }
-        "prfm" => format_operand_list(operands, None),
-        "fadd" | "fsub" | "fmul" | "fdiv" | "fmadd" | "fmsub" | "fcsel" => {
-            format_operand_list(operands, None)
-        }
-        "fcmp" => format_operand_list(operands, Some("#")),
-        "cmeq" => format_exception_operands(operands),
-        "fmov" => format_operand_list(operands, Some("#")),
-        "scvtf" | "ucvtf" | "fcvtns" | "fcvtnu" | "fcvtas" | "fcvtau" | "fcvtps" | "fcvtpu"
-        | "fcvtms" | "fcvtmu" | "fcvtzs" | "fcvtzu" => format_operand_list(operands, Some("#")),
-        "svc" | "hvc" | "smc" | "brk" | "hlt" | "hint" => format_exception_operands(operands),
-        "msr" => format_operand_list(operands, Some("#")),
-        "sys" => format_sys_operands(operands),
-        "sysl" => format_operand_list(operands, Some("#")),
-        "at" | "dc" => format_operand_list(operands, None),
-        "ic" | "tlbi" => format_optional_default_register(operands, 31),
-        "clrex" => format_optional_default_immediate(operands, 0xf),
-        "dsb" | "dmb" => format_operand_list(operands, None),
-        "isb" => format_isb_operands(operands),
-        "dcps1" | "dcps2" | "dcps3" => match operands.first() {
+        Special::TestBranch => format_test_branch_operands(operands, symbol_for_address),
+        Special::SimdLdSt => format_simd_ldst_operands(operands),
+        Special::LdpStp => format_ldp_stp_operands(operands, symbol_for_address),
+        Special::Sys => format_sys_operands(operands),
+        Special::IcTlbi => format_optional_default_register(operands, 31),
+        Special::Clrex => format_optional_default_immediate(operands, 0xf),
+        Special::Isb => format_isb_operands(operands),
+        Special::Dcps => match operands.first() {
             Some(DecodedOperand::Immediate(0)) | None => String::new(),
             _ => format_exception_operands(operands),
         },
-        "ret" => match operands.first() {
+        Special::Exception => format_exception_operands(operands),
+        Special::Ret => match operands.first() {
             Some(DecodedOperand::Register(register)) if register.index == 30 => String::new(),
-            Some(operand) => format_operand_with_symbols(operand, &symbol_for_address, None),
+            Some(operand) => format_operand_with_symbols(operand, symbol_for_address, None),
             None => String::new(),
         },
-        "csel" | "cinc" => format_operand_list(operands, None),
-        "ccmp" | "ccmn" => format_operand_list(operands, Some("#")),
-        "stp" | "ldp" => {
-            let Some((first, rest)) = operands.split_first() else {
-                return String::new();
-            };
-            let Some((second, rest)) = rest.split_first() else {
-                return format_operand_with_symbols(first, &symbol_for_address, None);
-            };
-            let Some(memory) = rest.first() else {
-                return format!(
-                    "{}, {}",
-                    format_operand_with_symbols(first, &symbol_for_address, None),
-                    format_operand_with_symbols(second, &symbol_for_address, None)
-                );
-            };
-
-            format!(
-                "{}, {}, {}",
-                format_operand_with_symbols(first, &symbol_for_address, None),
-                format_operand_with_symbols(second, &symbol_for_address, None),
-                format_operand_with_symbols(memory, &symbol_for_address, None)
-            )
-        }
-        _ => format_operand_list_with_symbols(operands, &symbol_for_address),
     }
+}
+
+fn format_ldp_stp_operands<F>(operands: &[DecodedOperand], symbol_for_address: &F) -> String
+where
+    F: Fn(u64) -> Option<String>,
+{
+    let Some((first, rest)) = operands.split_first() else {
+        return String::new();
+    };
+    let Some((second, rest)) = rest.split_first() else {
+        return format_operand_with_symbols(first, symbol_for_address, None);
+    };
+    let Some(memory) = rest.first() else {
+        return format!(
+            "{}, {}",
+            format_operand_with_symbols(first, symbol_for_address, None),
+            format_operand_with_symbols(second, symbol_for_address, None)
+        );
+    };
+
+    format!(
+        "{}, {}, {}",
+        format_operand_with_symbols(first, symbol_for_address, None),
+        format_operand_with_symbols(second, symbol_for_address, None),
+        format_operand_with_symbols(memory, symbol_for_address, None)
+    )
 }
 
 fn format_test_branch_operands<F>(operands: &[DecodedOperand], symbol_for_address: &F) -> String
@@ -438,7 +548,7 @@ where
     let mut parts = vec![formatted_first];
     parts.extend(
         rest.iter()
-            .map(|operand| format_operand_with_symbols(operand, symbol_for_address, Some("#"))),
+            .map(|operand| format_operand_with_symbols(operand, symbol_for_address, HASH)),
     );
     parts.join(", ")
 }
@@ -448,7 +558,7 @@ fn format_exception_operands(operands: &[DecodedOperand]) -> String {
         .iter()
         .map(|operand| match operand {
             DecodedOperand::Immediate(0) => "#0".to_string(),
-            _ => format_operand_with_symbols(operand, &|_| None, Some("#")),
+            _ => format_operand_with_symbols(operand, &|_| None, HASH),
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -457,7 +567,7 @@ fn format_exception_operands(operands: &[DecodedOperand]) -> String {
 fn format_optional_default_immediate(operands: &[DecodedOperand], default: i64) -> String {
     match operands.first() {
         Some(DecodedOperand::Immediate(value)) if *value == default => String::new(),
-        Some(operand) => format_operand_with_symbols(operand, &|_| None, Some("#")),
+        Some(operand) => format_operand_with_symbols(operand, &|_| None, HASH),
         None => String::new(),
     }
 }
@@ -472,7 +582,7 @@ fn format_optional_default_register(operands: &[DecodedOperand], default: u8) ->
         _ => operands,
     };
 
-    format_operand_list(operands, None)
+    format_operand_list(operands, &|_| None, None)
 }
 
 fn format_isb_operands(operands: &[DecodedOperand]) -> String {
@@ -493,7 +603,7 @@ fn format_sys_operands(operands: &[DecodedOperand]) -> String {
         _ => operands,
     };
 
-    format_operand_list(operands, Some("#"))
+    format_operand_list(operands, &|_| None, HASH)
 }
 
 fn format_simd_ldst_operands(operands: &[DecodedOperand]) -> String {
@@ -527,10 +637,17 @@ fn format_simd_memory(memory: &MemoryOperand) -> String {
     }
 }
 
-fn format_operand_list(operands: &[DecodedOperand], immediate_prefix: Option<&str>) -> String {
+fn format_operand_list<F>(
+    operands: &[DecodedOperand],
+    symbol_for_address: &F,
+    immediate_prefix: Option<&str>,
+) -> String
+where
+    F: Fn(u64) -> Option<String>,
+{
     operands
         .iter()
-        .map(|operand| format_operand_with_symbols(operand, &|_| None, immediate_prefix))
+        .map(|operand| format_operand_with_symbols(operand, symbol_for_address, immediate_prefix))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -553,20 +670,6 @@ fn is_immediate_operand(operand: &DecodedOperand) -> bool {
             | DecodedOperand::ShiftedImmediate(_)
             | DecodedOperand::UnsignedImmediate(_)
     )
-}
-
-fn format_operand_list_with_symbols<F>(
-    operands: &[DecodedOperand],
-    symbol_for_address: &F,
-) -> String
-where
-    F: Fn(u64) -> Option<String>,
-{
-    operands
-        .iter()
-        .map(|operand| format_operand_with_symbols(operand, symbol_for_address, None))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn format_operand_with_symbols<F>(

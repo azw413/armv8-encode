@@ -82,11 +82,12 @@ fn compare_binary_with_otool(binary: &Path, limit: usize) -> Vec<Comparison> {
         .into_iter()
         .filter_map(|instruction| {
             let word = *words.get(&instruction.address)?;
-            let ours = aarch64::decode_instruction(instruction.address, word)
-                .map(|decoded| {
+            let ours = match aarch64::decode_instruction(instruction.address, word) {
+                Ok(decoded) => {
                     format_instruction(decoded.format_mnemonic(), decoded.format_operands())
-                })
-                .unwrap_or_else(|| "<no match>".to_string());
+                }
+                Err(err) => format!("<decode error: {err:?}>"),
+            };
             let ours = strip_otool_comment(&ours).to_string();
             let otool = format_instruction(
                 instruction.mnemonic,
