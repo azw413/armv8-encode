@@ -14,7 +14,7 @@ use crate::container::Container;
 use crate::isa::aarch64::{
     invert_conditional_branch, pcrel_range_bytes, Aarch64Mnemonic,
 };
-use crate::rewrite::ir::{RewriteInstruction, Target};
+use crate::rewrite::ir::{RewriteInstruction, RewriteOp, Target};
 use crate::rewrite::plan::RewritePlan;
 
 const MAX_LAYOUT_ITERATIONS: usize = 16;
@@ -96,11 +96,11 @@ pub fn lay_out(
         .iter()
         .map(|block| {
             block
-                .instructions
+                .ops
                 .iter()
-                .map(|_| InstructionLayout {
+                .map(|op| InstructionLayout {
                     address: 0,
-                    size: 4,
+                    size: op.source_byte_size(),
                     strategy: EmitStrategy::Normal,
                 })
                 .collect()
@@ -144,9 +144,9 @@ fn assign_addresses(
 
     for (block_index, block) in plan.blocks.iter().enumerate() {
         block_addresses.push(current);
-        for instr_index in 0..block.instructions.len() {
-            instruction_layouts[block_index][instr_index].address = current;
-            current = current.wrapping_add(instruction_layouts[block_index][instr_index].size);
+        for op_index in 0..block.ops.len() {
+            instruction_layouts[block_index][op_index].address = current;
+            current = current.wrapping_add(instruction_layouts[block_index][op_index].size);
         }
     }
 
@@ -165,12 +165,25 @@ fn widen_out_of_range(
     let mut grew = false;
 
     for (block_index, block) in plan.blocks.iter().enumerate() {
-        for (instr_index, instr) in block.instructions.iter().enumerate() {
+        for (instr_index, op) in block.ops.iter().enumerate() {
+            // Macros (like adrp+add LoadAddress) don't widen — their
+            // ranges are huge (±4 GiB) and we don't have a widening
+            // strategy for them. Skip range checks here.
+            let RewriteOp::Instruction(instr) = op else {
+                continue;
+            };
             let Some(target) = pc_relative_branch_target(instr) else {
                 continue;
             };
 
-            let target_address = resolve_target(target, block_addresses, container)?;
+            // Undefined-symbol targets carry no displacement constraint at
+            // layout time — the linker fills them in later via a
+            // relocation that emit will produce. Skip the range check.
+            let target_address = match resolve_target(target, block_addresses, container) {
+                Ok(addr) => addr,
+                Err(LayoutError::UndefinedSymbol { .. }) => continue,
+                Err(other) => return Err(other),
+            };
             let here = instruction_layouts[block_index][instr_index].address;
             let strategy = instruction_layouts[block_index][instr_index].strategy;
             let displacement = (target_address as i64).wrapping_sub(here as i64);

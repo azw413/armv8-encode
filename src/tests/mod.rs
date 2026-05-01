@@ -8,5 +8,6 @@ mod control_flow;
 mod coverage;
 mod decode;
 mod encode;
+mod recursive;
 mod rewrite;
 mod sweep;

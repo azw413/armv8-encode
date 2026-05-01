@@ -617,7 +617,7 @@ mod writer {
         plan.redirect_branch(0, Target::Absolute(8)).unwrap();
 
         let layout = lay_out(&plan, base, None).unwrap();
-        let new_text = emit(&plan, &layout, None).unwrap();
+        let new_text = emit(&plan, &layout, None).unwrap().bytes;
         assert_ne!(new_text, text_bytes, "rewriter must change the encoding");
 
         // Splice new text into the container and write a fresh ELF.

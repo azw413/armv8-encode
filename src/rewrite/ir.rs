@@ -9,7 +9,7 @@
 //! See the module-level docs in `rewrite::mod` for the full lift → edit →
 //! lay-out → emit flow.
 
-use crate::isa::aarch64::{Aarch64Mnemonic, DecodedOperand};
+use crate::isa::aarch64::{Aarch64Mnemonic, DecodedOperand, Register};
 use crate::mc::BasicBlockId;
 
 /// Identifier for an extern symbol — function entry, global, GOT slot.
@@ -70,12 +70,90 @@ pub struct RewriteInstruction {
 ///
 /// Blocks here track the `BasicBlockId` from the analysis CFG so callers can
 /// cross-reference between the two. Internal control flow within a block
-/// stays implicit: instruction order is the source-order from the CFG, and
-/// the terminator is the last instruction.
+/// stays implicit: op order is the source-order from the CFG, and the
+/// terminator is the last op.
+///
+/// `ops` may contain [`RewriteOp::Instruction`] (single AArch64 instruction,
+/// the common case) or [`RewriteOp::Macro`] (a fused multi-instruction
+/// idiom like `adrp+add` representing a single logical operation).
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RewriteBlock {
     pub id: BasicBlockId,
-    pub instructions: Vec<RewriteInstruction>,
+    pub ops: Vec<RewriteOp>,
+}
+
+/// One unit of code within a [`RewriteBlock`]. Either a single AArch64
+/// instruction or a fused macro that expands to several instructions on
+/// emit.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum RewriteOp {
+    Instruction(RewriteInstruction),
+    Macro(MacroOp),
+}
+
+/// A multi-instruction AArch64 idiom recognized at lift time and treated
+/// as a single logical operation by the rest of the pipeline.
+///
+/// The most common case is the `adrp Rd, page; add Rd, Rd, #lo12` pair
+/// that compilers emit to compute the absolute address of a symbol —
+/// editing the *symbol* shouldn't require coordinating two separate
+/// instruction edits, so we represent the pair as one
+/// `MacroKind::LoadAddress` macro.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MacroOp {
+    pub kind: MacroKind,
+    /// Destination register the macro writes its result into. For
+    /// `LoadAddress`, this is the `Rd` shared by the adrp and add.
+    pub register: Register,
+    /// Symbolic target the macro computes / loads / stores. Replaces both
+    /// the adrp's page operand and the add/ldr/str's lo-12 immediate.
+    pub target: Target,
+    /// The original instructions that fused into this macro, in
+    /// source order. Kept so emit can reproduce the source bytes
+    /// verbatim when no edits touch the macro, and so diagnostics can
+    /// point at the original bytes.
+    pub original_instructions: Vec<RewriteInstruction>,
+    /// Original addresses of the fused instructions. Used by edit-by-
+    /// address lookups: a redirect targeting either of these addresses
+    /// finds this macro.
+    pub original_addresses: Vec<u64>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum MacroKind {
+    /// `adrp Rd, page; add Rd, Rd, #lo12` — compute the absolute address
+    /// of `target`.
+    LoadAddress,
+}
+
+impl RewriteOp {
+    /// Number of source bytes this op corresponds to, before any
+    /// rewriting. `4` for an instruction, `4 * original_instructions.len()`
+    /// for a macro.
+    pub fn source_byte_size(&self) -> u64 {
+        match self {
+            RewriteOp::Instruction(_) => 4,
+            RewriteOp::Macro(macro_op) => 4 * macro_op.original_instructions.len() as u64,
+        }
+    }
+
+    /// First original address of this op, if any. For an instruction
+    /// that's its `original_address`; for a macro it's the first entry
+    /// of `original_addresses`.
+    pub fn first_original_address(&self) -> Option<u64> {
+        match self {
+            RewriteOp::Instruction(insn) => insn.original_address,
+            RewriteOp::Macro(macro_op) => macro_op.original_addresses.first().copied(),
+        }
+    }
+
+    /// True when `address` matches one of this op's source addresses.
+    pub fn matches_source_address(&self, address: u64) -> bool {
+        match self {
+            RewriteOp::Instruction(insn) => insn.original_address == Some(address),
+            RewriteOp::Macro(macro_op) => macro_op.original_addresses.contains(&address),
+        }
+    }
 }
 
 impl RewriteInstruction {

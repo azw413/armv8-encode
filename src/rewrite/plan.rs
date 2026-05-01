@@ -3,17 +3,21 @@
 //! Workflow:
 //!
 //! 1. [`RewritePlan::lift`] converts a CFG plus its decoded instructions into
-//!    a plan whose branch targets are symbolic.
-//! 2. Edit operations (`redirect_branch`, `replace_terminator`, `insert_*`)
-//!    mutate the plan in place. They never recompute addresses.
+//!    a plan whose branch targets are symbolic. A fusion pass recognises
+//!    common multi-instruction idioms (`adrp+add`) and represents them as
+//!    [`MacroOp`] entries.
+//! 2. Edit operations (`redirect_branch`, `redirect_macro_target`,
+//!    `replace_terminator`, `insert_*`) mutate the plan in place. They never
+//!    recompute addresses.
 //! 3. The layout pass (separate module) decides where each block lands.
 //! 4. The emit pass walks the laid-out plan and produces bytes.
 
 use crate::container::Container;
-use crate::isa::aarch64::DecodedInstruction;
-use crate::isa::aarch64::DecodedOperand;
+use crate::isa::aarch64::{Aarch64Mnemonic, DecodedInstruction, DecodedOperand, Register};
 use crate::mc::{BasicBlockId, ControlFlowGraph};
-use crate::rewrite::ir::{RewriteBlock, RewriteInstruction, RewriteOperand, Target};
+use crate::rewrite::ir::{
+    MacroKind, MacroOp, RewriteBlock, RewriteInstruction, RewriteOp, RewriteOperand, Target,
+};
 use std::collections::HashMap;
 
 /// An editable, symbolic representation of a code region.
@@ -28,6 +32,13 @@ pub enum EditError {
     AddressNotFound(u64),
     /// The instruction at this address has no PC-relative operand to redirect.
     NoBranchOperand(u64),
+    /// `redirect_macro_target` was called for an address that resolves to a
+    /// non-macro op.
+    NotAMacro(u64),
+    /// `redirect_branch` / similar was called for an address that resolves
+    /// to a macro op rather than a single instruction. Use the macro-
+    /// specific edit instead.
+    NotAnInstruction(u64),
     /// The block id refers to a block that is not in this plan.
     UnknownBlock(BasicBlockId),
 }
@@ -83,53 +94,77 @@ impl RewritePlan {
         let blocks = cfg
             .blocks
             .iter()
-            .map(|block| RewriteBlock {
-                id: block.id,
-                instructions: instructions[block.instructions.clone()]
+            .map(|block| {
+                let lifted: Vec<RewriteInstruction> = instructions[block.instructions.clone()]
                     .iter()
                     .map(|insn| lift_instruction(insn, &block_at_address, container))
-                    .collect(),
+                    .collect();
+                let ops = fuse_macros(lifted, &block_at_address, container);
+                RewriteBlock { id: block.id, ops }
             })
             .collect();
 
         Self { blocks }
     }
 
-    /// Find the (block index, instruction index) of the instruction whose
-    /// `original_address` matches `address`, if any.
+    /// Find the (block index, op index) of the op whose source addresses
+    /// include `address`, if any.
     fn locate(&self, address: u64) -> Option<(usize, usize)> {
         for (block_index, block) in self.blocks.iter().enumerate() {
-            for (instr_index, instr) in block.instructions.iter().enumerate() {
-                if instr.original_address == Some(address) {
-                    return Some((block_index, instr_index));
+            for (op_index, op) in block.ops.iter().enumerate() {
+                if op.matches_source_address(address) {
+                    return Some((block_index, op_index));
                 }
             }
         }
         None
     }
 
-    pub fn instruction_at(&self, address: u64) -> Option<&RewriteInstruction> {
-        self.locate(address)
-            .map(|(b, i)| &self.blocks[b].instructions[i])
+    /// Read access to the op at `address` (instruction or macro).
+    pub fn op_at(&self, address: u64) -> Option<&RewriteOp> {
+        self.locate(address).map(|(b, i)| &self.blocks[b].ops[i])
     }
 
-    pub fn instruction_at_mut(&mut self, address: u64) -> Option<&mut RewriteInstruction> {
+    /// Mutable access to the op at `address`.
+    pub fn op_at_mut(&mut self, address: u64) -> Option<&mut RewriteOp> {
         let (b, i) = self.locate(address)?;
-        Some(&mut self.blocks[b].instructions[i])
+        Some(&mut self.blocks[b].ops[i])
     }
 
-    /// Change the PC-relative target of the instruction at `address`.
-    ///
-    /// Errors if no instruction has that source address, or if the
-    /// instruction has no PC-relative operand to redirect.
+    /// Convenience: read the singleton instruction at `address`. Returns
+    /// `None` when the address resolves to a macro instead — use
+    /// [`Self::op_at`] for the polymorphic view.
+    pub fn instruction_at(&self, address: u64) -> Option<&RewriteInstruction> {
+        match self.op_at(address)? {
+            RewriteOp::Instruction(insn) => Some(insn),
+            RewriteOp::Macro(_) => None,
+        }
+    }
+
+    /// Mutable singleton-instruction view at `address`. Returns `None` for
+    /// macro ops.
+    pub fn instruction_at_mut(&mut self, address: u64) -> Option<&mut RewriteInstruction> {
+        match self.op_at_mut(address)? {
+            RewriteOp::Instruction(insn) => Some(insn),
+            RewriteOp::Macro(_) => None,
+        }
+    }
+
+    /// Change the PC-relative target of the singleton instruction at
+    /// `address`. Errors with `NotAnInstruction` if the address resolves
+    /// to a macro — use [`Self::redirect_macro_target`] for macros.
     pub fn redirect_branch(
         &mut self,
         address: u64,
         new_target: Target,
     ) -> Result<(), EditError> {
-        let instr = self
-            .instruction_at_mut(address)
+        let op = self
+            .op_at_mut(address)
             .ok_or(EditError::AddressNotFound(address))?;
+        let instr = match op {
+            RewriteOp::Instruction(insn) => insn,
+            RewriteOp::Macro(_) => return Err(EditError::NotAnInstruction(address)),
+        };
         for operand in &mut instr.operands {
             match operand {
                 RewriteOperand::Branch(target) | RewriteOperand::Page(target) => {
@@ -142,8 +177,27 @@ impl RewritePlan {
         Err(EditError::NoBranchOperand(address))
     }
 
+    /// Redirect the symbolic target of the macro op at `address`. Errors
+    /// with `NotAMacro` for singleton instructions.
+    pub fn redirect_macro_target(
+        &mut self,
+        address: u64,
+        new_target: Target,
+    ) -> Result<(), EditError> {
+        let op = self
+            .op_at_mut(address)
+            .ok_or(EditError::AddressNotFound(address))?;
+        match op {
+            RewriteOp::Macro(macro_op) => {
+                macro_op.target = new_target;
+                Ok(())
+            }
+            RewriteOp::Instruction(_) => Err(EditError::NotAMacro(address)),
+        }
+    }
+
     /// Replace the terminator of `block` with a new instruction. The old
-    /// terminator (the last instruction in the block) is dropped.
+    /// terminator (the last op in the block) is dropped.
     pub fn replace_terminator(
         &mut self,
         block: BasicBlockId,
@@ -154,46 +208,43 @@ impl RewritePlan {
             .blocks
             .get_mut(block_index)
             .ok_or(EditError::UnknownBlock(BasicBlockId(block_index)))?;
-        if let Some(last) = block.instructions.last_mut() {
-            *last = new_terminator;
+        let new = RewriteOp::Instruction(new_terminator);
+        if let Some(last) = block.ops.last_mut() {
+            *last = new;
         } else {
-            block.instructions.push(new_terminator);
+            block.ops.push(new);
         }
         Ok(())
     }
 
-    /// Insert one or more instructions immediately after the instruction at
-    /// `address`. New instructions get `original_address = None`. The block
-    /// containing the anchor receives the new instructions; no block split
-    /// is performed.
+    /// Insert one or more instructions (as singleton ops) immediately after
+    /// the op at `address`. New instructions get `original_address = None`.
+    /// The block containing the anchor receives the new ops; no block
+    /// split is performed.
     pub fn insert_after_address(
         &mut self,
         address: u64,
         new_instructions: Vec<RewriteInstruction>,
     ) -> Result<(), EditError> {
-        let (block_index, instr_index) = self
+        let (block_index, op_index) = self
             .locate(address)
             .ok_or(EditError::AddressNotFound(address))?;
         let block = &mut self.blocks[block_index];
-        let insert_at = instr_index + 1;
-        // Splice the new instructions in. `splice` is the natural call here
-        // but `splice(insert_at..insert_at, new_instructions)` is awkward; a
-        // direct loop is clearer.
+        let insert_at = op_index + 1;
         for (offset, instruction) in new_instructions.into_iter().enumerate() {
-            block.instructions.insert(insert_at + offset, instruction);
+            block
+                .ops
+                .insert(insert_at + offset, RewriteOp::Instruction(instruction));
         }
         Ok(())
     }
 
-    /// Remove the instruction at `address`, returning it.
-    pub fn remove_at_address(
-        &mut self,
-        address: u64,
-    ) -> Result<RewriteInstruction, EditError> {
-        let (block_index, instr_index) = self
+    /// Remove the op at `address`, returning it.
+    pub fn remove_at_address(&mut self, address: u64) -> Result<RewriteOp, EditError> {
+        let (block_index, op_index) = self
             .locate(address)
             .ok_or(EditError::AddressNotFound(address))?;
-        Ok(self.blocks[block_index].instructions.remove(instr_index))
+        Ok(self.blocks[block_index].ops.remove(op_index))
     }
 }
 
@@ -239,4 +290,135 @@ fn resolve_address(
         }
     }
     Target::Absolute(address)
+}
+
+/// Walk a flat list of singleton instructions and fuse recognized
+/// multi-instruction idioms into [`MacroOp`]s. Currently handles
+/// `adrp+add` (strict adjacency, same `Rd`, register-shape `add`) →
+/// [`MacroKind::LoadAddress`].
+fn fuse_macros(
+    instructions: Vec<RewriteInstruction>,
+    block_at_address: &HashMap<u64, BasicBlockId>,
+    container: Option<&Container>,
+) -> Vec<RewriteOp> {
+    let mut ops = Vec::with_capacity(instructions.len());
+    let mut iter = instructions.into_iter().peekable();
+
+    while let Some(current) = iter.next() {
+        // Look for `adrp Rd, page` followed by `add Rd, Rd, #imm`. If we
+        // can fuse, consume the next item and emit a Macro; otherwise
+        // pass `current` through as a singleton.
+        if matches!(current.mnemonic, Aarch64Mnemonic::Adrp) {
+            if let Some(next) = iter.peek() {
+                if let Some(macro_op) =
+                    try_fuse_adrp_add(&current, next, block_at_address, container)
+                {
+                    iter.next();
+                    ops.push(RewriteOp::Macro(macro_op));
+                    continue;
+                }
+            }
+        }
+        ops.push(RewriteOp::Instruction(current));
+    }
+
+    ops
+}
+
+fn try_fuse_adrp_add(
+    adrp: &RewriteInstruction,
+    add: &RewriteInstruction,
+    block_at_address: &HashMap<u64, BasicBlockId>,
+    container: Option<&Container>,
+) -> Option<MacroOp> {
+    // adrp operands: [Register(Rd), Page(Target)].
+    let adrp_rd = match adrp.operands.as_slice() {
+        [RewriteOperand::Decoded(DecodedOperand::Register(rd)), RewriteOperand::Page(_)] => rd,
+        _ => return None,
+    };
+    let adrp_target = match &adrp.operands[1] {
+        RewriteOperand::Page(target) => *target,
+        _ => return None,
+    };
+
+    // The pair we want is `add Rd, Rn, #imm`. Our decoder canonicalises
+    // `add Rd, Rd, #0` as the `mov Rd, Rd` alias, so we accept both
+    // shapes — Mov with two register operands is equivalent to
+    // `add Rd, Rn, #0` here.
+    let (add_rd, add_rn, add_imm) = match (add.mnemonic, add.operands.as_slice()) {
+        (
+            Aarch64Mnemonic::Add,
+            [
+                RewriteOperand::Decoded(DecodedOperand::Register(rd)),
+                RewriteOperand::Decoded(DecodedOperand::Register(rn)),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(imm)),
+            ],
+        ) => (rd, rn, *imm),
+        (
+            Aarch64Mnemonic::Mov,
+            [
+                RewriteOperand::Decoded(DecodedOperand::Register(rd)),
+                RewriteOperand::Decoded(DecodedOperand::Register(rn)),
+            ],
+        ) => (rd, rn, 0_i64),
+        _ => return None,
+    };
+
+    if !same_register(adrp_rd, add_rd) || !same_register(adrp_rd, add_rn) {
+        return None;
+    }
+    if add_imm < 0 || add_imm > 0xfff {
+        // Page offsets are 12 bits; anything outside this isn't a fused
+        // pair we can represent.
+        return None;
+    }
+
+    // Compose the symbolic target by looking up the absolute address of
+    // (adrp_page + add_imm).
+    let combined_address = match adrp_target {
+        Target::Absolute(page) => page.wrapping_add(add_imm as u64),
+        // If the adrp already points at a Block / Symbol, it does so
+        // because the page address matched a block or symbol entry —
+        // *not* an addresses inside it. The combined adrp+add normally
+        // points to (page + offset), which is rarely the page itself,
+        // so we fall through to the absolute path through the original
+        // page address.
+        Target::Block(_) | Target::Symbol(_) | Target::Constant(_) => {
+            // Recover the original page address from the original adrp
+            // PageTarget(addr) pre-lift. Since we lost it during lift,
+            // we conservatively *don't* fuse — the rare case where the
+            // page itself is the entire target is preserved as separate
+            // adrp + add ops that the user can edit individually.
+            return None;
+        }
+    };
+
+    let target = resolve_address(combined_address, block_at_address, container);
+
+    Some(MacroOp {
+        kind: MacroKind::LoadAddress,
+        register: adrp_rd.clone(),
+        target,
+        original_addresses: [adrp.original_address, add.original_address]
+            .into_iter()
+            .flatten()
+            .collect(),
+        original_instructions: vec![adrp.clone(), add.clone()],
+    })
+}
+
+fn same_register(a: &Register, b: &Register) -> bool {
+    use crate::isa::aarch64::RegisterClass::{W, WOrSp, X, XOrSp};
+    if a.index != b.index {
+        return false;
+    }
+    // adrp's Rd is always plain `X`, but add's RdSp / RnSp decode to
+    // `XOrSp`. They refer to the same physical register; treat them as
+    // equal for fusion. Same story for 32-bit W vs WOrSp, though
+    // adrp+add fusion is 64-bit only in practice.
+    let lhs_64 = matches!(a.class, X | XOrSp);
+    let rhs_64 = matches!(b.class, X | XOrSp);
+    let lhs_32 = matches!(a.class, W | WOrSp);
+    let rhs_32 = matches!(b.class, W | WOrSp);
+    (lhs_64 && rhs_64) || (lhs_32 && rhs_32)
 }

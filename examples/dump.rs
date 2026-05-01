@@ -373,46 +373,102 @@ fn print_disassembly(container: &Container) {
             continue;
         }
 
+        // Entry points: every defined function symbol that lives in this
+        // section, plus the section's start address. The latter
+        // catches stripped binaries (where there are no function symbols
+        // but the section's first byte is the real entry) without
+        // sacrificing accuracy on unstripped ones.
+        let mut entry_points: Vec<u64> = container
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == SymbolKind::Function
+                    && symbol.section == Some(section.id)
+                    && !symbol.is_undefined
+            })
+            .map(|symbol| symbol.address)
+            .collect();
+        if !entry_points.contains(&base) {
+            entry_points.push(base);
+        }
+
+        let disassembly = aarch64::disassemble_recursive(base, bytes, &entry_points);
+
+        let instruction_count = disassembly.instructions.len();
+        let data_byte_count: usize = disassembly
+            .data_ranges
+            .iter()
+            .map(|range| range.bytes.len())
+            .sum();
+
         println!(
-            "Disassembly of {} ({} bytes at {:#x}):",
+            "Disassembly of {} ({} bytes at {:#x}, {} instructions, {} data bytes):",
             section.name,
             bytes.len(),
             base,
+            instruction_count,
+            data_byte_count,
         );
 
-        if bytes.len() % 4 != 0 {
-            println!(
-                "  (section length {} is not a multiple of 4 — likely contains non-instruction \
-                 padding; falling back to per-word decode of the aligned prefix)",
-                bytes.len(),
-            );
-        }
-
-        let aligned_len = bytes.len() - (bytes.len() % 4);
-        for (index, chunk) in bytes[..aligned_len].chunks_exact(4).enumerate() {
-            let address = base + (index as u64) * 4;
-            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-
-            if let Some(label) = symbol_map.get(&address) {
-                println!("\n{label}:");
-            }
-
-            match aarch64::decode_instruction(address, word) {
-                Ok(decoded) => {
+        for entry in disassembly.timeline() {
+            match entry {
+                aarch64::TimelineEntry::Instruction(decoded) => {
+                    let address = decoded.address;
+                    if let Some(label) = symbol_map.get(&address) {
+                        println!("\n{label}:");
+                    }
                     let mnemonic = decoded.format_mnemonic();
                     let operands = decoded.format_operands_with_symbols(&symbol_for_address);
+                    let word_offset = (address - base) as usize;
+                    let word = u32::from_le_bytes([
+                        bytes[word_offset],
+                        bytes[word_offset + 1],
+                        bytes[word_offset + 2],
+                        bytes[word_offset + 3],
+                    ]);
                     println!(
                         "  {address:>10x}: {word:08x}    {mnemonic:<10} {operands}"
                     );
                 }
-                Err(error) => {
-                    println!(
-                        "  {address:>10x}: {word:08x}    .word           ; <{error:?}>"
-                    );
+                aarch64::TimelineEntry::Data(range) => {
+                    print_data_range(range);
                 }
             }
         }
         println!();
+    }
+}
+
+fn print_data_range(range: &aarch64::DataRange) {
+    let label = match range.reason {
+        aarch64::DataReason::Unreachable => "unreachable",
+        aarch64::DataReason::DecodeError => "undecoded",
+        aarch64::DataReason::Padding => "padding",
+    };
+    println!(
+        "\n  ; {} bytes of {} data at {:#x}",
+        range.bytes.len(),
+        label,
+        range.address
+    );
+    // For aligned 4-byte chunks render as `.word`; trailing odd bytes as
+    // `.byte` to keep things tidy when the section has padding.
+    let chunks = range.bytes.chunks(4);
+    let mut offset = 0u64;
+    for chunk in chunks {
+        let address = range.address + offset;
+        if chunk.len() == 4 {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            println!("  {address:>10x}: {word:08x}    .word");
+        } else {
+            let bytes_str = chunk
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  {address:>10x}: {bytes_str:<8}    .byte");
+        }
+        offset += chunk.len() as u64;
     }
 }
 

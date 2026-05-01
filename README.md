@@ -67,6 +67,13 @@ vector registers, vector elements, system operands), implements
 and exposes table-driven encoding alongside helpers used by the rewrite
 layer (`pcrel_range_bytes`, `invert_conditional_branch`).
 
+Two disassembler entry points live here:
+[`disassemble_bytes`](src/isa/aarch64/sweep.rs) does fail-fast linear sweep
+(every word must decode), and
+[`disassemble_recursive`](src/isa/aarch64/recursive.rs) walks control flow
+from a set of entry points and classifies anything it doesn't reach as
+data. The latter is what works on real shipped binaries.
+
 ### Machine-Code Layer
 
 Path: `src/mc`
@@ -122,16 +129,27 @@ range, it widens the branch into `<inverted_cond> .Lskip ; b far_target ;
 .Lskip:`, which can in turn push other branches out of range — repeat until
 stable.
 
+Each block stores `Vec<RewriteOp>` where `RewriteOp` is either a single
+`RewriteInstruction` (the common case — every AArch64 instruction the
+decoder produces survives intact, with only PC-relative operands lifted to
+`Target`) or a `MacroOp` (a fused multi-instruction idiom like
+`adrp+add → LoadAddress` represented as a single logical operation).
+Macros are recognised at lift time, edited as a unit, and expanded back to
+their component instructions on emit.
+
 Operations supported today:
 
 - `RewritePlan::lift(cfg, instructions)` — convert decoded instructions to
-  symbolic IR.
+  symbolic IR. Includes a strict-adjacency `adrp+add` fusion pass.
 - `RewritePlan::lift_with_container(cfg, instructions, container)` — same,
   but cross-function call/branch targets that match a container symbol
   become `Target::Symbol` instead of `Target::Absolute`, so they survive
   layout no matter where the symbol is.
 - `redirect_branch(address, new_target)` — change the destination of a
-  branch.
+  branch (singleton instructions only).
+- `redirect_macro_target(address, new_target)` — change the symbolic
+  target of a fused `MacroOp`. Both component addresses (e.g. the
+  original `adrp` and `add`) locate the same macro.
 - `replace_terminator(block, new_instruction)` — swap a block's exit (e.g.
   `b.eq` ↔ `b.ne`).
 - `insert_after_address(address, new_instructions)` — splice instructions
@@ -139,8 +157,16 @@ Operations supported today:
 - `remove_at_address(address)` — drop an instruction.
 - `lay_out(&plan, base, container) → Layout` — assign final addresses,
   widen out-of-range conditionals, resolve `Target::Symbol` against the
-  container when supplied.
-- `emit(&plan, &layout, container) → Vec<u8>` — produce final bytes.
+  container when supplied. Undefined-symbol targets aren't an error; they
+  carry through to emit, which produces a relocation.
+- `emit(&plan, &layout, container) → EmitOutput` — produce final bytes
+  plus a list of `EmittedRelocation`s for any references to undefined
+  symbols. Defined-symbol targets are folded to their addresses; undefined
+  ones get a placeholder word with displacement 0 and a fresh relocation
+  record describing the fix-up the linker needs.
+- `commit_to_container(&container, section, output) → Container` —
+  splice rewriter bytes and relocations back into a container clone,
+  ready for `to_bytes`.
 
 ## Current Status
 
@@ -164,11 +190,24 @@ Currently implemented:
 - formatted AArch64 disassembly for the covered table/operand surface
 - table-driven AArch64 instruction encoding
 - linear-sweep disassembler (`aarch64::disassemble_bytes`)
+- recursive-descent disassembler (`aarch64::disassemble_recursive`) that
+  walks control flow from a set of entry points and classifies bytes it
+  doesn't reach as data (`Unreachable`, `DecodeError`, or `Padding`) —
+  required for working on real shipped binaries with literal pools and
+  jump tables embedded in `.text`
 - architecture-neutral control-flow classification (`mc::ControlFlow`)
 - basic-block discovery and CFG construction (`mc::build_cfg`)
 - symbolic rewrite IR with lift, edit, layout, and emit passes
 - container-aware lift: cross-function call targets that match a container
   symbol become `Target::Symbol` and resolve at layout time
+- relocation emission: `Target::Symbol(undefined)` references produce a
+  placeholder instruction word plus an `EmittedRelocation` ready to splice
+  back into the container, so the rewritten object file links cleanly
+- macro fusion: `adrp+add` pairs collapse into a single
+  `MacroOp::LoadAddress` so a "compute symbol address" idiom can be
+  redirected as one logical edit rather than two coordinated ones; emit
+  expands the macro back to two instructions (or two relocations, for
+  undefined-symbol targets)
 - conditional-branch widening at layout time (fixed-point iteration)
 - fixture-based comparisons against Apple `otool`
 - ignored real-binary comparison tests for Mach-O text sections
@@ -177,20 +216,14 @@ Not yet implemented:
 
 - DWARF line tables (file/line lookup for arbitrary addresses) and
   inlined-callsite metadata — only `DW_TAG_subprogram` is lifted today
-- emission of new relocation records when the rewriter edits a
-  `Target::Symbol(undefined)` reference (currently `lay_out` errors;
-  needs a follow-up to thread emitted relocations through)
 - PE/COFF container support
 - stub, literal-pool, and section-aware annotation
 - stable high-level disassembler API over whole object files
 - branch islands for `b` / `bl` displacements beyond ±128 MiB (needs
   literal-pool support)
-- emission of new relocation records for undefined-symbol targets
-  (`lay_out` still errors on `Target::Symbol(undefined)` — the rewriter
-  needs to learn to produce a `(bytes, Vec<Relocation>)` pair instead)
 - resolution of `Target::Constant` (literal-pool layer not yet wired up)
-- recursive-descent disassembly that tolerates literal pools and jump
-  tables in the middle of `.text`
+- jump-table / indirect-branch analysis to recover targets that recursive
+  descent currently can't follow
 
 The distinction matters: the ISA layer can decode and encode raw AArch64
 instruction words at known addresses, the analysis layer can build a CFG
@@ -318,12 +351,14 @@ let new_target_id = container
 plan.redirect_branch(0x1004, Target::Symbol(new_target_id))?;
 
 let layout = lay_out(&plan, base, Some(&container))?;
-let new_bytes = emit(&plan, &layout, Some(&container))?;
+let output = emit(&plan, &layout, Some(&container))?;
 
-// Splice the rewritten text back into the container and write a fresh
-// object file.
-let edited = container.with_section_bytes(text.id, new_bytes);
-std::fs::write("hello.rewritten.o", edited.to_bytes()?)?;
+// `output.bytes` carries the new code; `output.relocations` lists any
+// fix-ups for references to undefined extern symbols. Splice both back
+// into the container with `commit_to_container`, then write.
+use armv8_encode::rewrite::commit_to_container;
+let committed = commit_to_container(&container, text.id, output);
+std::fs::write("hello.rewritten.o", committed.to_bytes()?)?;
 ```
 
 ## Validation
@@ -361,16 +396,17 @@ and are outside the ISA decoder's scope.
 
 The next milestones are:
 
-1. Rewriter relocation emission: thread `(bytes, Vec<Relocation>)` out of
-   `emit` so `Target::Symbol(undefined)` references produce a placeholder
-   instruction word plus a fresh relocation record. Lets the writer
-   round-trip rewrites that touch extern calls.
-2. DWARF line tables for address-to-source mapping and inlined-callsite
-   discovery.
-3. Recursive-descent disassembly that uses symbol and section context to
-   skip literal pools and jump tables.
-4. Branch islands and literal-pool layout for rewrites that exceed the
+1. Jump-table / vtable / indirect-branch analysis to recover targets
+   recursive descent can't follow today. Pays off most for stripped
+   binaries where many functions are reachable only through indirect
+   dispatch.
+2. More macro patterns: `adrp+ldr` (LoadValue), `adrp+str` (StoreValue),
+   and non-adjacent fusion via lightweight data-flow tracking — useful
+   for scheduled code that splits the pair across other instructions.
+3. Branch islands and literal-pool layout for rewrites that exceed the
    ±128 MiB pcrel26 range.
+4. DWARF line tables for address-to-source mapping and inlined-callsite
+   discovery.
 5. PE/COFF container support and a second ISA, in either order.
 
 Correctness matters more than surface area. The project prefers generated

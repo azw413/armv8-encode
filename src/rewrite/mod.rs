@@ -35,14 +35,17 @@
 //! - Symbol and constant target resolution: types are defined, but no
 //!   resolver exists until binary-container ingest lands.
 
+pub mod commit;
 pub mod emit;
 pub mod ir;
 pub mod layout;
 pub mod plan;
 
-pub use emit::{emit, EmitError};
+pub use commit::commit_to_container;
+pub use emit::{emit, EmitError, EmitOutput, EmittedRelocation};
 pub use ir::{
-    ConstantId, RewriteBlock, RewriteInstruction, RewriteOperand, SymbolId, Target,
+    ConstantId, MacroKind, MacroOp, RewriteBlock, RewriteInstruction, RewriteOp, RewriteOperand,
+    SymbolId, Target,
 };
 pub use layout::{lay_out, EmitStrategy, InstructionLayout, Layout, LayoutError};
 pub use plan::{EditError, RewritePlan};
