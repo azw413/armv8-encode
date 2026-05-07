@@ -47,6 +47,10 @@ maintains pinned digests.
 - `fixtures/` — source files for fixtures plus `build.sh`. Built artefacts
   (e.g. `hello.o`) are produced inside the container, written back to
   this directory via the bind mount, and are gitignored.
+- `fixtures/lib_demo/` — second fixture set: a tiny shared library
+  (`libgreet.so`) and a host executable that links against it and
+  prints results from its exports. Used as the round-trip oracle for
+  Stage 5 (`.so` rewriting). Built artefacts gitignored.
 - `scratch/` — harness write area for rewritten objects and linked
   binaries. Gitignored. Never `rm -rf`'d by the harness; safe to inspect.
 
