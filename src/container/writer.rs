@@ -36,6 +36,14 @@ use std::collections::HashMap;
 pub enum ContainerWriteError {
     /// `architecture` is not one we know how to emit.
     UnsupportedArchitecture,
+    /// `kind` is something the writer can't emit yet — today only
+    /// [`ContainerKind::Relocatable`] is supported. Shared libraries
+    /// and executables (ET_DYN / ET_EXEC, MH_DYLIB / MH_EXECUTE) need
+    /// the lower-level `object::write::elf::Writer` path that lands
+    /// in Stage 5.
+    UnsupportedKind {
+        kind: crate::container::ContainerKind,
+    },
     /// A relocation kind has no representation in the target format.
     /// Mainly relevant for Mach-O, which lacks Branch19 / Branch14.
     UnsupportedRelocation {
@@ -55,6 +63,12 @@ impl std::fmt::Display for ContainerWriteError {
             ContainerWriteError::UnsupportedArchitecture => {
                 write!(f, "container architecture is not supported by the writer")
             }
+            ContainerWriteError::UnsupportedKind { kind } => write!(
+                f,
+                "container kind {kind:?} is not yet supported by the writer; \
+                 only Relocatable (ET_REL / MH_OBJECT) inputs can round-trip \
+                 today (ET_DYN / ET_EXEC support is Stage 5)",
+            ),
             ContainerWriteError::UnsupportedRelocation { format, kind } => write!(
                 f,
                 "relocation kind {kind:?} cannot be emitted for {format:?}"
@@ -71,6 +85,18 @@ impl std::fmt::Display for ContainerWriteError {
 impl std::error::Error for ContainerWriteError {}
 
 pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
+    use crate::container::ContainerKind;
+    // Fail fast on inputs the writer can't handle. `object::write::Object`
+    // is hard-wired to ET_REL on the ELF side and MH_OBJECT on the
+    // Mach-O side; passing an ET_DYN or ET_EXEC input today would
+    // silently re-emit it as a relocatable object — wrong shape, wrong
+    // section layout, broken at load time. Surface that explicitly so
+    // callers can detect the limit and route around it (or wait for
+    // Stage 5).
+    if !matches!(container.kind, ContainerKind::Relocatable) {
+        return Err(ContainerWriteError::UnsupportedKind { kind: container.kind });
+    }
+
     let format = match container.format {
         BinaryFormat::Elf => ObjFormat::Elf,
         BinaryFormat::Macho => ObjFormat::MachO,

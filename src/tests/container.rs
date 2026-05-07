@@ -575,6 +575,55 @@ mod writer {
     }
 
     #[test]
+    fn shared_object_kind_is_rejected_by_writer_until_stage_5() {
+        // The writer is hard-wired to ET_REL output via
+        // `object::write::Object`. Round-tripping a SharedObject /
+        // Executable-shaped container would silently re-emit it as
+        // ET_REL, breaking dynamic linking. Surface that explicitly.
+        use crate::container::ContainerKind;
+        let mut container = Container::from_bytes(&build_minimal(ObjFormat::Elf)).unwrap();
+        container.kind = ContainerKind::SharedObject;
+        match container.to_bytes() {
+            Err(ContainerWriteError::UnsupportedKind { kind }) => {
+                assert_eq!(kind, ContainerKind::SharedObject);
+            }
+            other => panic!("expected UnsupportedKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executable_kind_is_rejected_by_writer_until_stage_5() {
+        use crate::container::ContainerKind;
+        let mut container = Container::from_bytes(&build_minimal(ObjFormat::Elf)).unwrap();
+        container.kind = ContainerKind::Executable;
+        match container.to_bytes() {
+            Err(ContainerWriteError::UnsupportedKind { kind }) => {
+                assert_eq!(kind, ContainerKind::Executable);
+            }
+            other => panic!("expected UnsupportedKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elf_relocatable_input_is_classified_as_relocatable() {
+        // Reader sanity check: the synthetic build_minimal fixture is
+        // an ET_REL .o, so its `kind` should be Relocatable. Read this
+        // alongside the SharedObject / Executable rejection tests
+        // above so future shifts in classifier behaviour can't pass
+        // the rejection tests by accident.
+        use crate::container::ContainerKind;
+        let container = Container::from_bytes(&build_minimal(ObjFormat::Elf)).unwrap();
+        assert_eq!(container.kind, ContainerKind::Relocatable);
+    }
+
+    #[test]
+    fn macho_object_input_is_classified_as_relocatable() {
+        use crate::container::ContainerKind;
+        let container = Container::from_bytes(&build_minimal(ObjFormat::MachO)).unwrap();
+        assert_eq!(container.kind, ContainerKind::Relocatable);
+    }
+
+    #[test]
     fn read_rewrite_write_pipeline_changes_text_bytes() {
         // Full pipeline: read an ELF, lift the text section to a rewrite
         // plan, redirect a branch, emit, splice the new bytes back into

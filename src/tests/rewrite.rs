@@ -3,8 +3,8 @@
 
 use super::common::*;
 use crate::container::{
-    Architecture, BinaryFormat, Container, Section, SectionId, SectionKind, Symbol, SymbolBinding,
-    SymbolId, SymbolKind,
+    Architecture, BinaryFormat, Container, ContainerKind, Section, SectionId, SectionKind, Symbol,
+    SymbolBinding, SymbolId, SymbolKind,
 };
 use crate::isa::aarch64;
 use crate::isa::aarch64::{Aarch64Mnemonic, DecodedOperand};
@@ -376,6 +376,7 @@ fn container_with_function(name: &str, address: u64) -> Container {
     Container {
         format: BinaryFormat::Elf,
         architecture: Architecture::Aarch64,
+        kind: ContainerKind::Relocatable,
         sections: vec![Section {
             id: SectionId(0),
             name: ".text".to_string(),
@@ -408,6 +409,7 @@ fn container_with_undefined_function(name: &str) -> Container {
     Container {
         format: BinaryFormat::Elf,
         architecture: Architecture::Aarch64,
+        kind: ContainerKind::Relocatable,
         sections: Vec::new(),
         symbols: vec![Symbol {
             id: SymbolId(0),
@@ -664,14 +666,15 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
     // First should fold to the defined address; second should produce a
     // relocation.
     use crate::container::{
-        Architecture as ContArch, BinaryFormat as ContFormat, Container as Cont, Section,
-        Symbol, SymbolBinding, SymbolKind,
+        Architecture as ContArch, BinaryFormat as ContFormat, Container as Cont,
+        ContainerKind as ContKind, Section, Symbol, SymbolBinding, SymbolKind,
     };
     use crate::container::RelocationKind;
 
     let container = Cont {
         format: ContFormat::Elf,
         architecture: ContArch::Aarch64,
+        kind: ContKind::Relocatable,
         sections: vec![Section {
             id: SectionId(0),
             name: ".text".to_string(),
@@ -1354,6 +1357,7 @@ mod relocation_lift {
         Container {
             format: BinaryFormat::Elf,
             architecture: Architecture::Aarch64,
+            kind: ContainerKind::Relocatable,
             sections: vec![Section {
                 id: SectionId(0),
                 name: ".text".to_string(),
@@ -1446,6 +1450,7 @@ mod relocation_lift {
         let container = Container {
             format: BinaryFormat::Elf,
             architecture: Architecture::Aarch64,
+            kind: ContainerKind::Relocatable,
             sections: vec![Section {
                 id: SectionId(0),
                 name: ".text".to_string(),
@@ -1530,6 +1535,7 @@ mod relocation_lift {
         let container = Container {
             format: BinaryFormat::Elf,
             architecture: Architecture::Aarch64,
+            kind: ContainerKind::Relocatable,
             sections: vec![Section {
                 id: SectionId(0),
                 name: ".text".to_string(),
@@ -1632,6 +1638,7 @@ mod relocation_lift {
         let container = Container {
             format: BinaryFormat::Elf,
             architecture: Architecture::Aarch64,
+            kind: ContainerKind::Relocatable,
             sections: vec![
                 Section {
                     id: SectionId(0),

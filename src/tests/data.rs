@@ -1,8 +1,8 @@
 //! Tests for the data-section rewrite layer (`rewrite::data`).
 
 use crate::container::{
-    Architecture, BinaryFormat, Container, Relocation, RelocationId, RelocationKind, Section,
-    SectionId, SectionKind, Symbol, SymbolBinding, SymbolId, SymbolKind,
+    Architecture, BinaryFormat, Container, ContainerKind, Relocation, RelocationId,
+    RelocationKind, Section, SectionId, SectionKind, Symbol, SymbolBinding, SymbolId, SymbolKind,
 };
 use crate::rewrite::{
     commit_to_data_container, emit_data_section, DataPayload, DataSection, Target,
@@ -21,6 +21,7 @@ fn vtable_container() -> Container {
     Container {
         format: BinaryFormat::Elf,
         architecture: Architecture::Aarch64,
+        kind: ContainerKind::Relocatable,
         sections: vec![
             Section {
                 id: SectionId(0),
@@ -151,6 +152,7 @@ fn lift_emits_bytes_around_pointers() {
     let container = Container {
         format: BinaryFormat::Elf,
         architecture: Architecture::Aarch64,
+        kind: ContainerKind::Relocatable,
         sections: vec![Section {
             id: SectionId(0),
             name: ".rodata.mixed".to_string(),
@@ -213,6 +215,7 @@ fn lift_passes_unhandled_relocation_kinds_through() {
     let container = Container {
         format: BinaryFormat::Elf,
         architecture: Architecture::Aarch64,
+        kind: ContainerKind::Relocatable,
         sections: vec![Section {
             id: SectionId(0),
             name: ".rodata.weird".to_string(),
@@ -396,6 +399,7 @@ fn commit_to_data_container_preserves_unhandled_relocations() {
     let container = Container {
         format: BinaryFormat::Elf,
         architecture: Architecture::Aarch64,
+        kind: ContainerKind::Relocatable,
         sections: vec![Section {
             id: SectionId(0),
             name: ".rodata.mixed".to_string(),

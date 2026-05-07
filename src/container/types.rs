@@ -229,11 +229,39 @@ pub struct DwarfFunction {
     pub source_line: Option<u32>,
 }
 
+/// What kind of binary this container holds.
+///
+/// The writer's behaviour depends on this. Today it only knows how to
+/// emit `Relocatable` (ET_REL `.o` files); shared libraries and
+/// executables are read-only until Stage 5 lands the
+/// `object::write::elf::Writer` path.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum ContainerKind {
+    /// Relocatable object (ELF ET_REL, Mach-O MH_OBJECT). The writer
+    /// regenerates section layout, symbol/string tables, and
+    /// relocations from the neutral model and feeds them through
+    /// `object::write::Object`.
+    Relocatable,
+    /// Shared library or other ET_DYN-shaped output (Mach-O dylib /
+    /// MH_DYLIB). Round-trip read works; write does not yet.
+    SharedObject,
+    /// Executable file (ELF ET_EXEC, Mach-O MH_EXECUTE). Round-trip
+    /// read works; write does not yet.
+    Executable,
+    /// Core dump or anything else we recognise structurally but don't
+    /// classify further.
+    Other,
+}
+
 /// Parsed binary container.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Container {
     pub format: BinaryFormat,
     pub architecture: Architecture,
+    /// Whether this is a relocatable object, a shared library, an
+    /// executable, or something else. The writer refuses anything
+    /// other than [`ContainerKind::Relocatable`] until Stage 5.
+    pub kind: ContainerKind,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
     pub relocations: Vec<Relocation>,

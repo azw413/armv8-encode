@@ -41,16 +41,76 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
     let relocations = lift_relocations(&file, &section_index_to_id, &symbol_index_to_id);
     let dwarf = crate::container::dwarf::parse(&file);
     let file_flags = lift_file_flags(&file);
+    let kind = classify_container(&file, bytes);
 
     Ok(Container {
         format,
         architecture,
+        kind,
         sections,
         symbols,
         relocations,
         file_flags,
         dwarf,
     })
+}
+
+/// Classify a parsed file into the high-level [`ContainerKind`] taxonomy
+/// the writer uses to gate ET_DYN / ET_EXEC paths. We pull the raw
+/// header for ELF inputs because `object::read::Object` only exposes
+/// the relocatable / executable distinction indirectly via
+/// `is_executable`, and we want all four buckets explicit.
+fn classify_container(file: &File<'_>, bytes: &[u8]) -> crate::container::ContainerKind {
+    use crate::container::ContainerKind;
+    match file.format() {
+        object::BinaryFormat::Elf => classify_elf(bytes),
+        object::BinaryFormat::MachO => classify_macho(bytes),
+        _ => ContainerKind::Other,
+    }
+}
+
+fn classify_elf(bytes: &[u8]) -> crate::container::ContainerKind {
+    use crate::container::ContainerKind;
+    use object::read::elf::{ElfFile64, FileHeader as _};
+    use object::Endianness;
+
+    let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) else {
+        return ContainerKind::Other;
+    };
+    let endian = elf.endian();
+    let header = elf.elf_header();
+    match header.e_type(endian) {
+        object::elf::ET_REL => ContainerKind::Relocatable,
+        object::elf::ET_DYN => ContainerKind::SharedObject,
+        object::elf::ET_EXEC => ContainerKind::Executable,
+        _ => ContainerKind::Other,
+    }
+}
+
+fn classify_macho(bytes: &[u8]) -> crate::container::ContainerKind {
+    use crate::container::ContainerKind;
+    use object::macho;
+
+    if bytes.len() < 8 {
+        return ContainerKind::Other;
+    }
+    // Mach-O header layout: magic (4 bytes), cputype (4), cpusubtype
+    // (4), filetype (4), ... `filetype` lives at offset 12. Both LE
+    // and BE 64-bit headers have it at the same offset.
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let is_64 = magic == macho::MH_MAGIC_64 || magic == macho::MH_CIGAM_64;
+    if !is_64 || bytes.len() < 16 {
+        return ContainerKind::Other;
+    }
+    // Endianness for the filetype field follows the magic. We currently
+    // only emit and inspect little-endian Mach-O.
+    let filetype = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    match filetype {
+        macho::MH_OBJECT => ContainerKind::Relocatable,
+        macho::MH_DYLIB => ContainerKind::SharedObject,
+        macho::MH_EXECUTE => ContainerKind::Executable,
+        _ => ContainerKind::Other,
+    }
 }
 
 /// Pull the raw `sh_type` for any section whose neutral `kind` is `Other`
