@@ -268,12 +268,22 @@ fn map_elf_relocation(r_type: u32) -> RelocationKind {
         elf::R_AARCH64_CONDBR19 => RelocationKind::Branch19,
         elf::R_AARCH64_TSTBR14 => RelocationKind::Branch14,
         elf::R_AARCH64_ADR_PREL_PG_HI21 => RelocationKind::AdrpPage21,
-        elf::R_AARCH64_ADD_ABS_LO12_NC
-        | elf::R_AARCH64_LDST8_ABS_LO12_NC
-        | elf::R_AARCH64_LDST16_ABS_LO12_NC
-        | elf::R_AARCH64_LDST32_ABS_LO12_NC
-        | elf::R_AARCH64_LDST64_ABS_LO12_NC
-        | elf::R_AARCH64_LDST128_ABS_LO12_NC => RelocationKind::PageOffset12,
+        elf::R_AARCH64_ADD_ABS_LO12_NC => RelocationKind::AddPageOffset12,
+        elf::R_AARCH64_LDST8_ABS_LO12_NC => {
+            RelocationKind::LoadStorePageOffset12 { access_width_bytes: 1 }
+        }
+        elf::R_AARCH64_LDST16_ABS_LO12_NC => {
+            RelocationKind::LoadStorePageOffset12 { access_width_bytes: 2 }
+        }
+        elf::R_AARCH64_LDST32_ABS_LO12_NC => {
+            RelocationKind::LoadStorePageOffset12 { access_width_bytes: 4 }
+        }
+        elf::R_AARCH64_LDST64_ABS_LO12_NC => {
+            RelocationKind::LoadStorePageOffset12 { access_width_bytes: 8 }
+        }
+        elf::R_AARCH64_LDST128_ABS_LO12_NC => {
+            RelocationKind::LoadStorePageOffset12 { access_width_bytes: 16 }
+        }
         elf::R_AARCH64_ABS64 | elf::R_AARCH64_ABS32 => RelocationKind::Absolute,
         other => RelocationKind::Other(other),
     }
@@ -288,7 +298,12 @@ fn map_macho_relocation(r_type: u8) -> RelocationKind {
             RelocationKind::AdrpPage21
         }
         macho::ARM64_RELOC_PAGEOFF12 | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
-            RelocationKind::PageOffset12
+            // Mach-O uses one r_type for all lo-12 page-offset variants
+            // and disambiguates the access width via `r_length`. We
+            // collapse to the add-form here; cross-format work that
+            // needs LDST disambiguation should look at the bytes at
+            // `relocation.offset` to pick the right variant.
+            RelocationKind::AddPageOffset12
         }
         other => RelocationKind::Other(other as u32),
     }

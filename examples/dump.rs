@@ -733,7 +733,10 @@ fn relocation_kind_label(kind: RelocationKind) -> String {
         RelocationKind::Branch19 => "Branch19".into(),
         RelocationKind::Branch14 => "Branch14".into(),
         RelocationKind::AdrpPage21 => "AdrpPage21".into(),
-        RelocationKind::PageOffset12 => "PageOffset12".into(),
+        RelocationKind::AddPageOffset12 => "AddPageOffset12".into(),
+        RelocationKind::LoadStorePageOffset12 { access_width_bytes } => {
+            format!("LoadStorePageOffset12({access_width_bytes}B)")
+        }
         RelocationKind::Absolute => "Absolute".into(),
         RelocationKind::Other(code) => format!("Other(0x{code:x})"),
     }

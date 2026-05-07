@@ -245,3 +245,78 @@ fn rewritten_text_section_still_runs() {
         "no-op rewrite changed program behaviour",
     );
 }
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn data_edit_redirects_function_pointer_in_funcs_array() {
+    // Stage 3 acceptance: edit `.data` to swap `funcs[0]` from `answer`
+    // to `replacement`. After link+run, `funcs[0]()` invokes
+    // `replacement`, so the program prints `answer=99` instead of
+    // `answer=42`.
+    //
+    // Exercises the full data-section pipeline: lift `.data` →
+    // redirect a pointer item → emit → commit → write → link → run.
+    // The fixture's main calls `funcs[argc>1]()`; with no argv args
+    // it always picks `funcs[0]`.
+    require_docker();
+    let object_path = build_fixture_o();
+    let scratch = ensure_scratch_dir();
+
+    use armv8_encode::container::SymbolKind;
+    use armv8_encode::rewrite::{
+        commit_to_data_container, emit_data_section, DataSection, Target,
+    };
+
+    let bytes = std::fs::read(&object_path).expect("read hello.o");
+    let container = Container::from_bytes(&bytes).expect("parse hello.o");
+
+    // Locate `.data` and the `replacement` function symbol.
+    let data_section_id = container
+        .sections
+        .iter()
+        .find(|s| s.name == ".data")
+        .expect("`.data` section")
+        .id;
+    let replacement_symbol_id = container
+        .symbols
+        .iter()
+        .find(|s| s.kind == SymbolKind::Function && s.name == "replacement")
+        .expect("`replacement` function symbol")
+        .id;
+    let funcs_symbol_id = container
+        .symbols
+        .iter()
+        .find(|s| s.name == "funcs")
+        .expect("`funcs` array symbol")
+        .id;
+
+    // Lift `.data`, find the item labelled `funcs` (the array's
+    // first element), redirect it.
+    let mut lifted = DataSection::lift(&container, data_section_id).expect("lift .data");
+    let funcs_index = lifted
+        .plan
+        .find_by_label(funcs_symbol_id)
+        .expect("`funcs` symbol labels an item in .data");
+    lifted
+        .plan
+        .redirect_pointer_at(funcs_index, Target::Symbol(replacement_symbol_id))
+        .expect("redirect funcs[0]");
+
+    let output = emit_data_section(&lifted.plan);
+    let edited = commit_to_data_container(
+        &container,
+        data_section_id,
+        output,
+        lifted.unhandled_relocations,
+    );
+    let written = edited.to_bytes().expect("write edited container");
+
+    std::fs::write(scratch.join("hello_data_edit.o"), &written).expect("write");
+
+    let stdout = link_and_run("scratch/hello_data_edit.o", "hello_data_edit");
+    assert_eq!(
+        stdout, "answer=99\n",
+        "redirecting funcs[0] should make funcs[0]() return 99",
+    );
+}

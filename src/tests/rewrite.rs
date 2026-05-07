@@ -796,6 +796,61 @@ fn commit_to_container_replaces_bytes_and_relocations() {
 }
 
 #[test]
+fn commit_to_container_preserves_relocations_on_other_sections() {
+    // Stage 2 invariant: rewriting one section's bytes/relocations must
+    // not disturb relocations on other sections (e.g. .rodata pointing
+    // into .text via a vtable).
+    use crate::container::RelocationKind;
+    use crate::rewrite::{commit_to_container, EmitOutput};
+
+    let mut container = container_with_function("target_fn", 0x4000);
+    let text_id = container.text_sections().next().unwrap().id;
+    let other_section_id = SectionId(99);
+
+    // Stale relocation on .text (will be cleared) and one on a different
+    // section (must survive).
+    container.relocations.push(crate::container::Relocation {
+        id: crate::container::RelocationId(0),
+        section: text_id,
+        offset: 0x100,
+        kind: RelocationKind::Branch26,
+        size: 26,
+        addend: 0,
+        symbol: Some(container.symbols[0].id),
+    });
+    container.relocations.push(crate::container::Relocation {
+        id: crate::container::RelocationId(1),
+        section: other_section_id,
+        offset: 0x200,
+        kind: RelocationKind::Absolute,
+        size: 64,
+        addend: 7,
+        symbol: Some(container.symbols[0].id),
+    });
+
+    let output = EmitOutput {
+        bytes: vec![0xaa, 0xbb, 0xcc, 0xdd],
+        relocations: vec![],
+    };
+
+    let committed = commit_to_container(&container, text_id, output);
+
+    // Other section's relocation untouched.
+    let other_relocations: Vec<_> = committed
+        .relocations
+        .iter()
+        .filter(|r| r.section == other_section_id)
+        .collect();
+    assert_eq!(other_relocations.len(), 1);
+    assert_eq!(other_relocations[0].offset, 0x200);
+    assert_eq!(other_relocations[0].addend, 7);
+
+    // Targeted section cleared (no emit relocations were supplied).
+    let text_relocations: Vec<_> = committed.relocations_for(text_id).collect();
+    assert_eq!(text_relocations.len(), 0);
+}
+
+#[test]
 fn full_pipeline_emits_extern_call_relocation_in_written_object() {
     use crate::container::RelocationKind;
     use crate::rewrite::commit_to_container;
@@ -1106,13 +1161,14 @@ mod macros {
         let layout = lay_out(&plan, 0x1000, Some(&container)).unwrap();
         let output = emit(&plan, &layout, Some(&container)).unwrap();
 
-        // Two relocations at offsets 0 and 4: AdrpPage21 + PageOffset12.
+        // Two relocations at offsets 0 and 4: AdrpPage21 +
+        // AddPageOffset12 (the add-form companion).
         assert_eq!(output.relocations.len(), 2);
         assert_eq!(output.relocations[0].offset, 0);
         assert_eq!(output.relocations[0].kind, RelocationKind::AdrpPage21);
         assert_eq!(output.relocations[0].symbol, symbol_id);
         assert_eq!(output.relocations[1].offset, 4);
-        assert_eq!(output.relocations[1].kind, RelocationKind::PageOffset12);
+        assert_eq!(output.relocations[1].kind, RelocationKind::AddPageOffset12);
         assert_eq!(output.relocations[1].symbol, symbol_id);
     }
 
@@ -1269,7 +1325,7 @@ mod macros {
             .collect();
         let kinds: Vec<RelocationKind> = relevant.iter().map(|r| r.kind).collect();
         assert!(kinds.contains(&RelocationKind::AdrpPage21));
-        assert!(kinds.contains(&RelocationKind::PageOffset12));
+        assert!(kinds.contains(&RelocationKind::AddPageOffset12));
     }
 }
 
@@ -1426,7 +1482,7 @@ mod relocation_lift {
                     id: RelocationId(1),
                     section: SectionId(0),
                     offset: 4,
-                    kind: RelocationKind::PageOffset12,
+                    kind: RelocationKind::AddPageOffset12,
                     size: 32,
                     addend: 0,
                     symbol: Some(SymbolId(0)),
@@ -1453,6 +1509,104 @@ mod relocation_lift {
             macro_op.original_addresses,
             vec![0, 4],
             "macro must remember both component addresses",
+        );
+    }
+
+    #[test]
+    fn lift_fuses_adrp_ldr_via_relocations_into_access_value_macro() {
+        // Mirror clang's `adrp x8, sym ; ldr w8, [x8, :lo12:sym]` for
+        // loading a global. Both halves carry relocations naming the
+        // same data symbol; lift must fuse them into an AccessValue
+        // macro, not leave the adrp as a singleton (whose relocation
+        // alone is insufficient — the ldr's LoadStorePageOffset12
+        // reloc would disappear from emit).
+        let adrp_word = 0x90000008_u32; // adrp x8, +0
+        let ldr_word = 0xb9400108_u32;  // ldr w8, [x8, #0]
+        let mut text_bytes = Vec::new();
+        text_bytes.extend_from_slice(&adrp_word.to_le_bytes());
+        text_bytes.extend_from_slice(&ldr_word.to_le_bytes());
+        text_bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes()); // ret
+
+        let container = Container {
+            format: BinaryFormat::Elf,
+            architecture: Architecture::Aarch64,
+            sections: vec![Section {
+                id: SectionId(0),
+                name: ".text".to_string(),
+                address: 0,
+                size: text_bytes.len() as u64,
+                bytes: text_bytes.clone(),
+                kind: SectionKind::Text,
+                align: 4,
+                flags: None,
+                raw_sh_type: None,
+            }],
+            symbols: vec![Symbol {
+                id: SymbolId(0),
+                name: "global_var".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Object,
+                binding: SymbolBinding::Global,
+                section: None,
+                is_undefined: true,
+                flags: None,
+            }],
+            relocations: vec![
+                Relocation {
+                    id: RelocationId(0),
+                    section: SectionId(0),
+                    offset: 0,
+                    kind: RelocationKind::AdrpPage21,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+                Relocation {
+                    id: RelocationId(1),
+                    section: SectionId(0),
+                    offset: 4,
+                    kind: RelocationKind::LoadStorePageOffset12 {
+                        access_width_bytes: 4,
+                    },
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+            ],
+            file_flags: None,
+            dwarf: None,
+        };
+
+        let instructions = aarch64::disassemble_bytes(0, &text_bytes).unwrap();
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlan::lift_with_container(&cfg, &instructions, &container);
+
+        let op = &plan.blocks[0].ops[0];
+        let macro_op = match op {
+            crate::rewrite::RewriteOp::Macro(m) => m,
+            other => panic!("expected fused AccessValue macro, got {other:?}"),
+        };
+        assert_eq!(macro_op.kind, crate::rewrite::MacroKind::AccessValue);
+        assert_eq!(macro_op.target, Target::Symbol(SymbolId(0)));
+        assert_eq!(
+            macro_op.original_instructions[1].mnemonic,
+            Aarch64Mnemonic::Ldr,
+        );
+
+        // No-op rewrite emits both relocations.
+        use crate::rewrite::{emit, lay_out};
+        let layout = lay_out(&plan, 0, Some(&container)).unwrap();
+        let output = emit(&plan, &layout, Some(&container)).unwrap();
+        let kinds: Vec<RelocationKind> =
+            output.relocations.iter().map(|r| r.kind).collect();
+        assert!(
+            kinds.contains(&RelocationKind::AdrpPage21)
+                && kinds.contains(&RelocationKind::LoadStorePageOffset12 {
+                    access_width_bytes: 4,
+                }),
+            "AccessValue emit must produce AdrpPage21 + LoadStorePageOffset12 \
+             with access_width=4 for ldr w8, got {kinds:?}",
         );
     }
 
@@ -1527,7 +1681,7 @@ mod relocation_lift {
                     id: RelocationId(1),
                     section: SectionId(0),
                     offset: 4,
-                    kind: RelocationKind::PageOffset12,
+                    kind: RelocationKind::AddPageOffset12,
                     size: 32,
                     addend: 0,
                     symbol: Some(SymbolId(0)),
@@ -1551,7 +1705,7 @@ mod relocation_lift {
             .collect();
         assert!(
             kinds.contains(&RelocationKind::AdrpPage21)
-                && kinds.contains(&RelocationKind::PageOffset12),
+                && kinds.contains(&RelocationKind::AddPageOffset12),
             "section-symbol macro must emit both relocations, got {kinds:?}",
         );
     }

@@ -1077,12 +1077,28 @@ fn encode_rt_register(
         return Err(EncodeError::InvalidOperand { kind: kind.name() });
     }
 
-    let size_bits = match (opcode.class_name(), register.class) {
+    // Sign-extending load mnemonics (`ldrsw`, `ldrsh`, `ldrsb`) put a
+    // signed result into an X-class destination, but the size field
+    // encodes the *access* width (32/16/8), which is what the base
+    // opcode already carries. Don't let the X-class destination toggle
+    // bit 30 for those — that's the Rt-class size override used by
+    // plain `ldr`/`str`, where size matches the destination width.
+    let class_name = opcode.class_name();
+    let is_signed_load = matches!(
+        opcode.mnemonic(),
+        "ldrsw" | "ldrsh" | "ldrsb"
+    ) && matches!(
+        class_name,
+        "LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled"
+    );
+
+    let size_bits = match (class_name, register.class) {
         ("Testbranch", RegisterClass::W | RegisterClass::X) => 0,
         ("Ldstexcl", RegisterClass::W) => 0,
         ("Ldstexcl", RegisterClass::X) => 1 << 30,
         ("LseAtomic", RegisterClass::W) => 0,
         ("LseAtomic", RegisterClass::X) => 1 << 30,
+        ("LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled", _) if is_signed_load => 0,
         ("LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled", RegisterClass::W) => 0,
         ("LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled", RegisterClass::X) => 1 << 30,
         ("LdstImm9" | "LdstPos" | "LdstRegoff" | "LdstUnscaled", RegisterClass::S) => 2 << 30,

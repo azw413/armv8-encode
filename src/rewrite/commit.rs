@@ -64,7 +64,8 @@ fn relocation_size_bits(kind: RelocationKind) -> u8 {
         RelocationKind::Branch19 => 19,
         RelocationKind::Branch14 => 14,
         RelocationKind::AdrpPage21 => 21,
-        RelocationKind::PageOffset12 => 12,
+        RelocationKind::AddPageOffset12 => 12,
+        RelocationKind::LoadStorePageOffset12 { .. } => 12,
         RelocationKind::Absolute => 64,
         RelocationKind::Other(_) => 32,
     }

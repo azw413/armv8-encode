@@ -226,7 +226,7 @@ fn parses_adrp_pageoff_pair_in_elf() {
     let kinds: Vec<RelocationKind> =
         container.relocations.iter().map(|r| r.kind).collect();
     assert!(kinds.contains(&RelocationKind::AdrpPage21));
-    assert!(kinds.contains(&RelocationKind::PageOffset12));
+    assert!(kinds.contains(&RelocationKind::AddPageOffset12));
 }
 
 #[test]

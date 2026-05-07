@@ -367,7 +367,8 @@ fn is_relocation_kind_we_lift(kind: RelocationKind) -> bool {
             | RelocationKind::Branch19
             | RelocationKind::Branch14
             | RelocationKind::AdrpPage21
-            | RelocationKind::PageOffset12
+            | RelocationKind::AddPageOffset12
+            | RelocationKind::LoadStorePageOffset12 { .. }
     )
 }
 
@@ -404,9 +405,13 @@ fn resolve_address(
 }
 
 /// Walk a flat list of singleton instructions and fuse recognized
-/// multi-instruction idioms into [`MacroOp`]s. Currently handles
-/// `adrp+add` (strict adjacency, same `Rd`, register-shape `add`) →
-/// [`MacroKind::LoadAddress`].
+/// multi-instruction idioms into [`MacroOp`]s. Handles two patterns:
+/// - `adrp Rd, page` + `add Rd, Rd, #imm` → [`MacroKind::LoadAddress`].
+/// - `adrp Rd, page` + `ldr/str Rt, [Rd, #imm]` → [`MacroKind::AccessValue`].
+///
+/// Both patterns require strict adjacency. Non-adjacent patterns
+/// (compiler-scheduled) need lightweight data-flow tracking and are out
+/// of scope here.
 fn fuse_macros(
     instructions: Vec<RewriteInstruction>,
     block_at_address: &HashMap<u64, BasicBlockId>,
@@ -417,8 +422,8 @@ fn fuse_macros(
     let mut iter = instructions.into_iter().peekable();
 
     while let Some(current) = iter.next() {
-        // Look for `adrp Rd, page` followed by `add Rd, Rd, #imm`. If we
-        // can fuse, consume the next item and emit a Macro; otherwise
+        // Look for `adrp Rd, page` followed by a recognised companion. If
+        // we can fuse, consume the next item and emit a Macro; otherwise
         // pass `current` through as a singleton.
         if matches!(current.mnemonic, Aarch64Mnemonic::Adrp) {
             if let Some(next) = iter.peek() {
@@ -433,12 +438,77 @@ fn fuse_macros(
                     ops.push(RewriteOp::Macro(macro_op));
                     continue;
                 }
+                if let Some(macro_op) = try_fuse_adrp_ldst(&current, next, relocations) {
+                    iter.next();
+                    ops.push(RewriteOp::Macro(macro_op));
+                    continue;
+                }
             }
         }
         ops.push(RewriteOp::Instruction(current));
     }
 
     ops
+}
+
+/// Recognise `adrp Rd, sym ; ldr/str Rt, [Rd, #:lo12:sym]`. Both
+/// instructions must carry container relocations naming the same
+/// symbol — without that, we have no way to tell whether the load uses
+/// the adrp's result for symbol access vs. some unrelated address
+/// computation. The relocation pair is the unambiguous signal.
+fn try_fuse_adrp_ldst(
+    adrp: &RewriteInstruction,
+    companion: &RewriteInstruction,
+    relocations: &HashMap<u64, InstructionRelocation>,
+) -> Option<MacroOp> {
+    if !matches!(
+        companion.mnemonic,
+        Aarch64Mnemonic::Ldr | Aarch64Mnemonic::Str
+    ) {
+        return None;
+    }
+
+    // adrp shape: [Register(Rd), Page(_)].
+    let adrp_rd = match adrp.operands.as_slice() {
+        [RewriteOperand::Decoded(DecodedOperand::Register(rd)), RewriteOperand::Page(_)] => rd,
+        _ => return None,
+    };
+
+    // Companion shape: [Register(Rt), Memory{ base, offset, mode: Offset }].
+    // We only care that the memory base register is the adrp's Rd —
+    // that's the data-flow link. The Rt destination/source can be any
+    // register and any width.
+    let companion_base = match companion.operands.as_slice() {
+        [
+            RewriteOperand::Decoded(DecodedOperand::Register(_)),
+            RewriteOperand::Decoded(DecodedOperand::Memory(memory)),
+        ] => &memory.base,
+        _ => return None,
+    };
+    if !same_register(adrp_rd, companion_base) {
+        return None;
+    }
+
+    // Use the relocation pair as the source of truth, just like the
+    // adrp+add fuser. Same-symbol on AdrpPage21 + LoadStorePageOffset12
+    // ⇒ macro target.
+    let target = macro_target_from_relocations(
+        adrp,
+        companion,
+        relocations,
+        CompanionRelocKind::LoadStore,
+    )?;
+
+    Some(MacroOp {
+        kind: MacroKind::AccessValue,
+        register: adrp_rd.clone(),
+        target,
+        original_addresses: [adrp.original_address, companion.original_address]
+            .into_iter()
+            .flatten()
+            .collect(),
+        original_instructions: vec![adrp.clone(), companion.clone()],
+    })
 }
 
 fn try_fuse_adrp_add(
@@ -495,7 +565,12 @@ fn try_fuse_adrp_add(
     // are placeholder zeros and resolving them by address would give a
     // bogus answer. This is the unlinked-.o case (clang emits
     // `R_AARCH64_ADR_PREL_PG_HI21 + R_AARCH64_ADD_ABS_LO12_NC` paired).
-    let target = match macro_target_from_relocations(adrp, add, relocations) {
+    let target = match macro_target_from_relocations(
+        adrp,
+        add,
+        relocations,
+        CompanionRelocKind::Add,
+    ) {
         Some(t) => t,
         None => {
             // No relocations (already-linked code, or a hand-rolled
@@ -537,28 +612,51 @@ fn try_fuse_adrp_add(
 /// address-synthesis path.
 fn macro_target_from_relocations(
     adrp: &RewriteInstruction,
-    add: &RewriteInstruction,
+    companion: &RewriteInstruction,
     relocations: &HashMap<u64, InstructionRelocation>,
+    expected_companion_kind: CompanionRelocKind,
 ) -> Option<Target> {
     let adrp_addr = adrp.original_address?;
-    let add_addr = add.original_address?;
+    let companion_addr = companion.original_address?;
 
     let adrp_reloc = relocations.get(&adrp_addr)?;
-    let add_reloc = relocations.get(&add_addr)?;
+    let companion_reloc = relocations.get(&companion_addr)?;
 
-    if adrp_reloc.kind != RelocationKind::AdrpPage21
-        || add_reloc.kind != RelocationKind::PageOffset12
-    {
+    if adrp_reloc.kind != RelocationKind::AdrpPage21 {
+        return None;
+    }
+    if !companion_reloc_matches(companion_reloc.kind, expected_companion_kind) {
         return None;
     }
     let adrp_sym = adrp_reloc.symbol?;
-    let add_sym = add_reloc.symbol?;
-    if adrp_sym != add_sym {
-        // Mismatched symbols — not a fused load-address. Could be a
-        // valid construct (rare) but not one we want to collapse here.
+    let companion_sym = companion_reloc.symbol?;
+    if adrp_sym != companion_sym {
+        // Mismatched symbols — not a fused pair. Could be a valid
+        // construct (rare) but not one we want to collapse here.
         return None;
     }
     Some(Target::Symbol(adrp_sym))
+}
+
+/// Which lo-12 relocation shape the caller expects on the companion of
+/// an `adrp`. The `add` form pairs with `R_AARCH64_ADD_ABS_LO12_NC`;
+/// `ldr`/`str` pair with one of the `R_AARCH64_LDST*_ABS_LO12_NC`
+/// variants. We don't pin the LDST access width here because clang
+/// freely mixes it with the matching companion mnemonic, so the macro
+/// matcher accepts any LDST variant against any `Ldr`/`Str` mnemonic.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum CompanionRelocKind {
+    Add,
+    LoadStore,
+}
+
+fn companion_reloc_matches(actual: RelocationKind, expected: CompanionRelocKind) -> bool {
+    match expected {
+        CompanionRelocKind::Add => matches!(actual, RelocationKind::AddPageOffset12),
+        CompanionRelocKind::LoadStore => {
+            matches!(actual, RelocationKind::LoadStorePageOffset12 { .. })
+        }
+    }
 }
 
 fn same_register(a: &Register, b: &Register) -> bool {

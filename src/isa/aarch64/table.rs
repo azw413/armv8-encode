@@ -9736,6 +9736,16 @@ fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
             ((instruction >> 5) & 0x1f) == ((instruction >> 16) & 0x1f)
         }
         "sxtl" | "sxtl2" | "uxtl" | "uxtl2" => false,
+        // `cinc Wd, Wn, cond` ⇔ `csinc Wd, Wn, Wn, !cond` AND Wn != WZR.
+        // The base CSINC opcode also matches CSET (Wn=Wm=WZR), CINV
+        // (csinv with Rm=Rn), and plain CSINC, so we need to filter
+        // here to keep the alias from absorbing a non-aliasing form
+        // like `csinc Wd, Wn, wzr, cond` (Rm=wzr, Rn≠wzr).
+        "cinc" if opcode.iclass == Aarch64InsnClass::Condsel => {
+            let rn = (instruction >> 5) & 0x1f;
+            let rm = (instruction >> 16) & 0x1f;
+            rn == rm && rn != 31
+        }
         "at" => matches!(system_op_fields(instruction), (0, 7, 8, 0)),
         "dc" => matches!(system_op_fields(instruction), (3, 7, 4, 1)),
         "ic" => matches!(system_op_fields(instruction), (3, 7, 5, 1) | (0, 7, 5, 0)),

@@ -36,12 +36,17 @@
 //!   resolver exists until binary-container ingest lands.
 
 pub mod commit;
+pub mod data;
 pub mod emit;
 pub mod ir;
 pub mod layout;
 pub mod plan;
 
 pub use commit::commit_to_container;
+pub use data::{
+    commit_to_data_container, emit_data_section, DataEditError, DataEmitOutput, DataItem,
+    DataLift, DataLiftError, DataPayload, DataSection,
+};
 pub use emit::{emit, EmitError, EmitOutput, EmittedRelocation};
 pub use ir::{
     ConstantId, MacroKind, MacroOp, RewriteBlock, RewriteInstruction, RewriteOp, RewriteOperand,

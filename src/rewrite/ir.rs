@@ -124,6 +124,14 @@ pub enum MacroKind {
     /// `adrp Rd, page; add Rd, Rd, #lo12` — compute the absolute address
     /// of `target`.
     LoadAddress,
+    /// `adrp Rd, page; ldr/str Rd', [Rn, #lo12]` — load from or store to
+    /// `target`. Covers all `LDST*_ABS_LO12_NC` variants (8/16/32/64/128
+    /// bit, signed/unsigned, integer/SIMD). The companion instruction's
+    /// memory operand is preserved verbatim from the source via
+    /// [`MacroOp::original_instructions`]; the rewriter only needs to
+    /// know that it depends on the page address from the adrp and pairs
+    /// with a `PageOffset12` relocation against the same symbol.
+    AccessValue,
 }
 
 impl RewriteOp {

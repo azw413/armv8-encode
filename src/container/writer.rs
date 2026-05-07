@@ -339,7 +339,18 @@ fn elf_flags(kind: RelocationKind) -> RelocationFlags {
         RelocationKind::Branch19 => elf::R_AARCH64_CONDBR19,
         RelocationKind::Branch14 => elf::R_AARCH64_TSTBR14,
         RelocationKind::AdrpPage21 => elf::R_AARCH64_ADR_PREL_PG_HI21,
-        RelocationKind::PageOffset12 => elf::R_AARCH64_ADD_ABS_LO12_NC,
+        RelocationKind::AddPageOffset12 => elf::R_AARCH64_ADD_ABS_LO12_NC,
+        RelocationKind::LoadStorePageOffset12 { access_width_bytes } => match access_width_bytes {
+            1 => elf::R_AARCH64_LDST8_ABS_LO12_NC,
+            2 => elf::R_AARCH64_LDST16_ABS_LO12_NC,
+            4 => elf::R_AARCH64_LDST32_ABS_LO12_NC,
+            8 => elf::R_AARCH64_LDST64_ABS_LO12_NC,
+            16 => elf::R_AARCH64_LDST128_ABS_LO12_NC,
+            // Unknown widths fall back to the closest available
+            // variant. In practice the reader only constructs this
+            // variant from the five widths above.
+            _ => elf::R_AARCH64_LDST32_ABS_LO12_NC,
+        },
         RelocationKind::Absolute => elf::R_AARCH64_ABS64,
         RelocationKind::Other(raw) => raw,
     };
@@ -351,7 +362,20 @@ fn macho_flags(kind: RelocationKind) -> Result<RelocationFlags, ContainerWriteEr
     let (r_type, r_pcrel, r_length) = match kind {
         RelocationKind::Branch26 => (macho::ARM64_RELOC_BRANCH26, true, 2),
         RelocationKind::AdrpPage21 => (macho::ARM64_RELOC_PAGE21, true, 2),
-        RelocationKind::PageOffset12 => (macho::ARM64_RELOC_PAGEOFF12, false, 2),
+        RelocationKind::AddPageOffset12 => (macho::ARM64_RELOC_PAGEOFF12, false, 2),
+        // Mach-O encodes the access width via `r_length`, not the
+        // r_type. log2(width_bytes) gives the right field for the
+        // standard 1/2/4/8-byte widths we model.
+        RelocationKind::LoadStorePageOffset12 { access_width_bytes } => {
+            let r_length = match access_width_bytes {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                _ => 2,
+            };
+            (macho::ARM64_RELOC_PAGEOFF12, false, r_length)
+        }
         RelocationKind::Absolute => (macho::ARM64_RELOC_UNSIGNED, false, 3),
         RelocationKind::Other(raw) => (raw as u8, false, 2),
         // Mach-O's standard ARM64 relocation set has no Branch19 /

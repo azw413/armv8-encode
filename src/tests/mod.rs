@@ -6,6 +6,7 @@ mod common;
 mod container;
 mod control_flow;
 mod coverage;
+mod data;
 mod decode;
 mod encode;
 mod recursive;

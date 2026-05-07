@@ -139,6 +139,16 @@ pub enum SymbolExtraFlags {
 /// What kind of fix-up a relocation applies. Currently only the AArch64
 /// shapes the rewriter wants to see are mapped explicitly; everything else
 /// falls through to [`RelocationKind::Other`].
+///
+/// The lo-12 page-offset family is split by *companion instruction* —
+/// the `add`-form and the various `ldr`/`str`-form relocations all
+/// patch the same bit positions but the linker scales the value
+/// differently per form (the LDST variants right-shift by
+/// log2(access_width)). Collapsing them all to one enum variant breaks
+/// round-trip when emit picks `R_AARCH64_ADD_ABS_LO12_NC` for what was
+/// originally `R_AARCH64_LDST32_ABS_LO12_NC` — caught by the ELF
+/// runtime harness when the loaded address ended up wrong by orders of
+/// magnitude.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum RelocationKind {
     /// 26-bit PC-relative branch (`b`, `bl`).
@@ -149,8 +159,14 @@ pub enum RelocationKind {
     Branch14,
     /// 21-bit PC-relative ADRP page reference.
     AdrpPage21,
-    /// 12-bit page offset (the `add`/`ldr` companion to `adrp`).
-    PageOffset12,
+    /// 12-bit page offset for the `add` form companion to `adrp`
+    /// (`R_AARCH64_ADD_ABS_LO12_NC`). Linker writes the raw 12-bit value
+    /// into bits 21:10.
+    AddPageOffset12,
+    /// 12-bit page offset for an `ldr`/`str` companion to `adrp`. The
+    /// access width is tracked because the linker right-shifts the
+    /// patched value by log2(width_bytes) before placing it.
+    LoadStorePageOffset12 { access_width_bytes: u8 },
     /// Absolute pointer (data references, GOT entries).
     Absolute,
     /// Format-specific kind not yet mapped. Carries the raw type code so
