@@ -187,19 +187,23 @@ fn emit_load_address(
     container: Option<&Container>,
     output: &mut EmitOutput,
 ) -> Result<(), EmitError> {
-    let target_is_undefined = match (macro_op.target, container) {
+    // Macro target needs a relocation under the same rules as for
+    // instruction operands (see [`symbol_needs_relocation`]): undefined
+    // externs and section symbols both fail to fold to a stable
+    // address.
+    let target_needs_relocation = match (macro_op.target, container) {
         (Target::Symbol(id), Some(container)) => {
-            container.address_of_symbol(id).is_none()
+            symbol_needs_relocation(container, id)
         }
         _ => false,
     };
 
-    if target_is_undefined {
+    if target_needs_relocation {
         // Placeholder bytes: adrp Rd, here ; add Rd, Rd, #0. Offsets get
         // overwritten by the linker via the two emitted relocations.
         let symbol_id = match macro_op.target {
             Target::Symbol(id) => id,
-            _ => unreachable!("target_is_undefined implies Symbol"),
+            _ => unreachable!("target_needs_relocation implies Symbol"),
         };
 
         let adrp_offset = output.bytes.len() as u64;
@@ -270,8 +274,10 @@ fn build_add_immediate_template(rd: &Register, immediate: i64) -> InstructionTem
 }
 
 /// Inspect an instruction's PC-relative target. Returns `Some((symbol_id,
-/// is_page))` when the target is a `Target::Symbol(id)` that the supplied
-/// container considers undefined.
+/// is_page))` when the target is a `Target::Symbol(id)` whose final
+/// address can't be folded into a displacement at rewrite time —
+/// undefined externs, and section symbols whose final placement is up
+/// to the linker.
 fn needs_relocation(
     instruction: &RewriteInstruction,
     container: Option<&Container>,
@@ -284,12 +290,34 @@ fn needs_relocation(
             _ => continue,
         };
         if let Target::Symbol(id) = target {
-            if container.address_of_symbol(id).is_none() {
+            if symbol_needs_relocation(container, id) {
                 return Some((id, is_page));
             }
         }
     }
     None
+}
+
+/// True when emit must produce a relocation for a `Target::Symbol(id)`
+/// rather than fold the symbol's address into a displacement.
+///
+/// The straightforward case is an undefined extern — its address is the
+/// linker's responsibility. The subtler case is a *section symbol* (an
+/// `STT_SECTION` entry pointing at e.g. `.rodata.str1.1`): the symbol
+/// nominally has `address = 0` in the unlinked input, but its final
+/// address depends on where the linker places the section. Folding the
+/// `0` produces a binary that points at the file start instead of the
+/// referenced data — caught by the ELF runtime harness on
+/// `printf("answer=%d\n", ...)`.
+///
+/// Same-section function symbols (e.g. a `bl other_fn` within the same
+/// `.text`) don't need relocations: the linker preserves intra-section
+/// displacements when both ends land in the same output section, so a
+/// frozen PC-relative offset is correct.
+pub(crate) fn symbol_needs_relocation(container: &Container, id: SymbolId) -> bool {
+    use crate::container::SymbolKind;
+    let symbol = container.symbol(id);
+    symbol.is_undefined || symbol.kind == SymbolKind::Section
 }
 
 fn emit_with_relocation(

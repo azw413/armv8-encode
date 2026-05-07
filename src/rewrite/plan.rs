@@ -12,7 +12,7 @@
 //! 3. The layout pass (separate module) decides where each block lands.
 //! 4. The emit pass walks the laid-out plan and produces bytes.
 
-use crate::container::Container;
+use crate::container::{Container, RelocationKind, SymbolId};
 use crate::isa::aarch64::{Aarch64Mnemonic, DecodedInstruction, DecodedOperand, Register};
 use crate::mc::{BasicBlockId, ControlFlowGraph};
 use crate::rewrite::ir::{
@@ -91,15 +91,39 @@ impl RewritePlan {
             .map(|block| (block.start, block.id))
             .collect();
 
+        // Build a lookup from "absolute instruction address" → relocation
+        // info. PC-relative AArch64 instructions in unlinked `.o` files
+        // carry a placeholder displacement of zero and rely on the
+        // accompanying relocation for the real target. If we lift the
+        // placeholder zero verbatim, layout will resolve it as a real
+        // PC-relative branch (often into the middle of the same
+        // function), producing a runnable but completely broken binary.
+        // Consult the container so those instructions lift to
+        // `Target::Symbol` and the relocation is preserved through emit.
+        let pc_relative_relocations =
+            container.map(build_pc_relative_relocation_lookup).unwrap_or_default();
+
         let blocks = cfg
             .blocks
             .iter()
             .map(|block| {
                 let lifted: Vec<RewriteInstruction> = instructions[block.instructions.clone()]
                     .iter()
-                    .map(|insn| lift_instruction(insn, &block_at_address, container))
+                    .map(|insn| {
+                        lift_instruction(
+                            insn,
+                            &block_at_address,
+                            container,
+                            &pc_relative_relocations,
+                        )
+                    })
                     .collect();
-                let ops = fuse_macros(lifted, &block_at_address, container);
+                let ops = fuse_macros(
+                    lifted,
+                    &block_at_address,
+                    container,
+                    &pc_relative_relocations,
+                );
                 RewriteBlock { id: block.id, ops }
             })
             .collect();
@@ -252,16 +276,34 @@ fn lift_instruction(
     insn: &DecodedInstruction,
     block_at_address: &HashMap<u64, BasicBlockId>,
     container: Option<&Container>,
+    pc_relative_relocations: &HashMap<u64, InstructionRelocation>,
 ) -> RewriteInstruction {
+    // If a relocation applies to this instruction *and* targets a
+    // PC-relative operand, prefer it over whatever displacement the
+    // decoded operand carries. The decoded operand's address is computed
+    // from the placeholder word (typically zero in unlinked .o input),
+    // so blindly trusting it produces a branch into the function's
+    // prologue.
+    let reloc_target = pc_relative_relocations
+        .get(&insn.address)
+        .filter(|r| is_pc_relative_operand_kind(r.kind))
+        .and_then(|r| r.symbol.map(Target::Symbol));
+
     let operands = insn
         .operands
         .iter()
         .map(|operand| match operand {
             DecodedOperand::BranchTarget(addr) => {
-                RewriteOperand::Branch(resolve_address(*addr, block_at_address, container))
+                let target = reloc_target.unwrap_or_else(|| {
+                    resolve_address(*addr, block_at_address, container)
+                });
+                RewriteOperand::Branch(target)
             }
             DecodedOperand::PageTarget(addr) => {
-                RewriteOperand::Page(resolve_address(*addr, block_at_address, container))
+                let target = reloc_target.unwrap_or_else(|| {
+                    resolve_address(*addr, block_at_address, container)
+                });
+                RewriteOperand::Page(target)
             }
             other => RewriteOperand::Decoded(other.clone()),
         })
@@ -271,6 +313,75 @@ fn lift_instruction(
         operands,
         original_address: Some(insn.address),
     }
+}
+
+/// Per-instruction relocation summary used during lift. Carries enough
+/// to substitute symbolic targets where the encoded operand would
+/// otherwise carry a placeholder.
+#[derive(Debug, Clone)]
+struct InstructionRelocation {
+    kind: RelocationKind,
+    symbol: Option<SymbolId>,
+}
+
+/// Build an "instruction address → relocation" map from the container.
+///
+/// Unlinked AArch64 `.o` files store branch displacements as zero
+/// placeholders alongside `R_AARCH64_CALL26` / `R_AARCH64_CONDBR19` /
+/// `R_AARCH64_TSTBR14` relocations, and store `adrp` page references as
+/// zero alongside `R_AARCH64_ADR_PREL_PG_HI21`. The companion `add`
+/// /`ldr`/`str` instructions in an `adrp+...` pair store the page
+/// offset as zero alongside `R_AARCH64_ADD_ABS_LO12_NC` (or one of the
+/// `LDST*_ABS_LO12_NC` variants). Lift consults this map both for
+/// singleton instructions (branches, lone adrps) and during macro
+/// fusion (adrp + add → LoadAddress).
+fn build_pc_relative_relocation_lookup(
+    container: &Container,
+) -> HashMap<u64, InstructionRelocation> {
+    let mut map = HashMap::new();
+    for relocation in &container.relocations {
+        if !is_relocation_kind_we_lift(relocation.kind) {
+            continue;
+        }
+        let section = container.section(relocation.section);
+        let address = section.address + relocation.offset;
+        // First reloc wins on conflicts. The map is keyed by instruction
+        // address, and AArch64 has at most one relocation per
+        // instruction in well-formed input.
+        map.entry(address).or_insert(InstructionRelocation {
+            kind: relocation.kind,
+            symbol: relocation.symbol,
+        });
+    }
+    map
+}
+
+/// Relocations whose target the rewrite layer wants to lift to a
+/// symbolic [`Target`]. Branch* + AdrpPage21 substitute directly into
+/// PC-relative operands; PageOffset12 has no PC-relative operand on its
+/// host instruction but pairs with an adrp to form a macro target.
+fn is_relocation_kind_we_lift(kind: RelocationKind) -> bool {
+    matches!(
+        kind,
+        RelocationKind::Branch26
+            | RelocationKind::Branch19
+            | RelocationKind::Branch14
+            | RelocationKind::AdrpPage21
+            | RelocationKind::PageOffset12
+    )
+}
+
+/// True when this relocation kind targets a PC-relative *operand* on
+/// the instruction (so [`lift_instruction`] should swap the operand's
+/// resolved address for a [`Target::Symbol`]).
+fn is_pc_relative_operand_kind(kind: RelocationKind) -> bool {
+    matches!(
+        kind,
+        RelocationKind::Branch26
+            | RelocationKind::Branch19
+            | RelocationKind::Branch14
+            | RelocationKind::AdrpPage21
+    )
 }
 
 /// Resolve a numeric address to a symbolic target. Block matches in the
@@ -300,6 +411,7 @@ fn fuse_macros(
     instructions: Vec<RewriteInstruction>,
     block_at_address: &HashMap<u64, BasicBlockId>,
     container: Option<&Container>,
+    relocations: &HashMap<u64, InstructionRelocation>,
 ) -> Vec<RewriteOp> {
     let mut ops = Vec::with_capacity(instructions.len());
     let mut iter = instructions.into_iter().peekable();
@@ -310,9 +422,13 @@ fn fuse_macros(
         // pass `current` through as a singleton.
         if matches!(current.mnemonic, Aarch64Mnemonic::Adrp) {
             if let Some(next) = iter.peek() {
-                if let Some(macro_op) =
-                    try_fuse_adrp_add(&current, next, block_at_address, container)
-                {
+                if let Some(macro_op) = try_fuse_adrp_add(
+                    &current,
+                    next,
+                    block_at_address,
+                    container,
+                    relocations,
+                ) {
                     iter.next();
                     ops.push(RewriteOp::Macro(macro_op));
                     continue;
@@ -330,6 +446,7 @@ fn try_fuse_adrp_add(
     add: &RewriteInstruction,
     block_at_address: &HashMap<u64, BasicBlockId>,
     container: Option<&Container>,
+    relocations: &HashMap<u64, InstructionRelocation>,
 ) -> Option<MacroOp> {
     // adrp operands: [Register(Rd), Page(Target)].
     let adrp_rd = match adrp.operands.as_slice() {
@@ -373,27 +490,33 @@ fn try_fuse_adrp_add(
         return None;
     }
 
-    // Compose the symbolic target by looking up the absolute address of
-    // (adrp_page + add_imm).
-    let combined_address = match adrp_target {
-        Target::Absolute(page) => page.wrapping_add(add_imm as u64),
-        // If the adrp already points at a Block / Symbol, it does so
-        // because the page address matched a block or symbol entry —
-        // *not* an addresses inside it. The combined adrp+add normally
-        // points to (page + offset), which is rarely the page itself,
-        // so we fall through to the absolute path through the original
-        // page address.
-        Target::Block(_) | Target::Symbol(_) | Target::Constant(_) => {
-            // Recover the original page address from the original adrp
-            // PageTarget(addr) pre-lift. Since we lost it during lift,
-            // we conservatively *don't* fuse — the rare case where the
-            // page itself is the entire target is preserved as separate
-            // adrp + add ops that the user can edit individually.
-            return None;
+    // If both halves of the pair carry matching relocations naming the
+    // same symbol, that *is* the macro target — the encoded operands
+    // are placeholder zeros and resolving them by address would give a
+    // bogus answer. This is the unlinked-.o case (clang emits
+    // `R_AARCH64_ADR_PREL_PG_HI21 + R_AARCH64_ADD_ABS_LO12_NC` paired).
+    let target = match macro_target_from_relocations(adrp, add, relocations) {
+        Some(t) => t,
+        None => {
+            // No relocations (already-linked code, or a hand-rolled
+            // pair). Compose the symbolic target by looking up the
+            // absolute address of (adrp_page + add_imm).
+            let combined_address = match adrp_target {
+                Target::Absolute(page) => page.wrapping_add(add_imm as u64),
+                // If the adrp already points at a Block / Symbol, it
+                // does so because the page address matched a block or
+                // symbol entry — *not* an address inside it. The
+                // combined adrp+add normally points to (page + offset),
+                // which is rarely the page itself, so we conservatively
+                // bail and let the user edit the two instructions
+                // separately.
+                Target::Block(_) | Target::Symbol(_) | Target::Constant(_) => {
+                    return None;
+                }
+            };
+            resolve_address(combined_address, block_at_address, container)
         }
     };
-
-    let target = resolve_address(combined_address, block_at_address, container);
 
     Some(MacroOp {
         kind: MacroKind::LoadAddress,
@@ -405,6 +528,37 @@ fn try_fuse_adrp_add(
             .collect(),
         original_instructions: vec![adrp.clone(), add.clone()],
     })
+}
+
+/// If the adrp and add instructions both carry container relocations that
+/// name the same symbol (`R_AARCH64_ADR_PREL_PG_HI21` paired with
+/// `R_AARCH64_ADD_ABS_LO12_NC`), return that symbol as the macro's
+/// resolved target. Otherwise `None` — caller falls back to the
+/// address-synthesis path.
+fn macro_target_from_relocations(
+    adrp: &RewriteInstruction,
+    add: &RewriteInstruction,
+    relocations: &HashMap<u64, InstructionRelocation>,
+) -> Option<Target> {
+    let adrp_addr = adrp.original_address?;
+    let add_addr = add.original_address?;
+
+    let adrp_reloc = relocations.get(&adrp_addr)?;
+    let add_reloc = relocations.get(&add_addr)?;
+
+    if adrp_reloc.kind != RelocationKind::AdrpPage21
+        || add_reloc.kind != RelocationKind::PageOffset12
+    {
+        return None;
+    }
+    let adrp_sym = adrp_reloc.symbol?;
+    let add_sym = add_reloc.symbol?;
+    if adrp_sym != add_sym {
+        // Mismatched symbols — not a fused load-address. Could be a
+        // valid construct (rare) but not one we want to collapse here.
+        return None;
+    }
+    Some(Target::Symbol(adrp_sym))
 }
 
 fn same_register(a: &Register, b: &Register) -> bool {

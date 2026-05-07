@@ -1272,3 +1272,335 @@ mod macros {
         assert!(kinds.contains(&RelocationKind::PageOffset12));
     }
 }
+
+// ---- Lift consults container relocations ------------------------------
+//
+// In an unlinked .o, `bl <symbol>` is encoded as `bl 0` (placeholder)
+// plus an `R_AARCH64_CALL26` relocation that names the real target.
+// Without consulting the relocation, lift would treat the placeholder
+// zero as a real PC-relative branch into the start of the section,
+// freezing it through layout and emit. The runtime harness caught this
+// — the rewritten binary jumped into its own prologue and hung. Cover
+// it here so it can't regress.
+
+mod relocation_lift {
+    use super::*;
+    use crate::container::{Relocation, RelocationId, RelocationKind};
+
+    /// Build a container with a single text section containing `.text`
+    /// bytes, plus one undefined extern symbol "extern_fn" and a
+    /// Branch26 relocation pointing at it. The relocation's offset is
+    /// caller-supplied so we can target a specific instruction.
+    fn container_with_extern_branch(
+        text_bytes: Vec<u8>,
+        relocation_offset: u64,
+    ) -> Container {
+        Container {
+            format: BinaryFormat::Elf,
+            architecture: Architecture::Aarch64,
+            sections: vec![Section {
+                id: SectionId(0),
+                name: ".text".to_string(),
+                address: 0,
+                size: text_bytes.len() as u64,
+                bytes: text_bytes,
+                kind: SectionKind::Text,
+                align: 4,
+                flags: None,
+                raw_sh_type: None,
+            }],
+            symbols: vec![Symbol {
+                id: SymbolId(0),
+                name: "extern_fn".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section: None,
+                is_undefined: true,
+                flags: None,
+            }],
+            relocations: vec![Relocation {
+                id: RelocationId(0),
+                section: SectionId(0),
+                offset: relocation_offset,
+                kind: RelocationKind::Branch26,
+                size: 32,
+                addend: 0,
+                symbol: Some(SymbolId(0)),
+            }],
+            file_flags: None,
+            dwarf: None,
+        }
+    }
+
+    #[test]
+    fn lift_replaces_placeholder_branch_target_with_relocation_symbol() {
+        // `bl 0` (the unlinked placeholder) at offset 0 of .text, plus a
+        // Branch26 relocation naming `extern_fn`. After lift the
+        // instruction's branch target must be `Target::Symbol`, not
+        // `Target::Absolute(0)` — otherwise layout would emit a
+        // PC-relative branch to address 0 (= start of .text = the
+        // function itself).
+        let bl_word = 0x94000000_u32; // bl +0
+        let mut text_bytes = Vec::new();
+        text_bytes.extend_from_slice(&bl_word.to_le_bytes());
+        // Followed by a `ret` so the CFG terminates cleanly.
+        text_bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes());
+
+        let container = container_with_extern_branch(text_bytes.clone(), /*offset*/ 0);
+
+        let instructions = aarch64::disassemble_bytes(0, &text_bytes).expect("decode");
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlan::lift_with_container(&cfg, &instructions, &container);
+
+        // The `bl` instruction is the first op of the only block.
+        let op = &plan.blocks[0].ops[0];
+        let insn = match op {
+            crate::rewrite::RewriteOp::Instruction(i) => i,
+            other => panic!("expected singleton instruction, got {other:?}"),
+        };
+        assert_eq!(insn.mnemonic, Aarch64Mnemonic::Bl);
+        let target = insn
+            .pc_relative_target()
+            .expect("bl has a PC-relative operand");
+        assert_eq!(
+            target,
+            Target::Symbol(SymbolId(0)),
+            "lift must consult the container relocation rather than \
+             trusting the placeholder branch displacement",
+        );
+    }
+
+    #[test]
+    fn lift_fuses_adrp_add_via_relocations_into_load_address_macro() {
+        // Mirror the clang-emitted shape for `adrp x0, sym ; add x0, x0,
+        // #:lo12:sym`: both instructions encode placeholder zero, both
+        // carry relocations naming the same symbol. Lift should fuse
+        // them into a LoadAddress macro pointing at the symbol — not a
+        // pair of singleton instructions resolving the placeholder
+        // zeroes through `resolve_address`.
+        let adrp_word = 0x90000000_u32; // adrp x0, +0
+        let add_word = 0x91000000_u32;  // add x0, x0, #0
+        let mut text_bytes = Vec::new();
+        text_bytes.extend_from_slice(&adrp_word.to_le_bytes());
+        text_bytes.extend_from_slice(&add_word.to_le_bytes());
+        text_bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes()); // ret
+
+        let container = Container {
+            format: BinaryFormat::Elf,
+            architecture: Architecture::Aarch64,
+            sections: vec![Section {
+                id: SectionId(0),
+                name: ".text".to_string(),
+                address: 0,
+                size: text_bytes.len() as u64,
+                bytes: text_bytes.clone(),
+                kind: SectionKind::Text,
+                align: 4,
+                flags: None,
+                raw_sh_type: None,
+            }],
+            symbols: vec![Symbol {
+                id: SymbolId(0),
+                name: "format_str".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Object,
+                binding: SymbolBinding::Local,
+                section: None,
+                is_undefined: true,
+                flags: None,
+            }],
+            relocations: vec![
+                Relocation {
+                    id: RelocationId(0),
+                    section: SectionId(0),
+                    offset: 0,
+                    kind: RelocationKind::AdrpPage21,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+                Relocation {
+                    id: RelocationId(1),
+                    section: SectionId(0),
+                    offset: 4,
+                    kind: RelocationKind::PageOffset12,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+            ],
+            file_flags: None,
+            dwarf: None,
+        };
+
+        let instructions = aarch64::disassemble_bytes(0, &text_bytes).unwrap();
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlan::lift_with_container(&cfg, &instructions, &container);
+
+        // First op of the only block must be a LoadAddress macro
+        // pointing at the symbol.
+        let op = &plan.blocks[0].ops[0];
+        let macro_op = match op {
+            crate::rewrite::RewriteOp::Macro(m) => m,
+            other => panic!("expected fused macro, got {other:?}"),
+        };
+        assert_eq!(macro_op.kind, crate::rewrite::MacroKind::LoadAddress);
+        assert_eq!(macro_op.target, Target::Symbol(SymbolId(0)));
+        assert_eq!(
+            macro_op.original_addresses,
+            vec![0, 4],
+            "macro must remember both component addresses",
+        );
+    }
+
+    #[test]
+    fn macro_with_section_symbol_target_emits_relocations_not_folded_address() {
+        // Section symbols (STT_SECTION) have address=0 in unlinked input,
+        // but their final address depends on linker placement. Emit must
+        // produce relocations rather than fold the placeholder zero.
+        // Without this, `adrp x0, .rodata.str1.1 ; add x0, x0, :lo12:...`
+        // round-trips to "load the address 0," which made the runtime
+        // fixture printf the ELF magic.
+        use crate::rewrite::{emit, lay_out};
+
+        let adrp_word = 0x90000000_u32;
+        let add_word = 0x91000000_u32;
+        let mut text_bytes = Vec::new();
+        text_bytes.extend_from_slice(&adrp_word.to_le_bytes());
+        text_bytes.extend_from_slice(&add_word.to_le_bytes());
+        text_bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes()); // ret
+
+        // Section symbol "" pointing at section id 1 (.rodata). Defined
+        // (`is_undefined: false`), kind=Section, address 0.
+        let container = Container {
+            format: BinaryFormat::Elf,
+            architecture: Architecture::Aarch64,
+            sections: vec![
+                Section {
+                    id: SectionId(0),
+                    name: ".text".to_string(),
+                    address: 0,
+                    size: text_bytes.len() as u64,
+                    bytes: text_bytes.clone(),
+                    kind: SectionKind::Text,
+                    align: 4,
+                    flags: None,
+                    raw_sh_type: None,
+                },
+                Section {
+                    id: SectionId(1),
+                    name: ".rodata.str1.1".to_string(),
+                    address: 0,
+                    size: 16,
+                    bytes: vec![0; 16],
+                    kind: SectionKind::Rodata,
+                    align: 1,
+                    flags: None,
+                    raw_sh_type: None,
+                },
+            ],
+            symbols: vec![Symbol {
+                id: SymbolId(0),
+                name: "".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Section,
+                binding: SymbolBinding::Local,
+                section: Some(SectionId(1)),
+                is_undefined: false,
+                flags: None,
+            }],
+            relocations: vec![
+                Relocation {
+                    id: RelocationId(0),
+                    section: SectionId(0),
+                    offset: 0,
+                    kind: RelocationKind::AdrpPage21,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+                Relocation {
+                    id: RelocationId(1),
+                    section: SectionId(0),
+                    offset: 4,
+                    kind: RelocationKind::PageOffset12,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+            ],
+            file_flags: None,
+            dwarf: None,
+        };
+
+        let instructions = aarch64::disassemble_bytes(0, &text_bytes).unwrap();
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlan::lift_with_container(&cfg, &instructions, &container);
+        let layout = lay_out(&plan, 0, Some(&container)).unwrap();
+        let output = emit(&plan, &layout, Some(&container)).unwrap();
+
+        // Both halves of the macro must produce relocations.
+        let kinds: Vec<RelocationKind> = output
+            .relocations
+            .iter()
+            .map(|r| r.kind)
+            .collect();
+        assert!(
+            kinds.contains(&RelocationKind::AdrpPage21)
+                && kinds.contains(&RelocationKind::PageOffset12),
+            "section-symbol macro must emit both relocations, got {kinds:?}",
+        );
+    }
+
+    #[test]
+    fn lift_emits_relocation_when_no_op_rewrite_round_trips_extern_call() {
+        // End-to-end: read → lift → layout → emit, no edits. The output
+        // must carry a Branch26 relocation, not a literal displacement.
+        // Mirrors what the ELF runtime harness does, minus Docker/QEMU.
+        use crate::rewrite::{emit, lay_out};
+
+        let bl_word = 0x94000000_u32;
+        let mut text_bytes = Vec::new();
+        text_bytes.extend_from_slice(&bl_word.to_le_bytes());
+        text_bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes());
+
+        let container = container_with_extern_branch(text_bytes.clone(), 0);
+
+        let instructions = aarch64::disassemble_bytes(0, &text_bytes).unwrap();
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlan::lift_with_container(&cfg, &instructions, &container);
+
+        let layout = lay_out(&plan, 0, Some(&container)).unwrap();
+        let output = emit(&plan, &layout, Some(&container)).unwrap();
+
+        // Output must include a Branch26 reloc at offset 0 pointing at
+        // the extern symbol — proves emit didn't fold the symbol into a
+        // displacement.
+        assert!(
+            output
+                .relocations
+                .iter()
+                .any(|r| r.offset == 0 && r.kind == RelocationKind::Branch26),
+            "expected a Branch26 relocation at offset 0; got {:?}",
+            output.relocations,
+        );
+
+        // The placeholder word emitted at offset 0 should encode `bl +0`
+        // — the linker fills in the real displacement via the
+        // relocation. If lift had frozen the placeholder zero into a
+        // real branch, the encoded word would still be `bl +0` here too,
+        // but no relocation would accompany it; the relocation
+        // assertion above is what distinguishes the two cases.
+        let word = u32::from_le_bytes([
+            output.bytes[0],
+            output.bytes[1],
+            output.bytes[2],
+            output.bytes[3],
+        ]);
+        assert_eq!(word, bl_word, "placeholder word must be bl +0");
+    }
+}

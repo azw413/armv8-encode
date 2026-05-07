@@ -764,6 +764,21 @@ fn encode_gp_or_sp_register(
     }
 
     let sf = match register.class {
+        // For indices 0-30 the W/X and WOrSp/XOrSp classes encode
+        // identically, so accept either. Index 31 is the disambiguation
+        // point: in W/X it means `wzr`/`xzr`, in WOrSp/XOrSp it means
+        // `wsp`/`sp`. Refuse the zero-register form here so the encoder
+        // falls through to a candidate row whose operand list actually
+        // accepts the zero register (e.g. `mov Wd, Wm` decodes from
+        // `orr Wd, wzr, Wm`, with `Rn = wzr`). Otherwise we'd silently
+        // re-emit `mov w8, wzr` as `mov w8, wsp`, which is what stage 1's
+        // runtime harness caught.
+        RegisterClass::W if register.index == 31 => {
+            return Err(EncodeError::InvalidOperand { kind: kind.name() });
+        }
+        RegisterClass::X if register.index == 31 => {
+            return Err(EncodeError::InvalidOperand { kind: kind.name() });
+        }
         RegisterClass::W => 0,
         RegisterClass::X => 1,
         RegisterClass::WOrSp => 0,

@@ -1266,3 +1266,121 @@ fn encode_instruction_normalizes_conditional_branch_mnemonics() {
 
     assert_eq!(aarch64::encode_instruction(&instruction), Ok(0x54008001));
 }
+
+// ---- mov with register 31 — wzr/wsp disambiguation ---------------------
+//
+// Two distinct AArch64 instructions share the visual form `mov reg, REG31`:
+//
+//   * `mov Wd, wzr` — the `orr Wd, wzr, Wm` alias (LogShift form,
+//     base 0x2a0003e0). `Rn=31` here means the zero register.
+//   * `mov Wd, wsp` — the `add Wd, Wsp, #0` alias (AddsubImm form,
+//     base 0x11000000). `Rn=31` here means the stack pointer.
+//
+// They differ only in the source register's class (W/X vs WOrSp/XOrSp).
+// The encoder must respect that distinction; otherwise `mov w8, wzr` —
+// which appears in nearly every clang-emitted prologue as
+// `0x2a1f03e8` — round-trips into `mov w8, wsp` (`0x110003e8`), which
+// reads SP into a GPR and corrupts execution. Caught by the ELF
+// runtime harness; covered here so it doesn't regress.
+
+#[test]
+fn encode_mov_w_from_wzr_uses_orr_alias() {
+    use crate::isa::aarch64::{Register, RegisterClass};
+    let wzr = Register {
+        class: RegisterClass::W,
+        index: 31,
+    };
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::Mov,
+        vec![
+            DecodedOperand::Register(w_reg(8)),
+            DecodedOperand::Register(wzr),
+        ],
+    );
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0x2a1f03e8));
+}
+
+#[test]
+fn encode_mov_w_from_wsp_uses_add_alias() {
+    use crate::isa::aarch64::{Register, RegisterClass};
+    let wsp = Register {
+        class: RegisterClass::WOrSp,
+        index: 31,
+    };
+    let wd_sp = Register {
+        class: RegisterClass::WOrSp,
+        index: 8,
+    };
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::Mov,
+        vec![DecodedOperand::Register(wd_sp), DecodedOperand::Register(wsp)],
+    );
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0x110003e8));
+}
+
+#[test]
+fn encode_mov_x_from_xzr_uses_orr_alias() {
+    use crate::isa::aarch64::{Register, RegisterClass};
+    let xzr = Register {
+        class: RegisterClass::X,
+        index: 31,
+    };
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::Mov,
+        vec![
+            DecodedOperand::Register(x_reg(8)),
+            DecodedOperand::Register(xzr),
+        ],
+    );
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0xaa1f03e8));
+}
+
+#[test]
+fn encode_mov_x_from_sp_uses_add_alias() {
+    use crate::isa::aarch64::{Register, RegisterClass};
+    let sp = Register {
+        class: RegisterClass::XOrSp,
+        index: 31,
+    };
+    let xd_sp = Register {
+        class: RegisterClass::XOrSp,
+        index: 8,
+    };
+    let instruction = template(
+        0,
+        Aarch64Mnemonic::Mov,
+        vec![DecodedOperand::Register(xd_sp), DecodedOperand::Register(sp)],
+    );
+    assert_eq!(aarch64::encode_instruction(&instruction), Ok(0x910003e8));
+}
+
+#[test]
+fn decode_then_encode_roundtrips_mov_w_from_wzr() {
+    // End-to-end: decoder produces what the encoder consumes. Catches the
+    // case where decoder labels the source as `W{index:31}` (correct,
+    // wzr) but the encoder picks the AddsubImm form because its `RnSp`
+    // codec accepts W-class.
+    let word = 0x2a1f03e8;
+    let decoded = aarch64::decode_instruction(0, word).expect("decode mov w8,wzr");
+    let template = aarch64::InstructionTemplate {
+        address: 0,
+        mnemonic: decoded.mnemonic,
+        operands: decoded.operands,
+    };
+    assert_eq!(aarch64::encode_instruction(&template), Ok(word));
+}
+
+#[test]
+fn decode_then_encode_roundtrips_mov_x_from_xzr() {
+    let word = 0xaa1f03e8;
+    let decoded = aarch64::decode_instruction(0, word).expect("decode mov x8,xzr");
+    let template = aarch64::InstructionTemplate {
+        address: 0,
+        mnemonic: decoded.mnemonic,
+        operands: decoded.operands,
+    };
+    assert_eq!(aarch64::encode_instruction(&template), Ok(word));
+}
