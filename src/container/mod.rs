@@ -31,10 +31,15 @@
 //! ```
 
 mod dwarf;
+mod elf_image;
+mod elf_writer;
 mod reader;
 mod types;
 mod writer;
 
+pub use elf_image::{
+    DynamicEntry, ElfImage, ProgramHeader, RawNoteSection, RawSectionBytes, SectionLayout,
+};
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
     DwarfInfo, FileFlags, Function, FunctionProvenance, Relocation, RelocationId, RelocationKind,
@@ -57,8 +62,24 @@ impl Container {
     /// `object::write` but does not preserve every header detail of the
     /// source file. Use this together with [`Self::with_section_bytes`] to
     /// land rewriter output back into a valid object file.
+    ///
+    /// Dispatch by [`ContainerKind`]:
+    /// - [`ContainerKind::Relocatable`] → ET_REL / MH_OBJECT writer
+    ///   (the `object::write::Object` path; supports both ELF and
+    ///   Mach-O).
+    /// - [`ContainerKind::SharedObject`] / [`ContainerKind::Executable`]
+    ///   on ELF → the Stage 5 ET_DYN / ET_EXEC writer
+    ///   (`object::write::elf::Writer` path; reproduces the input's
+    ///   layout from the attached [`ElfImage`]).
+    /// - Anything else → [`ContainerWriteError::UnsupportedKind`].
     pub fn to_bytes(&self) -> Result<Vec<u8>, ContainerWriteError> {
-        writer::write(self)
+        match (self.format, self.kind) {
+            (_, ContainerKind::Relocatable) => writer::write(self),
+            (BinaryFormat::Elf, ContainerKind::SharedObject | ContainerKind::Executable) => {
+                elf_writer::write(self)
+            }
+            _ => Err(ContainerWriteError::UnsupportedKind { kind: self.kind }),
+        }
     }
 
     /// Return a clone of this container with one section's bytes

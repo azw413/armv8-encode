@@ -43,6 +43,18 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
     let file_flags = lift_file_flags(&file);
     let kind = classify_container(&file, bytes);
 
+    // ET_DYN / ET_EXEC ELF inputs carry program headers, .dynamic,
+    // GNU hash, version sections, build-ID, .interp, and .eh_frame_hdr
+    // — none of which the neutral types model. Lift them into an
+    // ElfImage companion so the Stage 5 writer can reproduce them.
+    let elf_image = match (format, kind) {
+        (
+            BinaryFormat::Elf,
+            ContainerKind::SharedObject | ContainerKind::Executable,
+        ) => lift_elf_image(bytes, &sections),
+        _ => None,
+    };
+
     Ok(Container {
         format,
         architecture,
@@ -51,7 +63,204 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         symbols,
         relocations,
         file_flags,
+        elf_image,
         dwarf,
+    })
+}
+
+/// Capture every ELF-specific blob the neutral types don't model.
+/// Returns `None` when the input doesn't parse as ELF64; falling back
+/// to no-image is safer than failing the entire read, since the rest
+/// of the container (sections, symbols) is still useful.
+fn lift_elf_image(
+    bytes: &[u8],
+    sections: &[Section],
+) -> Option<crate::container::elf_image::ElfImage> {
+    use crate::container::elf_image::{
+        DynamicEntry, ElfImage, ProgramHeader, RawNoteSection, SectionLayout,
+    };
+    use object::elf;
+    use object::read::elf::{
+        Dyn, ElfFile64, FileHeader, NoteIterator, ProgramHeader as _, SectionHeader,
+    };
+    use object::Endianness;
+
+    let elf = ElfFile64::<Endianness>::parse(bytes).ok()?;
+    let endian = elf.endian();
+    let mut image = ElfImage::new();
+
+    // 0. File-header fields the neutral types don't carry.
+    image.e_entry = elf.elf_header().e_entry(endian);
+
+    // 1. Program headers — verbatim copy of every entry.
+    for phdr in elf.elf_program_headers() {
+        image.program_headers.push(ProgramHeader {
+            p_type: phdr.p_type(endian),
+            p_flags: phdr.p_flags(endian),
+            p_offset: phdr.p_offset(endian),
+            p_vaddr: phdr.p_vaddr(endian),
+            p_paddr: phdr.p_paddr(endian),
+            p_filesz: phdr.p_filesz(endian),
+            p_memsz: phdr.p_memsz(endian),
+            p_align: phdr.p_align(endian),
+        });
+    }
+
+    // 2. Section ordering — the neutral list happens to follow source
+    // order today, but record it explicitly so the writer can
+    // reproduce by index without depending on that invariant.
+    image.section_order = sections.iter().map(|s| s.id).collect();
+
+    // 2b. Per-section ELF header fields the neutral model doesn't
+    // carry: sh_offset (file offset), sh_link, sh_info, sh_entsize.
+    // Stage 5's writer needs these to reproduce the input layout.
+    image.section_layout = elf
+        .elf_section_table()
+        .iter()
+        .skip(1) // null section excluded from neutral model
+        .map(|hdr| SectionLayout {
+            sh_offset: hdr.sh_offset(endian),
+            sh_link: hdr.sh_link(endian),
+            sh_info: hdr.sh_info(endian),
+            sh_entsize: hdr.sh_entsize(endian),
+        })
+        .collect();
+
+    // 3. Segment-to-section mapping. For each PT_LOAD segment, find
+    // every section whose source `offset` falls inside its
+    // `[p_offset, p_offset + p_filesz)` range. Sections covered by
+    // multiple segments (rare; the GNU_RELRO overlap) are reported
+    // under each.
+    let section_table = elf.elf_section_table();
+    image.segment_sections = elf
+        .elf_program_headers()
+        .iter()
+        .map(|phdr| {
+            let p_offset = phdr.p_offset(endian);
+            let p_end = p_offset + phdr.p_filesz(endian);
+            sections
+                .iter()
+                .zip(section_table.iter().skip(1)) // skip null section
+                .filter_map(|(neutral, raw)| {
+                    let sh_offset = raw.sh_offset(endian);
+                    let sh_size = raw.sh_size(endian);
+                    if sh_size == 0 {
+                        return None;
+                    }
+                    if sh_offset >= p_offset && sh_offset + sh_size <= p_end {
+                        Some(neutral.id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // 4. `.dynamic` — parsed tag/value list plus the section id so
+    // the writer knows where it lives.
+    if let Ok(Some((entries, _link))) = section_table.dynamic(endian, bytes) {
+        for entry in entries {
+            image.dynamic.push(DynamicEntry {
+                tag: entry.d_tag(endian),
+                value: entry.d_val(endian),
+            });
+        }
+        // The .dynamic section's neutral id, located by name.
+        image.dynamic_section = sections
+            .iter()
+            .find(|s| s.name == ".dynamic")
+            .map(|s| s.id);
+    }
+
+    // 5. Raw passthrough sections — find each by name and snapshot
+    // its bytes. Using name-based lookup is fine here because these
+    // sections have well-known canonical names.
+    image.gnu_hash = raw_section_bytes(sections, ".gnu.hash");
+    image.sysv_hash = raw_section_bytes(sections, ".hash");
+    image.gnu_versym = raw_section_bytes(sections, ".gnu.version");
+    image.gnu_verdef = raw_section_bytes(sections, ".gnu.version_d");
+    image.gnu_verneed = raw_section_bytes(sections, ".gnu.version_r");
+    image.eh_frame_hdr = raw_section_bytes(sections, ".eh_frame_hdr");
+    image.dynsym = raw_section_bytes(sections, ".dynsym");
+    image.dynstr = raw_section_bytes(sections, ".dynstr");
+
+    // 6. `.interp` — store as a String for ergonomics; the writer
+    // re-adds the trailing NUL.
+    image.interp = sections
+        .iter()
+        .find(|s| s.name == ".interp")
+        .and_then(|s| {
+            let trimmed = s
+                .bytes
+                .split(|&b| b == 0)
+                .next()
+                .unwrap_or(&[]);
+            std::str::from_utf8(trimmed).ok().map(|s| s.to_string())
+        });
+
+    // 7. Build-ID note + other notes. Walk every SHT_NOTE section's
+    // entries; route the `GNU` `NT_GNU_BUILD_ID` note to `build_id`
+    // and everything else to `other_notes` keyed by source section.
+    for header in section_table.iter().skip(1) {
+        if header.sh_type(endian) != elf::SHT_NOTE {
+            continue;
+        }
+        let Ok(data) = header.data(endian, bytes) else {
+            continue;
+        };
+        let Ok(name_bytes) = section_table.section_name(endian, header) else {
+            continue;
+        };
+        let Ok(section_name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        // Locate the matching neutral SectionId so other_notes can
+        // be re-attached.
+        let Some(neutral) = sections.iter().find(|s| s.name == section_name) else {
+            continue;
+        };
+        let Ok(mut iter) = NoteIterator::<elf::FileHeader64<Endianness>>::new(
+            endian,
+            header.sh_addralign(endian),
+            data,
+        ) else {
+            continue;
+        };
+
+        let mut consumed_as_build_id = false;
+        while let Ok(Some(note)) = iter.next() {
+            if note.name() == elf::ELF_NOTE_GNU
+                && note.n_type(endian) == elf::NT_GNU_BUILD_ID
+            {
+                image.build_id = Some(note.desc().to_vec());
+                consumed_as_build_id = true;
+            }
+        }
+        if !consumed_as_build_id {
+            image.other_notes.push(RawNoteSection {
+                section: neutral.id,
+                name: section_name.to_string(),
+                bytes: data.to_vec(),
+            });
+        }
+    }
+
+    Some(image)
+}
+
+/// Snapshot the bytes of a named section, returning None when the
+/// section isn't present. The neutral `Section.bytes` is already a
+/// `Vec<u8>` we can clone — this is just a typed wrapper around that
+/// lookup.
+fn raw_section_bytes(
+    sections: &[Section],
+    name: &str,
+) -> Option<crate::container::elf_image::RawSectionBytes> {
+    use crate::container::elf_image::RawSectionBytes;
+    sections.iter().find(|s| s.name == name).map(|s| RawSectionBytes {
+        section: s.id,
+        bytes: s.bytes.clone(),
     })
 }
 

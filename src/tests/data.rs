@@ -102,6 +102,7 @@ fn vtable_container() -> Container {
             },
         ],
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     }
 }
@@ -185,6 +186,7 @@ fn lift_emits_bytes_around_pointers() {
             symbol: Some(SymbolId(0)),
         }],
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     };
 
@@ -251,6 +253,7 @@ fn lift_passes_unhandled_relocation_kinds_through() {
             symbol: Some(SymbolId(0)),
         }],
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     };
 
@@ -443,6 +446,7 @@ fn commit_to_data_container_preserves_unhandled_relocations() {
             },
         ],
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     };
 

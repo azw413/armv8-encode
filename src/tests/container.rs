@@ -575,33 +575,51 @@ mod writer {
     }
 
     #[test]
-    fn shared_object_kind_is_rejected_by_writer_until_stage_5() {
-        // The writer is hard-wired to ET_REL output via
-        // `object::write::Object`. Round-tripping a SharedObject /
-        // Executable-shaped container would silently re-emit it as
-        // ET_REL, breaking dynamic linking. Surface that explicitly.
+    fn shared_object_without_elf_image_reports_missing_image() {
+        // ET_DYN dispatch path: the writer routes SharedObject inputs
+        // to the elf_writer module. With no attached ElfImage (the
+        // case for hand-mutated synthetic containers) we surface a
+        // clean error rather than panicking or silently producing the
+        // wrong shape.
         use crate::container::ContainerKind;
         let mut container = Container::from_bytes(&build_minimal(ObjFormat::Elf)).unwrap();
         container.kind = ContainerKind::SharedObject;
+        // elf_image stays None — that's the failure path under test.
         match container.to_bytes() {
-            Err(ContainerWriteError::UnsupportedKind { kind }) => {
-                assert_eq!(kind, ContainerKind::SharedObject);
-            }
-            other => panic!("expected UnsupportedKind, got {other:?}"),
+            Err(ContainerWriteError::ElfImageMissing) => {}
+            other => panic!("expected ElfImageMissing, got {other:?}"),
         }
     }
 
     #[test]
-    fn executable_kind_is_rejected_by_writer_until_stage_5() {
+    fn executable_without_elf_image_reports_missing_image() {
         use crate::container::ContainerKind;
         let mut container = Container::from_bytes(&build_minimal(ObjFormat::Elf)).unwrap();
         container.kind = ContainerKind::Executable;
         match container.to_bytes() {
-            Err(ContainerWriteError::UnsupportedKind { kind }) => {
-                assert_eq!(kind, ContainerKind::Executable);
-            }
-            other => panic!("expected UnsupportedKind, got {other:?}"),
+            Err(ContainerWriteError::ElfImageMissing) => {}
+            other => panic!("expected ElfImageMissing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_object_with_elf_image_reaches_elf_writer() {
+        // With an ElfImage attached, the writer dispatches into the
+        // ET_DYN path. An empty ElfImage doesn't carry program
+        // headers / .dynamic etc., so the resulting bytes won't
+        // load — but the call should *succeed at producing bytes*
+        // (a sanity check that dispatch wires through). Real ET_DYN
+        // round-trip lives in the runtime harness.
+        use crate::container::{ContainerKind, ElfImage};
+        let mut container = Container::from_bytes(&build_minimal(ObjFormat::Elf)).unwrap();
+        container.kind = ContainerKind::SharedObject;
+        container.elf_image = Some(ElfImage::new());
+        let bytes = container
+            .to_bytes()
+            .expect("ET_DYN writer should produce bytes for a minimal image");
+        // ELF magic + class=64 + ET_DYN(=3) at offset 16.
+        assert_eq!(&bytes[..4], b"\x7fELF");
+        assert_eq!(bytes[16], 3, "e_type byte should be ET_DYN");
     }
 
     #[test]

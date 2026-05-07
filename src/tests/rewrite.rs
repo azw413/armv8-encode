@@ -401,6 +401,7 @@ fn container_with_function(name: &str, address: u64) -> Container {
         }],
         relocations: Vec::new(),
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     }
 }
@@ -424,6 +425,7 @@ fn container_with_undefined_function(name: &str) -> Container {
         }],
         relocations: Vec::new(),
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     }
 }
@@ -712,6 +714,7 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
         ],
         relocations: Vec::new(),
         file_flags: None,
+        elf_image: None,
         dwarf: None,
     };
 
@@ -1390,6 +1393,7 @@ mod relocation_lift {
                 symbol: Some(SymbolId(0)),
             }],
             file_flags: None,
+            elf_image: None,
             dwarf: None,
         }
     }
@@ -1494,6 +1498,7 @@ mod relocation_lift {
                 },
             ],
             file_flags: None,
+            elf_image: None,
             dwarf: None,
         };
 
@@ -1581,6 +1586,7 @@ mod relocation_lift {
                 },
             ],
             file_flags: None,
+            elf_image: None,
             dwarf: None,
         };
 
@@ -1695,6 +1701,7 @@ mod relocation_lift {
                 },
             ],
             file_flags: None,
+            elf_image: None,
             dwarf: None,
         };
 

@@ -55,6 +55,12 @@ pub enum ContainerWriteError {
     DanglingSymbol { symbol_index: usize },
     /// `object::write` rejected the input.
     ObjectWrite(String),
+    /// Caller asked for an ELF ET_DYN / ET_EXEC write but the
+    /// container has no attached [`super::ElfImage`]. The reader
+    /// populates it for non-relocatable ELF inputs; missing here
+    /// indicates a reader bug or a hand-built container that lacks
+    /// the necessary metadata.
+    ElfImageMissing,
 }
 
 impl std::fmt::Display for ContainerWriteError {
@@ -78,6 +84,10 @@ impl std::fmt::Display for ContainerWriteError {
                 "relocation references symbol id {symbol_index}, which is not in the symbol table"
             ),
             ContainerWriteError::ObjectWrite(detail) => write!(f, "object::write error: {detail}"),
+            ContainerWriteError::ElfImageMissing => write!(
+                f,
+                "container kind requires an ElfImage companion but none is attached",
+            ),
         }
     }
 }

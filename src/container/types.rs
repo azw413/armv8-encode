@@ -269,6 +269,15 @@ pub struct Container {
     /// (carries AArch64 BTI/PAC/variant-PCS feature flags). `None` for
     /// formats that don't expose anything we round-trip yet (Mach-O).
     pub file_flags: Option<FileFlags>,
+    /// Format-specific data captured for ET_DYN / ET_EXEC ELF inputs
+    /// that the neutral types deliberately don't model. Populated by
+    /// the reader for [`ContainerKind::SharedObject`] /
+    /// [`ContainerKind::Executable`] inputs; consumed by the ELF
+    /// writer (Stage 5) so dynamic-linker-relevant metadata (program
+    /// headers, `.dynamic`, GNU hash, version sections, build-ID,
+    /// `.eh_frame_hdr`, `.interp`) survives round-trip. `None` for
+    /// ET_REL inputs and for non-ELF formats.
+    pub elf_image: Option<crate::container::elf_image::ElfImage>,
     /// DWARF debug info, populated when the container has `.debug_info` /
     /// `__debug_info` sections that parse cleanly. `None` when no DWARF is
     /// present or parsing failed (best-effort — DWARF is metadata, not
