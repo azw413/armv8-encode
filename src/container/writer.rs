@@ -25,8 +25,10 @@ use object::write::{
     SymbolSection as WriteSymbolSection,
 };
 use object::{
-    Architecture as ObjArch, BinaryFormat as ObjFormat, Endianness, RelocationFlags,
-    SectionKind as ObjSectionKind, SymbolFlags, SymbolKind as ObjSymbolKind, SymbolScope,
+    Architecture as ObjArch, BinaryFormat as ObjFormat, Endianness,
+    FileFlags as ObjFileFlags, RelocationFlags, SectionFlags as ObjSectionFlags,
+    SectionKind as ObjSectionKind, SymbolFlags as ObjSymbolFlags,
+    SymbolKind as ObjSymbolKind, SymbolScope,
 };
 use std::collections::HashMap;
 
@@ -80,6 +82,20 @@ pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
 
     let mut obj = WriteObject::new(format, architecture, Endianness::Little);
 
+    if let Some(file_flags) = container.file_flags {
+        obj.flags = match file_flags {
+            FileFlags::Elf {
+                os_abi,
+                abi_version,
+                e_flags,
+            } => ObjFileFlags::Elf {
+                os_abi,
+                abi_version,
+                e_flags,
+            },
+        };
+    }
+
     let section_map = add_sections(container, &mut obj);
     let symbol_map = add_symbols(container, &mut obj, &section_map);
     add_relocations(container, &mut obj, &section_map, &symbol_map)?;
@@ -94,20 +110,49 @@ fn add_sections(
 ) -> HashMap<SectionId, object::write::SectionId> {
     let mut map = HashMap::new();
     for section in &container.sections {
+        // Skip sections `object::write` regenerates from the symbol and
+        // relocation tables we hand it: the symbol/string tables and
+        // section-name table for ELF, plus the relocation sections per
+        // text/data section. Re-adding them would produce a malformed
+        // output (duplicate section names, mismatched sh_link).
+        if container.format == BinaryFormat::Elf && is_writer_managed_elf_section(section) {
+            continue;
+        }
         let segment = match container.format {
             BinaryFormat::Macho => macho_segment_for(section).to_vec(),
             BinaryFormat::Elf => Vec::new(),
         };
-        let kind = section_kind_to_obj(section.kind);
+        // Pick the kind passed to `add_section`. For ELF inputs whose
+        // neutral kind is `Other` and we captured a raw `sh_type`, fall
+        // through to `SectionKind::Elf(raw)` so the writer emits the
+        // exact section type. Otherwise stock kinds suffice.
+        let kind = match (container.format, section.kind, section.raw_sh_type) {
+            (BinaryFormat::Elf, SectionKind::Other, Some(raw)) => ObjSectionKind::Elf(raw),
+            _ => section_kind_to_obj(section.kind),
+        };
         let obj_id = obj.add_section(segment, section.name.as_bytes().to_vec(), kind);
+        // Alignment passed to `append_section_data` becomes `sh_addralign`
+        // for ELF and the section alignment for Mach-O. Default to 4 (the
+        // historic default) when the section didn't carry one.
+        let align = if section.align == 0 { 4 } else { section.align };
         // `Bss`-kind sections in object::write should be marked as having
         // no on-disk bytes; for our model that means an empty `bytes`
         // vector. `append_section_bss` reserves the size; otherwise, push
         // bytes directly.
         if matches!(section.kind, SectionKind::Bss) {
-            obj.section_mut(obj_id).append_bss(section.size, 4);
+            obj.section_mut(obj_id).append_bss(section.size, align);
         } else if !section.bytes.is_empty() {
-            obj.append_section_data(obj_id, &section.bytes, 4);
+            obj.append_section_data(obj_id, &section.bytes, align);
+        }
+        // Apply raw section flags last, after the section is fully formed
+        // — `add_section` may pick defaults from `kind` and we want the
+        // source's `sh_flags` to win. Mach-O carries flag bits we don't
+        // model yet; pass through as-is when present.
+        if let Some(flags) = section.flags {
+            let obj_flags = match flags {
+                SectionFlags::Elf { sh_flags } => ObjSectionFlags::Elf { sh_flags },
+            };
+            obj.section_mut(obj_id).flags = obj_flags;
         }
         map.insert(section.id, obj_id);
     }
@@ -134,6 +179,12 @@ fn add_symbols(
             SymbolBinding::Weak => SymbolScope::Linkage,
             SymbolBinding::Unknown => SymbolScope::Unknown,
         };
+        let flags = match symbol.flags {
+            Some(SymbolExtraFlags::Elf { st_info, st_other }) => {
+                ObjSymbolFlags::Elf { st_info, st_other }
+            }
+            None => ObjSymbolFlags::None,
+        };
         let obj_id = obj.add_symbol(WriteSymbol {
             name: symbol.name.as_bytes().to_vec(),
             value: symbol.address,
@@ -142,7 +193,7 @@ fn add_symbols(
             scope,
             weak: symbol.binding == SymbolBinding::Weak,
             section,
-            flags: SymbolFlags::None,
+            flags,
         });
         map.insert(symbol.id, obj_id);
     }
@@ -155,18 +206,37 @@ fn add_relocations(
     section_map: &HashMap<SectionId, object::write::SectionId>,
     symbol_map: &HashMap<SymbolId, object::write::SymbolId>,
 ) -> Result<(), ContainerWriteError> {
+    // Cache for synthesized section symbols. ELF requires every relocation
+    // to point at *some* symbol; section-relative relocations conventionally
+    // target a synthetic STT_SECTION symbol bound to the destination
+    // section. `object::write` exposes `Object::section_symbol(section_id)`
+    // to materialize one on demand and reuse it across relocations.
+    let mut section_symbol_cache: HashMap<object::write::SectionId, object::write::SymbolId> =
+        HashMap::new();
+
     for relocation in &container.relocations {
         let Some(&section_id) = section_map.get(&relocation.section) else {
             continue;
         };
-        let Some(symbol) = relocation.symbol else {
-            // Section-relative relocations would need additional plumbing;
-            // skip for now so the file is still valid.
-            continue;
+        let symbol_id = match relocation.symbol {
+            Some(symbol) => *symbol_map.get(&symbol).ok_or(
+                ContainerWriteError::DanglingSymbol {
+                    symbol_index: symbol.0,
+                },
+            )?,
+            None => {
+                // Section-relative relocation. Pick a target section: prefer
+                // the relocation's `addend` interpreted as an offset into a
+                // known section, else fall back to the relocation's own
+                // section (rare, but valid for self-referential fixups).
+                // Without more context the best generic choice is the
+                // relocation's own section — that's where stripped or
+                // section-only relocations point in practice.
+                *section_symbol_cache
+                    .entry(section_id)
+                    .or_insert_with(|| obj.section_symbol(section_id))
+            }
         };
-        let &symbol_id = symbol_map.get(&symbol).ok_or(ContainerWriteError::DanglingSymbol {
-            symbol_index: symbol.0,
-        })?;
         let flags = relocation_flags(relocation.kind, container.format)?;
         obj.add_relocation(
             section_id,
@@ -201,6 +271,35 @@ fn symbol_kind_to_obj(kind: SymbolKind) -> ObjSymbolKind {
         SymbolKind::File => ObjSymbolKind::File,
         SymbolKind::Unknown => ObjSymbolKind::Unknown,
     }
+}
+
+/// True when an ELF section is one `object::write::Object` regenerates
+/// itself, so re-adding it from the parsed container would duplicate it.
+/// Covers the symbol/string tables, the section-name table, the symbol
+/// shndx-extension table, and per-section relocation sub-sections.
+fn is_writer_managed_elf_section(section: &Section) -> bool {
+    use object::elf;
+    if let Some(sh_type) = section.raw_sh_type {
+        if matches!(
+            sh_type,
+            elf::SHT_SYMTAB
+                | elf::SHT_STRTAB
+                | elf::SHT_SYMTAB_SHNDX
+                | elf::SHT_REL
+                | elf::SHT_RELA
+        ) {
+            return true;
+        }
+    }
+    // The `.shstrtab` and `.strtab` are SHT_STRTAB so the check above
+    // catches them; `.symtab` is SHT_SYMTAB. Fall back to name-based
+    // matching for inputs that didn't carry a raw `sh_type` (i.e. were
+    // mapped to a stock kind that obscured it).
+    matches!(
+        section.name.as_str(),
+        ".symtab" | ".strtab" | ".shstrtab" | ".rela.text" | ".rel.text"
+    ) || section.name.starts_with(".rela.")
+        || section.name.starts_with(".rel.")
 }
 
 /// Best-effort segment placement for Mach-O. Real binaries have more

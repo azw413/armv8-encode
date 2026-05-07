@@ -821,3 +821,252 @@ mod dwarf {
         );
     }
 }
+
+// ---- Faithful-round-trip tests for ELF (Stage 1) -----------------------
+//
+// These cover the fields beyond the structural set: file `e_flags`,
+// section `sh_flags` / alignment, symbol `st_other` (visibility),
+// section-relative relocations (no symbol), and addend-bearing
+// `RelocationKind::Other` passthrough.
+
+mod elf_faithful {
+    use super::*;
+    use crate::container::FileFlags;
+
+    /// Read the raw ELF symbol entries from a freshly written byte stream.
+    /// Returns `(name, st_info, st_other)` for each non-null entry.
+    fn raw_symtab(bytes: &[u8]) -> Vec<(String, u8, u8)> {
+        use object::read::elf::{ElfFile64, Sym};
+        let elf = ElfFile64::<Endianness>::parse(bytes).unwrap();
+        let endian = elf.endian();
+        let symtab = elf.elf_symbol_table();
+        symtab
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0)
+            .map(|(_, sym)| {
+                let name = std::str::from_utf8(sym.name(endian, symtab.strings()).unwrap_or(b""))
+                    .unwrap_or("?")
+                    .to_string();
+                (name, sym.st_info(), sym.st_other())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn e_flags_round_trip_through_container() {
+        // AArch64 ELF carries BTI/PAC feature flags in `e_flags`. Set a
+        // recognisable non-zero value and confirm it survives.
+        const FLAGS: u32 = 0x0000_0001; // arbitrary marker bit
+
+        let mut obj = fresh_object(ObjFormat::Elf);
+        obj.flags = object::FileFlags::Elf {
+            os_abi: 0,
+            abi_version: 0,
+            e_flags: FLAGS,
+        };
+        let text_id = obj.section_id(StandardSection::Text);
+        obj.append_section_data(text_id, &nop_ret_bytes(), 4);
+        let bytes = obj.write().unwrap();
+
+        let parsed = Container::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            parsed.file_flags,
+            Some(FileFlags::Elf {
+                os_abi: 0,
+                abi_version: 0,
+                e_flags: FLAGS,
+            }),
+        );
+
+        let written = parsed.to_bytes().unwrap();
+        let reparsed = Container::from_bytes(&written).unwrap();
+        assert_eq!(
+            reparsed.file_flags,
+            Some(FileFlags::Elf {
+                os_abi: 0,
+                abi_version: 0,
+                e_flags: FLAGS,
+            }),
+            "e_flags must survive a round-trip",
+        );
+    }
+
+    #[test]
+    fn hidden_visibility_round_trips() {
+        // STV_HIDDEN must round-trip via SymbolFlags::Elf passthrough.
+        let mut obj = fresh_object(ObjFormat::Elf);
+        let text_id = obj.section_id(StandardSection::Text);
+        obj.append_section_data(text_id, &nop_ret_bytes(), 4);
+        // STB_GLOBAL << 4 | STT_FUNC = 0x12; STV_HIDDEN = 2.
+        obj.add_symbol(WriteSymbol {
+            name: b"hidden_fn".to_vec(),
+            value: 0,
+            size: 8,
+            kind: ObjSymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: WriteSymbolSection::Section(text_id),
+            flags: SymbolFlags::Elf {
+                st_info: 0x12,
+                st_other: 2,
+            },
+        });
+        let bytes = obj.write().unwrap();
+        let parsed = Container::from_bytes(&bytes).unwrap();
+        let written = parsed.to_bytes().unwrap();
+
+        let entries = raw_symtab(&written);
+        let entry = entries
+            .iter()
+            .find(|(name, _, _)| name == "hidden_fn")
+            .expect("hidden_fn must appear in re-emitted symtab");
+        assert_eq!(entry.1, 0x12, "st_info must round-trip");
+        assert_eq!(entry.2, 2, "st_other (STV_HIDDEN) must round-trip");
+    }
+
+    #[test]
+    fn unknown_relocation_round_trip_preserves_addend() {
+        // R_AARCH64_PREL64 (260) isn't in our explicit relocation enum, so
+        // it lifts to `RelocationKind::Other(260)`. The non-zero addend
+        // must survive read → write → re-read.
+        let mut obj = fresh_object(ObjFormat::Elf);
+        let text_id = obj.section_id(StandardSection::Text);
+        obj.append_section_data(text_id, &[0; 8], 4);
+        let symbol = obj.add_symbol(WriteSymbol {
+            name: b"target".to_vec(),
+            value: 0,
+            size: 0,
+            kind: ObjSymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: WriteSymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        obj.add_relocation(
+            text_id,
+            WriteRelocation {
+                offset: 0,
+                symbol,
+                addend: 0x1234_5678,
+                flags: RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_PREL64,
+                },
+            },
+        )
+        .unwrap();
+
+        let bytes = obj.write().unwrap();
+        let parsed = Container::from_bytes(&bytes).unwrap();
+        let written = parsed.to_bytes().unwrap();
+        let reparsed = Container::from_bytes(&written).unwrap();
+
+        let reloc = reparsed
+            .relocations
+            .iter()
+            .find(|r| matches!(r.kind, RelocationKind::Other(260)))
+            .expect("PREL64 relocation must survive");
+        assert_eq!(reloc.addend, 0x1234_5678);
+    }
+
+    #[test]
+    fn section_alignment_round_trips() {
+        // Set a non-default alignment (16) on .text and confirm the writer
+        // preserves it through the container's `align` field.
+        let mut obj = fresh_object(ObjFormat::Elf);
+        let text_id = obj.section_id(StandardSection::Text);
+        obj.append_section_data(text_id, &nop_ret_bytes(), 16);
+        let bytes = obj.write().unwrap();
+
+        let parsed = Container::from_bytes(&bytes).unwrap();
+        let text = parsed
+            .sections
+            .iter()
+            .find(|s| s.name == ".text")
+            .expect("text present");
+        assert_eq!(text.align, 16, "alignment captured on read");
+
+        let written = parsed.to_bytes().unwrap();
+        let reparsed = Container::from_bytes(&written).unwrap();
+        let text2 = reparsed
+            .sections
+            .iter()
+            .find(|s| s.name == ".text")
+            .unwrap();
+        assert_eq!(text2.align, 16, "alignment survives round-trip");
+    }
+
+    #[test]
+    fn section_sh_flags_round_trip() {
+        // Capture sh_flags on a stock section. .text has SHF_ALLOC|SHF_EXECINSTR
+        // = 0x6, which the writer should reproduce after we read+write it.
+        let bytes = build_minimal(ObjFormat::Elf);
+        let parsed = Container::from_bytes(&bytes).unwrap();
+        let text = parsed
+            .sections
+            .iter()
+            .find(|s| s.name == ".text")
+            .unwrap();
+        let original_flags = text.flags.expect("text section had ELF flags on read");
+
+        let written = parsed.to_bytes().unwrap();
+        let reparsed = Container::from_bytes(&written).unwrap();
+        let reparsed_text = reparsed
+            .sections
+            .iter()
+            .find(|s| s.name == ".text")
+            .unwrap();
+        assert_eq!(
+            reparsed_text.flags,
+            Some(original_flags),
+            "sh_flags must survive a round-trip",
+        );
+    }
+
+    #[test]
+    fn section_relative_relocation_survives_round_trip() {
+        // A relocation whose target is a section, not a named symbol. The
+        // writer must synthesize a section symbol on the fly so the reloc
+        // survives.
+        //
+        // Compilers emit these as R_AARCH64_ABS64 with a section-symbol
+        // target after section subsumption — common in `.eh_frame` and
+        // debug info pointing into `.text`.
+        let mut obj = fresh_object(ObjFormat::Elf);
+        let text_id = obj.section_id(StandardSection::Text);
+        obj.append_section_data(text_id, &[0; 16], 4);
+        // `object::write` exposes section_symbol() to materialize an
+        // STT_SECTION symbol that points at the section itself.
+        let text_section_symbol = obj.section_symbol(text_id);
+        // Relocate offset 8 of .text to point at .text+0 (a self-reference,
+        // structurally valid).
+        obj.add_relocation(
+            text_id,
+            WriteRelocation {
+                offset: 8,
+                symbol: text_section_symbol,
+                addend: 0,
+                flags: RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_ABS64,
+                },
+            },
+        )
+        .unwrap();
+        let bytes = obj.write().unwrap();
+
+        let parsed = Container::from_bytes(&bytes).unwrap();
+        // The reloc may show up either with a section-kind symbol or no
+        // symbol at all depending on how `object::read` lifts it. The
+        // important thing is that round-trip preserves it.
+        let initial_count = parsed.relocations.len();
+        assert!(initial_count >= 1);
+
+        let written = parsed.to_bytes().unwrap();
+        let reparsed = Container::from_bytes(&written).unwrap();
+        assert_eq!(
+            reparsed.relocations.len(),
+            initial_count,
+            "section-relative relocation must survive (initial={initial_count})",
+        );
+    }
+}

@@ -36,9 +36,10 @@ mod types;
 mod writer;
 
 pub use types::{
-    Architecture, BinaryFormat, Container, ContainerError, DwarfFunction, DwarfInfo, Function,
-    FunctionProvenance, Relocation, RelocationId, RelocationKind, Section, SectionId, SectionKind,
-    Symbol, SymbolBinding, SymbolId, SymbolKind,
+    Architecture, BinaryFormat, Container, ContainerError, DwarfFunction, DwarfInfo, FileFlags,
+    Function, FunctionProvenance, Relocation, RelocationId, RelocationKind, Section,
+    SectionFlags, SectionId, SectionKind, Symbol, SymbolBinding, SymbolExtraFlags, SymbolId,
+    SymbolKind,
 };
 pub use writer::ContainerWriteError;
 

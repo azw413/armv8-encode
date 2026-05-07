@@ -12,7 +12,10 @@
 
 use crate::container::types::*;
 use object::read::{File, Object, ObjectSection, ObjectSymbol};
-use object::{RelocationFlags, RelocationTarget};
+use object::{
+    FileFlags as ObjFileFlags, RelocationFlags, RelocationTarget, SectionFlags as ObjSectionFlags,
+    SymbolFlags as ObjSymbolFlags,
+};
 use std::collections::HashMap;
 
 pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
@@ -32,10 +35,12 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
     // analysis layers will refuse to disassemble.
     let _ = architecture;
 
-    let (sections, section_index_to_id) = lift_sections(&file);
+    let (mut sections, section_index_to_id) = lift_sections(&file);
+    populate_elf_raw_sh_type(bytes, &mut sections);
     let (symbols, symbol_index_to_id) = lift_symbols(&file, &section_index_to_id);
     let relocations = lift_relocations(&file, &section_index_to_id, &symbol_index_to_id);
     let dwarf = crate::container::dwarf::parse(&file);
+    let file_flags = lift_file_flags(&file);
 
     Ok(Container {
         format,
@@ -43,8 +48,48 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         sections,
         symbols,
         relocations,
+        file_flags,
         dwarf,
     })
+}
+
+/// Pull the raw `sh_type` for any section whose neutral `kind` is `Other`
+/// from the underlying ELF section header. Skipped on non-ELF inputs.
+///
+/// We only need this for sections the writer would otherwise emit as
+/// `SectionKind::Other` — for stock kinds (Text/Data/Rodata/etc.)
+/// `object::write` already picks the right `sh_type`.
+fn populate_elf_raw_sh_type(bytes: &[u8], sections: &mut [Section]) {
+    use object::read::elf::{ElfFile64, SectionHeader};
+    use object::Endianness;
+
+    let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) else {
+        return;
+    };
+    let endian = elf.endian();
+    // `elf_section_table().iter()` includes the null section at index 0,
+    // which the neutral lift skips. Drop it so positional zip lines up.
+    let table = elf.elf_section_table();
+    for (section, header) in sections.iter_mut().zip(table.iter().skip(1)) {
+        if matches!(section.kind, SectionKind::Other) {
+            section.raw_sh_type = Some(header.sh_type(endian));
+        }
+    }
+}
+
+fn lift_file_flags(file: &File<'_>) -> Option<FileFlags> {
+    match file.flags() {
+        ObjFileFlags::Elf {
+            os_abi,
+            abi_version,
+            e_flags,
+        } => Some(FileFlags::Elf {
+            os_abi,
+            abi_version,
+            e_flags,
+        }),
+        _ => None,
+    }
 }
 
 fn lift_sections(
@@ -65,6 +110,11 @@ fn lift_sections(
             .map(|cow| cow.into_owned())
             .unwrap_or_default();
         let kind = map_section_kind(section.kind(), &name);
+        let align = section.align();
+        let flags = match section.flags() {
+            ObjSectionFlags::Elf { sh_flags } => Some(SectionFlags::Elf { sh_flags }),
+            _ => None,
+        };
 
         sections.push(Section {
             id,
@@ -73,6 +123,12 @@ fn lift_sections(
             size,
             bytes,
             kind,
+            align,
+            flags,
+            // Populated below for ELF sections whose `kind` is `Other` —
+            // those are the ones where stock `SectionKind` would lose the
+            // raw `sh_type` on round-trip.
+            raw_sh_type: None,
         });
     }
 
@@ -108,6 +164,12 @@ fn lift_symbols(
             _ => None,
         };
         let is_undefined = symbol.is_undefined();
+        let flags = match symbol.flags() {
+            ObjSymbolFlags::Elf { st_info, st_other } => {
+                Some(SymbolExtraFlags::Elf { st_info, st_other })
+            }
+            _ => None,
+        };
 
         symbols.push(Symbol {
             id,
@@ -118,6 +180,7 @@ fn lift_symbols(
             binding,
             section,
             is_undefined,
+            flags,
         });
     }
 

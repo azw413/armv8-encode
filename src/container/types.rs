@@ -59,6 +59,23 @@ pub struct Section {
     /// On-disk bytes. Empty for `Bss`.
     pub bytes: Vec<u8>,
     pub kind: SectionKind,
+    /// Required alignment in bytes. `0` or `1` mean "no specific alignment."
+    /// For ELF this is `sh_addralign`; for Mach-O it's the section alignment
+    /// recorded in the section header.
+    pub align: u64,
+    /// Format-specific flags. ELF: raw `sh_flags`. Mach-O: raw section flags
+    /// word. `None` means "writer picks defaults from `kind`."
+    pub flags: Option<SectionFlags>,
+    /// Raw ELF `sh_type` to preserve through round-trip when `kind` is
+    /// [`SectionKind::Other`] and we can't pick a stock kind. Ignored on
+    /// non-ELF formats.
+    pub raw_sh_type: Option<u32>,
+}
+
+/// Format-specific flag bits attached to a section. Currently only ELF.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum SectionFlags {
+    Elf { sh_flags: u64 },
 }
 
 impl Section {
@@ -104,6 +121,19 @@ pub struct Symbol {
     /// True for imports — symbols referenced but not defined in this
     /// container.
     pub is_undefined: bool,
+    /// Format-specific symbol flag bits. ELF: raw `st_info` and `st_other`
+    /// (visibility, ifunc/TLS markers). `None` means "writer picks defaults
+    /// from `kind`/`binding`."
+    pub flags: Option<SymbolExtraFlags>,
+}
+
+/// Format-specific extra flag bits attached to a symbol. ELF carries
+/// `st_info` (binding+type) and `st_other` (visibility); we expose both
+/// raw so visibility (HIDDEN, PROTECTED, INTERNAL) and exotic types
+/// (STT_GNU_IFUNC, STT_TLS) round-trip.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum SymbolExtraFlags {
+    Elf { st_info: u8, st_other: u8 },
 }
 
 /// What kind of fix-up a relocation applies. Currently only the AArch64
@@ -191,11 +221,25 @@ pub struct Container {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
     pub relocations: Vec<Relocation>,
+    /// File-level header flags. ELF: `os_abi`, `abi_version`, `e_flags`
+    /// (carries AArch64 BTI/PAC/variant-PCS feature flags). `None` for
+    /// formats that don't expose anything we round-trip yet (Mach-O).
+    pub file_flags: Option<FileFlags>,
     /// DWARF debug info, populated when the container has `.debug_info` /
     /// `__debug_info` sections that parse cleanly. `None` when no DWARF is
     /// present or parsing failed (best-effort — DWARF is metadata, not
     /// load-bearing).
     pub dwarf: Option<DwarfInfo>,
+}
+
+/// File-header flag bits. Currently only ELF.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum FileFlags {
+    Elf {
+        os_abi: u8,
+        abi_version: u8,
+        e_flags: u32,
+    },
 }
 
 impl Container {

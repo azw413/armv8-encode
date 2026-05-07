@@ -383,6 +383,9 @@ fn container_with_function(name: &str, address: u64) -> Container {
             size: 4,
             bytes: vec![0xc0, 0x03, 0x5f, 0xd6], // ret
             kind: SectionKind::Text,
+            align: 4,
+            flags: None,
+            raw_sh_type: None,
         }],
         symbols: vec![Symbol {
             id: SymbolId(0),
@@ -393,8 +396,10 @@ fn container_with_function(name: &str, address: u64) -> Container {
             binding: SymbolBinding::Global,
             section: Some(SectionId(0)),
             is_undefined: false,
+            flags: None,
         }],
         relocations: Vec::new(),
+        file_flags: None,
         dwarf: None,
     }
 }
@@ -413,8 +418,10 @@ fn container_with_undefined_function(name: &str) -> Container {
             binding: SymbolBinding::Global,
             section: None,
             is_undefined: true,
+            flags: None,
         }],
         relocations: Vec::new(),
+        file_flags: None,
         dwarf: None,
     }
 }
@@ -672,6 +679,9 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
             size: 4,
             bytes: vec![0; 4],
             kind: SectionKind::Text,
+            align: 4,
+            flags: None,
+            raw_sh_type: None,
         }],
         symbols: vec![
             Symbol {
@@ -683,6 +693,7 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
                 binding: SymbolBinding::Global,
                 section: Some(SectionId(0)),
                 is_undefined: false,
+                flags: None,
             },
             Symbol {
                 id: SymbolId(1),
@@ -693,9 +704,11 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
                 binding: SymbolBinding::Global,
                 section: None,
                 is_undefined: true,
+                flags: None,
             },
         ],
         relocations: Vec::new(),
+        file_flags: None,
         dwarf: None,
     };
 
