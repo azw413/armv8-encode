@@ -630,6 +630,107 @@ fn et_dyn_add_library_dependency_forces_extra_load() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn et_dyn_add_initialiser_hijacks_init_offsets_slot() {
+    // Phase 6 acceptance: `add_initialiser` hijacks the
+    // `__init_offsets` slot (modern Mach-O equivalent of
+    // `.init_array`). The appended wrapper:
+    //   1. saves x0/x1/x2 (the `(argc, argv, envp)` dyld
+    //      passes to constructors);
+    //   2. calls the user body, which sets
+    //      `greet_ctor_marker = 0x10`;
+    //   3. restores;
+    //   4. chain-tail-calls the original `_greet_ctor`,
+    //      which `|= 0x1` the marker;
+    //   5. returns.
+    //
+    // Final marker value:
+    //   - body runs first: marker = 0x10
+    //   - chained _greet_ctor runs: marker |= 0x1 → 0x11 = 17
+    //
+    // host's `ctor` mode prints the marker.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{self, DecodedOperand};
+    use armv8_encode::rewrite::{
+        BinaryEditor, InitialiserPosition, RewriteInstruction, RewriteOperand, Target,
+    };
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+    let marker_id = editor
+        .binary
+        .symbol_by_name("_greet_ctor_marker")
+        .expect("_greet_ctor_marker should be defined");
+
+    // User body — leaf, no stack frame. Sets
+    // greet_ctor_marker to 0x10.
+    //
+    //   adrp x0, &greet_ctor_marker
+    //   add  x0, x0, #lo12 (fused)
+    //   mov  w1, #0x10
+    //   str  w1, [x0]
+    //   ret
+    let template = |word: u32| {
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
+        RewriteInstruction {
+            mnemonic: decoded.mnemonic,
+            operands: decoded
+                .operands
+                .into_iter()
+                .map(RewriteOperand::Decoded)
+                .collect(),
+            original_address: None,
+        }
+    };
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    let body = vec![
+        symbolic_adrp(0x90000000, Target::Symbol(marker_id)),
+        template(0x91000000), // add x0, x0, #lo12 (fused)
+        template(0x52800201), // mov w1, #0x10
+        template(0xb9000001), // str w1, [x0]
+        template(0xd65f03c0), // ret
+    ];
+    let _user_body_id = editor
+        .binary
+        .add_initialiser("greet_appended_init", body, InitialiserPosition::Last)
+        .expect("add_initialiser");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+
+    // Default mode still works.
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default, "double=42 offset=107\n",
+        "regular library functions should still work after add_initialiser",
+    );
+
+    // Acceptance: ctor_marker = 17 proves both the appended
+    // initialiser and the chained-back _greet_ctor ran in
+    // order.
+    let stdout_ctor = run_in_lib_demo_with_args("host", &["ctor"]);
+    assert_eq!(
+        stdout_ctor, "ctor_marker=17\n",
+        "expected ctor_marker=17 (= 0x10 from appended | 0x1 \
+         from chained _greet_ctor); got {stdout_ctor:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_round_trip_through_container_loads_and_runs() {
     // Phase 1 acceptance: read libgreet.dylib, round-trip it
     // through Container::to_bytes (which routes through the

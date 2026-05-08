@@ -550,7 +550,7 @@ cargo test --test elf_runtime -- --ignored --nocapture
 The `tests/macho_runtime/` directory mirrors the ELF harness but
 runs natively on Apple Silicon — no Docker/QEMU. Build script
 uses `clang -dynamiclib` plus `codesign -s -` (ad-hoc) so dyld
-loads the rewritten dylib. Seven tests cover:
+loads the rewritten dylib. Eight tests cover:
 
 - baseline (sanity: fixture builds, signs, loads, runs).
 - ET_DYN-shaped round-trip — read `libgreet.dylib`, write it
@@ -597,9 +597,15 @@ loads the rewritten dylib. Seven tests cover:
   room reserved at link time via `-Wl,-headerpad,0x1000`),
   dyld pulls libdep in alongside libgreet and the marker
   reads 0xab.
-
-Subsequent phases will add initialiser tests as the Mach-O
-writer reaches parity with the ELF one.
+- appended initialiser hijacks `__init_offsets` —
+  `add_initialiser` (Mach-O path) appends a wrapper that
+  preserves the dyld-supplied `(argc, argv, envp)`
+  registers, calls the user body, and chain-tail-calls the
+  original `_greet_ctor`. The Mach-O `__init_offsets`
+  section's first slot (4-byte image-base offset) is
+  overridden to point at the wrapper. Host observes
+  `ctor_marker=17` (= 0x10 from appended | 0x1 from
+  chained), proving both ran in order.
 
 `add_data` writes read-only bytes into the same R-X segment
 as `add_function`. Writable appended data is future work —

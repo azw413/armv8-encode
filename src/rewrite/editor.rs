@@ -962,6 +962,15 @@ impl BinaryState {
             return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
         }
 
+        // Mach-O dispatch: handled separately below since the
+        // mechanics differ (no `.init_array` / `.rela.dyn`;
+        // hijack works by patching `__init_offsets[0]` to
+        // point at our wrapper, and the wrapper chain-tails to
+        // the original ctor).
+        if matches!(self.container.format, crate::container::BinaryFormat::Macho) {
+            return self.add_initialiser_macho(name, body, position);
+        }
+
         // Append branch: brand-new slot. No hijack, no
         // chain-back. Defer the heavy lifting to commit time —
         // we just register the user body and stash its vaddr.
@@ -1179,6 +1188,163 @@ impl BinaryState {
         new_rela_dyn[rela_entry_off + 16..rela_entry_off + 24]
             .copy_from_slice(&(wrapper_vaddr as i64).to_le_bytes());
         self.section_overrides.push((rela_dyn_idx, new_rela_dyn));
+
+        Ok(user_body_id)
+    }
+
+    /// Mach-O implementation of [`Self::add_initialiser`].
+    /// Hijacks the existing `__init_offsets` slot (which
+    /// modern macOS toolchains emit by default in lieu of
+    /// `__mod_init_func`) to point at a freshly-appended
+    /// wrapper that chain-tail-calls back to the original
+    /// constructor.
+    ///
+    /// Limitations:
+    ///
+    /// - Only `InitialiserPosition::First` and `::Last` are
+    ///   supported. They behave identically when the input
+    ///   has only one ctor (the typical case for hand-written
+    ///   Mach-O dylibs). `::Append` (brand-new slot)
+    ///   isn't yet implemented — would need to grow
+    ///   `__init_offsets` in place, which shifts subsequent
+    ///   `__TEXT` content.
+    /// - The input must already have a non-empty
+    ///   `__init_offsets` section. Inputs without one
+    ///   (e.g. legacy toolchains that emit `__mod_init_func`
+    ///   instead) return [`TextEditorError::NoExistingInitArray`].
+    fn add_initialiser_macho(
+        &mut self,
+        name: &str,
+        body: Vec<RewriteInstruction>,
+        position: InitialiserPosition,
+    ) -> Result<SymbolId, TextEditorError> {
+        if matches!(position, InitialiserPosition::Append) {
+            return Err(TextEditorError::Encode(EncodeError::Unimplemented {
+                kind: "Mach-O add_initialiser(Append) not yet implemented",
+            }));
+        }
+        let macho_image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+
+        // Find the `__init_offsets` section.
+        let init_offsets_section = macho_image
+            .layout
+            .section("__TEXT", "__init_offsets")
+            .ok_or(TextEditorError::NoExistingInitArray)?;
+        if init_offsets_section.size < 4 {
+            return Err(TextEditorError::NoExistingInitArray);
+        }
+
+        // Each entry is a u32 image-base-relative offset.
+        let entry_count = (init_offsets_section.size / 4) as usize;
+        let slot_index = match position {
+            InitialiserPosition::First => 0,
+            InitialiserPosition::Last => entry_count - 1,
+            InitialiserPosition::Append => unreachable!(),
+        };
+        let slot_byte_offset = slot_index * 4;
+
+        // Read the original ctor offset from the section bytes.
+        // Find the matching neutral container section by
+        // address — `__init_offsets` is the section at
+        // init_offsets_section.vaddr in the container's
+        // sections list.
+        let container_section_idx = self
+            .container
+            .sections
+            .iter()
+            .position(|s| s.address == init_offsets_section.vaddr)
+            .ok_or(TextEditorError::NoExistingInitArray)?;
+        let original_offsets_bytes =
+            self.container.sections[container_section_idx].bytes.clone();
+        let mut original_offset_bytes = [0u8; 4];
+        original_offset_bytes
+            .copy_from_slice(&original_offsets_bytes[slot_byte_offset..slot_byte_offset + 4]);
+        let original_ctor_offset = u32::from_le_bytes(original_offset_bytes) as u64;
+
+        // The original ctor's image-base-relative offset.
+        // Locate it in the container's symbol table by
+        // address (Mach-O dylibs typically load at vaddr 0,
+        // so image-base offset == vaddr).
+        let original_ctor_id = self
+            .container
+            .symbols
+            .iter()
+            .find(|s| {
+                s.kind == SymbolKind::Function
+                    && !s.is_undefined
+                    && s.address == original_ctor_offset
+            })
+            .map(|s| s.id)
+            .ok_or_else(|| {
+                TextEditorError::SymbolNotFound(format!(
+                    "<original ctor at offset 0x{original_ctor_offset:x}>"
+                ))
+            })?;
+
+        // Step 1: register the user body via add_function.
+        let body_name = format!("{name}__body");
+        let user_body_id = self.add_function(&body_name, body)?;
+
+        // Step 2: synthesise the wrapper (same shape as ELF).
+        // Wrapper preserves x0/x1/x2 across user_body since
+        // dyld calls ctors with `(argc, argv, envp)` in those
+        // registers.
+        use crate::isa::aarch64::DecodedOperand;
+        use crate::rewrite::ir::RewriteOperand;
+        let template = |word: u32| -> RewriteInstruction {
+            let decoded = aarch64::decode_instruction(0, word)
+                .expect("static add_initialiser wrapper template must decode");
+            RewriteInstruction {
+                mnemonic: decoded.mnemonic,
+                operands: decoded
+                    .operands
+                    .into_iter()
+                    .map(RewriteOperand::Decoded)
+                    .collect(),
+                original_address: None,
+            }
+        };
+        let symbolic_bl = |word: u32, target: Target| -> Result<RewriteInstruction, TextEditorError> {
+            let mut t = template(word);
+            for op in t.operands.iter_mut() {
+                if matches!(op, RewriteOperand::Decoded(DecodedOperand::BranchTarget(_))) {
+                    *op = RewriteOperand::Branch(target);
+                    return Ok(t);
+                }
+            }
+            Err(TextEditorError::Encode(EncodeError::Unimplemented {
+                kind: "bl template has no BranchTarget operand to substitute",
+            }))
+        };
+        let wrapper_body: Vec<RewriteInstruction> = vec![
+            template(0xa9bd7bfd),                                       // stp x29, x30, [sp, #-48]!
+            template(0xa90107e0),                                       // stp x0,  x1,  [sp, #16]
+            template(0xf90013e2),                                       // str x2,       [sp, #32]
+            template(0x910003fd),                                       // mov x29, sp
+            symbolic_bl(0x94000000, Target::Symbol(user_body_id))?,     // bl user_body
+            template(0xa94107e0),                                       // ldp x0,  x1,  [sp, #16]
+            template(0xf94013e2),                                       // ldr x2,       [sp, #32]
+            symbolic_bl(0x94000000, Target::Symbol(original_ctor_id))?, // bl original_ctor
+            template(0xa8c37bfd),                                       // ldp x29, x30, [sp], #48
+            template(0xd65f03c0),                                       // ret
+        ];
+        let wrapper_name = format!("{name}__wrapper");
+        let wrapper_id = self.add_function(&wrapper_name, wrapper_body)?;
+        let wrapper_vaddr = self.container.symbol(wrapper_id).address;
+
+        // Step 3: override the __init_offsets slot bytes to
+        // point at our wrapper. The section override is
+        // same-length (4 bytes), so it lands in place via the
+        // Mach-O writer's existing section_overrides path.
+        let mut new_init_offsets = original_offsets_bytes;
+        new_init_offsets[slot_byte_offset..slot_byte_offset + 4]
+            .copy_from_slice(&(wrapper_vaddr as u32).to_le_bytes());
+        self.section_overrides
+            .push((container_section_idx, new_init_offsets));
 
         Ok(user_body_id)
     }
