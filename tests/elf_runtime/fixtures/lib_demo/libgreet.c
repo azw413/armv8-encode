@@ -49,3 +49,22 @@ int32_t greet_offset(int32_t n) {
 // on link-time symbol resolution.
 typedef void *(*dlsym_fn)(void *, const char *);
 volatile dlsym_fn _greet_unused_dlsym_anchor = dlsym;
+
+// Marker bumped by the original constructor so a test can prove
+// it still ran after `add_initialiser` hijacked the .init_array
+// slot. Default value 0; original ctor sets it to 1; appended
+// initialiser sets it to 1 plus a high bit (see Stage-A
+// `add_initialiser` test). Exported so the host can read it.
+int32_t greet_ctor_marker = 0;
+
+// Real library constructor — runs at .so load time. The
+// Stage-A `add_initialiser` test hijacks the .init_array slot
+// pointing here and chains back to this function, so
+// post-rewrite both the appended initialiser AND this one run.
+// We bump a dedicated marker rather than `greet_base` so all
+// the existing runtime tests (which assert on `greet_base=100`)
+// keep passing.
+__attribute__((constructor))
+static void greet_ctor(void) {
+    greet_ctor_marker |= 0x1;
+}

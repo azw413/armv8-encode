@@ -685,9 +685,18 @@ pub(crate) fn write_with_appended_segment_inner(
             p_align: phdr.p_align,
         });
     }
+    // RWX permissions on the appended segment. The R-X subset
+    // covers appended functions and read-only data; the W bit
+    // is required when callers (e.g. add_initialiser(Append))
+    // place `.init_array` slots in this segment that the
+    // dynamic loader needs to write `R_AARCH64_RELATIVE`
+    // results into. Callers who only append code/data and
+    // never need the W bit pay no runtime cost — the W bit
+    // only affects behaviour for relocations targeting the
+    // segment's pages.
     writer.write_program_header(&ProgramHeader {
         p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R | elf::PF_X,
+        p_flags: elf::PF_R | elf::PF_W | elf::PF_X,
         p_offset: appended_file_offset,
         p_vaddr: new_seg_vaddr,
         p_paddr: new_seg_vaddr,

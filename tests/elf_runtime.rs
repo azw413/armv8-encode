@@ -972,6 +972,225 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
     );
 }
 
+/// Shared body used by both add_initialiser tests (Last and
+/// First). Writes `0x10` to greet_ctor_marker as a leaf.
+fn build_marker_init_body(
+    marker_id: armv8_encode::rewrite::SymbolId,
+) -> Vec<armv8_encode::rewrite::RewriteInstruction> {
+    use armv8_encode::isa::aarch64::{self, DecodedOperand};
+    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target};
+    let template = |word: u32| {
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
+        RewriteInstruction {
+            mnemonic: decoded.mnemonic,
+            operands: decoded
+                .operands
+                .into_iter()
+                .map(RewriteOperand::Decoded)
+                .collect(),
+            original_address: None,
+        }
+    };
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    vec![
+        symbolic_adrp(0x90000000, Target::Symbol(marker_id)),
+        template(0x91000000),    // add x0, x0, #lo12 — fused
+        template(0x52800201),    // mov w1, #0x10
+        template(0xb9000001),    // str w1, [x0]
+        template(0xd65f03c0),    // ret
+    ]
+}
+
+/// Run `add_initialiser(..., position)` against a fresh
+/// libgreet fixture, write the result, and return the
+/// rewritten bytes for additional assertions. Side-effect:
+/// overwrites the on-disk libgreet.so so the host can run
+/// against it.
+fn rewrite_libgreet_with_initialiser(
+    lib_path: &std::path::Path,
+    position: armv8_encode::rewrite::InitialiserPosition,
+) {
+    use armv8_encode::rewrite::TextEditor;
+    let lib_bytes = std::fs::read(lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let marker_id = editor
+        .symbol_by_name("greet_ctor_marker")
+        .expect("greet_ctor_marker should be defined in libgreet.so");
+    let body = build_marker_init_body(marker_id);
+    let _user_body_id = editor
+        .add_initialiser("greet_appended_init", body, position)
+        .expect("add_initialiser");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet");
+    std::fs::write(lib_path, &written).expect("write rewritten libgreet.so");
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_initialiser_last_runs_before_existing_ctor_and_chains_back() {
+    // Stage-A acceptance for `add_initialiser` with
+    // `InitialiserPosition::Last`. libgreet.so has
+    // `__attribute__((constructor)) greet_ctor` that sets
+    // `greet_ctor_marker |= 0x1` in the LAST .init_array slot.
+    // We append an initialiser that sets `greet_ctor_marker =
+    // 0x10` and chains back to greet_ctor.
+    //
+    // Expected: appended runs → marker=0x10; chained greet_ctor
+    // runs → marker |= 0x1 → 0x11 = 17.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    rewrite_libgreet_with_initialiser(
+        &lib_path,
+        armv8_encode::rewrite::InitialiserPosition::Last,
+    );
+
+    // Sanity: regular host call still works.
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after \
+         add_initialiser(Last)",
+    );
+
+    // Acceptance: marker = 17 proves both the appended
+    // initialiser and the chained-back original ctor ran.
+    let stdout_ctor = run_in_lib_demo_with_args("host", &["ctor"]);
+    assert_eq!(
+        stdout_ctor,
+        "ctor_marker=17\n",
+        "expected ctor_marker=17 (= 0x10 appended | 0x1 chained \
+         greet_ctor); got {stdout_ctor:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_initialiser_first_runs_before_every_existing_ctor() {
+    // Stage-A acceptance for `add_initialiser` with
+    // `InitialiserPosition::First`. We hijack slot[0] of
+    // .init_array, which originally points at the CRT helper
+    // `frame_dummy`. Our wrapper:
+    //
+    //   1. runs the appended body (sets marker=0x10),
+    //   2. chains tail-call to frame_dummy (no observable
+    //      effect on the marker),
+    //   3. returns to the loader — which then runs slot[1]
+    //      (greet_ctor) normally.
+    //
+    // Expected: appended runs first → marker=0x10; frame_dummy
+    // runs (no marker effect); greet_ctor runs from slot[1] →
+    // marker |= 0x1 → 0x11 = 17.
+    //
+    // Final marker value matches the Last-position test, but
+    // the *order* differs: with First, the appended body runs
+    // before frame_dummy as well as before greet_ctor.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    rewrite_libgreet_with_initialiser(
+        &lib_path,
+        armv8_encode::rewrite::InitialiserPosition::First,
+    );
+
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after \
+         add_initialiser(First)",
+    );
+
+    let stdout_ctor = run_in_lib_demo_with_args("host", &["ctor"]);
+    assert_eq!(
+        stdout_ctor,
+        "ctor_marker=17\n",
+        "expected ctor_marker=17 (= 0x10 appended | 0x1 \
+         greet_ctor from slot[1]); got {stdout_ctor:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_initialiser_append_adds_brand_new_slot_without_hijack() {
+    // Stage-B acceptance: `add_initialiser` with
+    // `InitialiserPosition::Append` adds a brand-new
+    // `.init_array` slot without hijacking any existing one.
+    // The new init_array (originals + new slot) and the
+    // extended .rela.dyn live in the appended segment;
+    // .dynamic is patched to point at them via DT_INIT_ARRAY /
+    // DT_INIT_ARRAYSZ / DT_RELA / DT_RELASZ / DT_RELACOUNT.
+    //
+    // Execution order on libgreet:
+    //   slot[0] frame_dummy        - no marker effect
+    //   slot[1] greet_ctor         - marker |= 0x1 → 1
+    //   slot[2] greet_appended     - marker = 0x10  → 16
+    //
+    // Appended init's `mov w1,#0x10; str w1,[marker]` overwrites
+    // (rather than ORing), so the final value is 0x10 = 16.
+    // This differs from the hijack tests (which produce 17) —
+    // the value is the test's signal that Append ran *after*
+    // the original ctors.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::{InitialiserPosition, TextEditor};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let marker_id = editor
+        .symbol_by_name("greet_ctor_marker")
+        .expect("greet_ctor_marker should be defined in libgreet.so");
+    let body = build_marker_init_body(marker_id);
+
+    let _user_body_id = editor
+        .add_initialiser(
+            "greet_appended_init",
+            body,
+            InitialiserPosition::Append,
+        )
+        .expect("add_initialiser(Append)");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet");
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+
+    // Regular host call still works.
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after \
+         add_initialiser(Append)",
+    );
+
+    // Acceptance: marker = 16 proves Append's slot ran *after*
+    // greet_ctor (otherwise greet_ctor's |= 0x1 would have
+    // bumped 0x10 to 0x11). Both ran.
+    let stdout_ctor = run_in_lib_demo_with_args("host", &["ctor"]);
+    assert_eq!(
+        stdout_ctor,
+        "ctor_marker=16\n",
+        "expected ctor_marker=16 (greet_ctor ran first → 1, \
+         then appended slot overwrote with 0x10); got \
+         {stdout_ctor:?}",
+    );
+}
+
 // ---- ELF structural-equivalence checker --------------------------------
 //
 // Used by Stage 5 round-trip tests as a stronger oracle than "did

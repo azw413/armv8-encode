@@ -41,6 +41,28 @@ so other ISAs can plug in later.
   code can call `dlsym(RTLD_DEFAULT, "name")` to resolve any symbol
   the dynamic loader can find — `printf`, `strlen`, `getenv`,
   anything — without needing it to be pre-anchored in the source.
+- **Run code at library load time.**
+  `add_initialiser(name, body, position)` registers a
+  load-time constructor. Three insertion strategies:
+  - `InitialiserPosition::First` — hijack `.init_array[0]` so
+    the appended code runs ahead of *every* other ctor
+    (including CRT helpers like `frame_dummy`); a wrapper
+    chain-tails to the original ctor so it still runs.
+  - `InitialiserPosition::Last` — hijack the final
+    `.init_array` slot; same chain-back semantics, but the
+    appended code runs after every other ctor and before only
+    the last one.
+  - `InitialiserPosition::Append` — *add a brand-new slot*
+    rather than hijacking. The appended code runs after all
+    original ctors as a separate constructor. The new slot
+    plus the extended `.rela.dyn` (with one new
+    `R_AARCH64_RELATIVE` per slot) live in the appended
+    segment; `.dynamic` is patched to point at the rebuilt
+    sections via `DT_INIT_ARRAY`/`DT_INIT_ARRAYSZ`/`DT_RELA`/
+    `DT_RELASZ`/`DT_RELACOUNT`. Works on inputs that have
+    no `.init_array` at all, provided the input has an
+    existing `.rela.dyn` and at least two unused `DT_NULL`
+    slots in `.dynamic`.
 - **Export the new function** as a `.dynsym` entry resolvable via
   `dlopen` + `dlsym` from any caller. The writer rebuilds
   `.dynsym` / `.dynstr` / `.gnu.version` and regenerates
@@ -249,6 +271,21 @@ The editor proxies the rewrite primitives:
   rewriter's macro-fusion pass folds the pair into a
   `LoadAddress` macro that resolves at the appended segment's
   vaddr.
+- `add_initialiser(name, body, position) -> SymbolId` — register
+  a function that runs at library load time. Three positions:
+  - `First` / `Last` — hijack an existing `.init_array` slot
+    via a wrapper that chain-tails to the displaced original
+    ctor. Requires the input to have a non-empty
+    `.init_array`; returns `NoExistingInitArray` otherwise.
+  - `Append` — add a brand-new `.init_array` slot without
+    hijacking. The new slot, plus a rebuilt `.rela.dyn` with
+    one extra `R_AARCH64_RELATIVE`, lives in the appended
+    segment, and `.dynamic` is patched to point at the new
+    copies via `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` /
+    `DT_RELA` / `DT_RELASZ` / `DT_RELACOUNT`. Returns
+    `NoExistingRelaDyn` if the input has no `.rela.dyn`, or
+    `DynamicTooFull` if `.dynamic` lacks the trailing
+    `DT_NULL` padding to absorb the new tags.
 - `commit() -> Container` and `commit_to_bytes() -> Vec<u8>` —
   drive the layout/emit/commit pipeline.
 
@@ -330,6 +367,15 @@ capability:
   `dlsym(RTLD_DEFAULT, "printf")` and invoking the resolved pointer.
   One PLT anchor (`dlsym`) subsumes the need for any number of
   imported externs.
+- **`examples/add_initialiser.rs`** — appends a function that
+  runs at library load time before the host's `main()` reaches
+  any libgreet code. Hijacks the last `.init_array` slot
+  (originally pointing at libgreet's own `__attribute__((constructor))`),
+  redirects it to a freshly-appended wrapper, and chains the
+  wrapper back to the original ctor — so both run, in
+  user-first order. Verify the result with `./host ctor` (expected
+  `ctor_marker=17`, proving both ran) and `./host` (still
+  `double=42 offset=107`, proving normal functionality is intact).
 - **`examples/export_function.rs`** — appends a new function
   `greet_quintuple` via `add_function_exported` so it appears in
   `.dynsym` and is resolvable via `dlopen`/`dlsym`. Demonstrates
@@ -373,7 +419,7 @@ ARMV8_COMPARE_STRICT=1 cargo test --test otool_compare -- --ignored --nocapture
 The `tests/elf_runtime/` directory builds a small aarch64 Linux
 fixture (`libgreet.so` + `host` + `host_dlopen`) inside a Docker
 image, exercises the full read → edit → write → load → run
-pipeline, and asserts on host stdout. Ten tests cover:
+pipeline, and asserts on host stdout. Thirteen tests cover:
 
 - baseline (sanity: harness works, fixture runs).
 - identity round-trip — `Container::to_bytes()` produces a
@@ -399,6 +445,23 @@ pipeline, and asserts on host stdout. Ten tests cover:
 - exported appended function — add `greet_quintuple` via
   `add_function_exported`, then `host_dlopen` resolves it by
   name through the regenerated `.gnu.hash` and calls it.
+- appended initialiser hijacks `.init_array` (Last) — appends
+  an init function that writes a marker, redirects the last
+  `.init_array` slot to a wrapper around it, chains the wrapper
+  back to the library's original constructor, and verifies via
+  `host ctor` that both ran (final marker 17 = 0x10 appended |
+  0x1 chained).
+- appended initialiser hijacks `.init_array` (First) — same
+  body, but redirects slot[0] (originally `frame_dummy`) so the
+  appended code runs ahead of every other library ctor.
+  Marker still ends at 17 because the original ctor still runs
+  from slot[1].
+- appended initialiser adds a *brand-new* `.init_array` slot
+  (Append) — rebuilt `.init_array` and `.rela.dyn` live in the
+  appended segment, `.dynamic` patched accordingly. Marker
+  ends at 16 (greet_ctor sets bit 0x1, then the appended slot
+  overwrites with 0x10 because it runs *after* the originals
+  rather than via a hijack-and-chain-back).
 
 Setup (one-time):
 

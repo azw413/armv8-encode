@@ -163,6 +163,48 @@ pub fn update_dynamic_tags(
         .collect()
 }
 
+/// Insert new `.dynamic` entries by overwriting trailing
+/// `DT_NULL` slots. Returns `Some(extended)` if there were
+/// enough trailing nulls to absorb the additions in place,
+/// `None` otherwise (caller must grow `.dynamic`).
+///
+/// The result preserves the section's byte size — important
+/// because the writer keeps section offsets fixed for in-place
+/// overrides.
+///
+/// Insertion happens *before* the first DT_NULL, so the
+/// terminator stays at the end. Extra DT_NULLs (the padding
+/// the linker emits) shrink to make room.
+pub fn insert_dynamic_tags(
+    source: &[crate::container::DynamicEntry],
+    additions: &[(u64, u64)],
+) -> Option<Vec<crate::container::DynamicEntry>> {
+    use crate::container::DynamicEntry;
+    use object::elf::DT_NULL;
+    // Index of the first DT_NULL.
+    let first_null = source.iter().position(|e| e.tag == DT_NULL as u64)?;
+    let trailing_nulls = source.len() - first_null;
+    if trailing_nulls < additions.len() + 1 {
+        // Need at least one DT_NULL to remain as terminator.
+        return None;
+    }
+    let mut out: Vec<DynamicEntry> = Vec::with_capacity(source.len());
+    out.extend_from_slice(&source[..first_null]);
+    for &(tag, value) in additions {
+        out.push(DynamicEntry { tag, value });
+    }
+    // Refill remaining slots with DT_NULL so the byte length
+    // stays the same.
+    let remaining_slots = source.len() - out.len();
+    for _ in 0..remaining_slots {
+        out.push(DynamicEntry {
+            tag: DT_NULL as u64,
+            value: 0,
+        });
+    }
+    Some(out)
+}
+
 /// Encode a `.dynamic` tag list into bytes (Elf64_Dyn × N).
 /// Each entry is 16 bytes: u64 d_tag, u64 d_un.d_val.
 pub fn encode_dynamic(entries: &[crate::container::DynamicEntry]) -> Vec<u8> {

@@ -48,7 +48,7 @@ pub use data::{
     commit_to_data_container, emit_data_section, DataEditError, DataEmitOutput, DataItem,
     DataLift, DataLiftError, DataPayload, DataSection,
 };
-pub use editor::{TextEditor, TextEditorError};
+pub use editor::{InitialiserPosition, TextEditor, TextEditorError};
 pub use emit::{emit, EmitError, EmitOutput, EmittedRelocation};
 pub use ir::{
     ConstantId, MacroKind, MacroOp, RewriteBlock, RewriteInstruction, RewriteOp, RewriteOperand,
