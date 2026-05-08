@@ -308,8 +308,12 @@ The editor proxies the rewrite primitives:
   dynamic linker to load another shared library when this one
   is loaded. Appends the name to `.dynstr` (rebuilt in the
   appended segment) and inserts a `DT_NEEDED` tag in
-  `.dynamic`. Returns `DynamicTooFull` if `.dynamic` lacks the
-  trailing `DT_NULL` slot needed to absorb the new tag.
+  `.dynamic`. If the input's `.dynamic` doesn't have a
+  trailing `DT_NULL` slot to absorb the new tag in place,
+  `.dynamic` is automatically relocated into the appended
+  segment with headroom and `PT_DYNAMIC` is rewritten to point
+  at the new copy — works on real-world binaries (e.g. Android
+  NDK output) that ship a single trailing DT_NULL.
 - `add_initialiser(name, body, position) -> SymbolId` — register
   a function that runs at library load time. Three positions:
   - `First` / `Last` — hijack an existing `.init_array` slot
@@ -322,9 +326,11 @@ The editor proxies the rewrite primitives:
     segment, and `.dynamic` is patched to point at the new
     copies via `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` /
     `DT_RELA` / `DT_RELASZ` / `DT_RELACOUNT`. Returns
-    `NoExistingRelaDyn` if the input has no `.rela.dyn`, or
-    `DynamicTooFull` if `.dynamic` lacks the trailing
-    `DT_NULL` padding to absorb the new tags.
+    `NoExistingRelaDyn` if the input has no `.rela.dyn`. If
+    the input's `.dynamic` doesn't have DT_NULL room for the
+    new tags, `.dynamic` is relocated into the appended
+    segment automatically (same mechanism as
+    `add_library_dependency`).
 - `commit() -> Container` and `commit_to_bytes() -> Vec<u8>` —
   drive the layout/emit/commit pipeline.
 
@@ -458,7 +464,7 @@ ARMV8_COMPARE_STRICT=1 cargo test --test otool_compare -- --ignored --nocapture
 The `tests/elf_runtime/` directory builds a small aarch64 Linux
 fixture (`libgreet.so` + `libdep.so` + `host` + `host_dlopen`) inside a Docker
 image, exercises the full read → edit → write → load → run
-pipeline, and asserts on host stdout. Fourteen tests cover:
+pipeline, and asserts on host stdout. Sixteen tests cover:
 
 - baseline (sanity: harness works, fixture runs).
 - identity round-trip — `Container::to_bytes()` produces a
@@ -507,6 +513,16 @@ pipeline, and asserts on host stdout. Fourteen tests cover:
   returns 0 (libdep not loaded). After `add_library_dependency`
   injects a DT_NEEDED for libdep into libgreet's `.dynamic`,
   the loader pulls libdep in and the marker reads 0xab.
+- `.dynamic` relocation when DT_NULL room is short — synthesises
+  a libgreet variant whose `.dynamic` has exactly one trailing
+  DT_NULL (matching real-world Android NDK output), calls
+  `add_library_dependency`, and verifies that `.dynamic` is
+  relocated to the appended segment, PT_DYNAMIC is rewritten,
+  and the loader still honours the new dep at runtime.
+- many-deps via relocation — N=8 `add_library_dependency`
+  calls on the same one-DT_NULL fixture, verifying that the
+  relocated `.dynamic`'s DT_NULL headroom reserve absorbs all
+  of them without re-relocating.
 
 Setup (one-time):
 

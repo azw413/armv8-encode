@@ -205,6 +205,39 @@ pub fn insert_dynamic_tags(
     Some(out)
 }
 
+/// Insert new `.dynamic` entries always, growing the tag list
+/// past its original length if there isn't enough trailing
+/// `DT_NULL` padding to absorb them. Companion to
+/// [`insert_dynamic_tags`] for callers that don't need to
+/// preserve byte length — typically because they're prepared
+/// to relocate `.dynamic` to a fresh location if the result
+/// no longer fits in the original section.
+///
+/// Always returns at least one trailing DT_NULL.
+pub fn insert_dynamic_tags_growing(
+    source: &[crate::container::DynamicEntry],
+    additions: &[(u64, u64)],
+) -> Vec<crate::container::DynamicEntry> {
+    use crate::container::DynamicEntry;
+    use object::elf::DT_NULL;
+
+    // Strip trailing DT_NULLs so we can re-insert exactly one
+    // terminator at the end after appending new entries.
+    let mut prefix: Vec<DynamicEntry> = source
+        .iter()
+        .take_while(|e| e.tag != DT_NULL as u64)
+        .copied()
+        .collect();
+    for &(tag, value) in additions {
+        prefix.push(DynamicEntry { tag, value });
+    }
+    prefix.push(DynamicEntry {
+        tag: DT_NULL as u64,
+        value: 0,
+    });
+    prefix
+}
+
 /// Parse `.dynamic` bytes (Elf64_Dyn × N) back into a tag list.
 /// Inverse of [`encode_dynamic`]. Caller is responsible for
 /// the byte length being a multiple of 16.

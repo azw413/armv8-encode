@@ -671,13 +671,25 @@ pub(crate) fn write_with_appended_segment_inner(
     writer.write_align(APPEND_PAGE_ALIGN as usize);
     writer.write(&appended.bytes);
 
-    // Program header table at end.
+    // Program header table at end. If a phdr's p_vaddr falls
+    // inside the appended segment (e.g. PT_DYNAMIC after a
+    // `.dynamic` relocation), recompute its p_offset from the
+    // appended segment's file_offset so static tooling and
+    // strict loaders find the on-disk content where the phdr
+    // says it should be.
     writer.write_align_program_headers();
     for phdr in &image.program_headers {
+        let p_offset = if phdr.p_vaddr >= new_seg_vaddr
+            && phdr.p_vaddr + phdr.p_filesz <= new_seg_vaddr + new_seg_filesz
+        {
+            appended_file_offset + (phdr.p_vaddr - new_seg_vaddr)
+        } else {
+            phdr.p_offset
+        };
         writer.write_program_header(&ProgramHeader {
             p_type: phdr.p_type,
             p_flags: phdr.p_flags,
-            p_offset: phdr.p_offset,
+            p_offset,
             p_vaddr: phdr.p_vaddr,
             p_paddr: phdr.p_paddr,
             p_filesz: phdr.p_filesz,

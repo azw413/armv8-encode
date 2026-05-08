@@ -1267,6 +1267,197 @@ fn et_dyn_add_library_dependency_forces_extra_load() {
     );
 }
 
+/// Construct an in-memory `Container` that simulates a
+/// one-DT_NULL `.dynamic` (matching real-world Android NDK
+/// output and the proposal at
+/// ~/armadillo/docs/proposals/armv8_encode_grow_dynamic.md).
+/// Reads libgreet.so, then shrinks both `sections[dynamic_idx]
+/// .bytes` and `elf_image.dynamic` to "real entries + 1
+/// DT_NULL". The writer's section-size logic still pads the
+/// in-file slot to the original `sh_size` from
+/// `section_layout`, so the resulting binary is structurally
+/// valid even though we've conceptually shrunk the section.
+fn build_one_null_dynamic_container() -> Container {
+    let (lib_path, _) = build_lib_demo_fixture();
+    let bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let mut container = Container::from_bytes(&bytes).expect("parse libgreet.so");
+
+    use armv8_encode::container::dynsym_extension as dx;
+
+    let dynamic_idx = container
+        .sections
+        .iter()
+        .position(|s| s.name == ".dynamic")
+        .expect(".dynamic section");
+    let parsed = dx::parse_dynamic(&container.sections[dynamic_idx].bytes);
+    // Strip trailing DT_NULLs and add exactly one.
+    let mut compact: Vec<armv8_encode::container::DynamicEntry> = parsed
+        .iter()
+        .take_while(|e| e.tag != object::elf::DT_NULL as u64)
+        .copied()
+        .collect();
+    compact.push(armv8_encode::container::DynamicEntry {
+        tag: object::elf::DT_NULL as u64,
+        value: 0,
+    });
+    container.sections[dynamic_idx].bytes = dx::encode_dynamic(&compact);
+    container.sections[dynamic_idx].size =
+        container.sections[dynamic_idx].bytes.len() as u64;
+    if let Some(image) = container.elf_image.as_mut() {
+        image.dynamic = compact;
+    }
+    container
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_library_dependency_grows_dynamic_when_no_null_room() {
+    // Acceptance for the .dynamic-relocation path: build a
+    // libgreet variant whose `.dynamic` has exactly one
+    // trailing DT_NULL (matching real-world Android NDK output
+    // and the proposal at
+    // ~/armadillo/docs/proposals/armv8_encode_grow_dynamic.md),
+    // then call `add_library_dependency` and verify the loader
+    // honours the new dep — proving PT_DYNAMIC was rewritten
+    // correctly to point at the relocated copy.
+    require_docker();
+    let container = build_one_null_dynamic_container();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    // Sanity: exactly one DT_NULL in the parsed image, so we
+    // know we're exercising the relocation path.
+    let null_count = container
+        .elf_image
+        .as_ref()
+        .expect("elf_image")
+        .dynamic
+        .iter()
+        .filter(|e| e.tag == object::elf::DT_NULL as u64)
+        .count();
+    assert_eq!(null_count, 1, "fixture should have exactly one DT_NULL");
+
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .add_library_dependency("libdep.so")
+        .expect("add_library_dependency should succeed even with one DT_NULL");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+
+    // Re-parse and confirm PT_DYNAMIC's vaddr moved outside
+    // the original `.dynamic` section's range.
+    let rewritten = Container::from_bytes(&written).expect("re-parse");
+    let dynamic_idx = rewritten
+        .sections
+        .iter()
+        .position(|s| s.name == ".dynamic")
+        .expect(".dynamic");
+    let image = rewritten.elf_image.as_ref().expect("elf_image");
+    let pt_dynamic = image
+        .program_headers
+        .iter()
+        .find(|p| p.p_type == object::elf::PT_DYNAMIC)
+        .expect("PT_DYNAMIC");
+    let original_dyn_section = &rewritten.sections[dynamic_idx];
+    let orig_start = original_dyn_section.address;
+    let orig_end = orig_start + original_dyn_section.bytes.len() as u64;
+    assert!(
+        pt_dynamic.p_vaddr < orig_start || pt_dynamic.p_vaddr >= orig_end,
+        "PT_DYNAMIC vaddr should have moved outside the original \
+         .dynamic section after relocation; original [0x{orig_start:x}, \
+         0x{orig_end:x}), PT_DYNAMIC = 0x{:x}",
+        pt_dynamic.p_vaddr,
+    );
+
+    // Swap the rewritten bytes in for the on-disk libgreet.so
+    // and run host. libdep was forced via DT_NEEDED, so its
+    // constructor should set the marker.
+    let dir = harness_dir().join("fixtures/lib_demo");
+    let backup = dir.join("libgreet.backup.so");
+    let original_lib = dir.join("libgreet.so");
+    std::fs::copy(&original_lib, &backup).expect("backup libgreet");
+    std::fs::write(&original_lib, &written).expect("install rewritten libgreet");
+    let result = std::panic::catch_unwind(|| {
+        run_in_lib_demo_with_args("host", &["libdep"])
+    });
+    std::fs::copy(&backup, &original_lib).expect("restore libgreet");
+    let _ = std::fs::remove_file(&backup);
+    let stdout = result.expect("host run panicked");
+    assert_eq!(
+        stdout, "libdep_marker=171\n",
+        "expected libdep_marker=171 (0xab) after \
+         relocated-.dynamic-bound DT_NEEDED was honoured; \
+         got {stdout:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_library_dependency_handles_many_deps_via_relocation() {
+    // The relocated `.dynamic` reserves DT_NULL headroom so
+    // multiple `add_library_dependency` calls on the same
+    // editor don't trigger repeated relocations or run out of
+    // room. Verify with N=8 deps on the one-DT_NULL fixture.
+    require_docker();
+    let container = build_one_null_dynamic_container();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    for i in 0..8 {
+        editor
+            .binary
+            .add_library_dependency(&format!("libphantom{i}.so"))
+            .expect("add_library_dependency");
+    }
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let rewritten = Container::from_bytes(&written).expect("re-parse");
+
+    use armv8_encode::container::dynsym_extension as dx;
+    let dynamic_idx = rewritten
+        .sections
+        .iter()
+        .position(|s| s.name == ".dynamic")
+        .expect(".dynamic");
+
+    // We can read the relocated `.dynamic` via PT_DYNAMIC's
+    // p_vaddr, which after relocation points into the appended
+    // segment. The neutral container model exposes the
+    // appended segment's bytes as-is once re-parsed: PT_DYNAMIC
+    // covers a region that lies inside one of the PT_LOAD
+    // segments of the rewritten binary, and the section header
+    // for `.dynamic` (still at the original location, now
+    // orphaned) lets us confirm the original is intact too.
+    //
+    // Easiest check: count DT_NEEDED tags in the now-relocated
+    // PT_DYNAMIC. We have to read the right bytes — find them
+    // via PT_DYNAMIC's p_offset since the section header still
+    // points at the old location.
+    let image = rewritten.elf_image.as_ref().expect("elf_image");
+    let pt_dynamic = image
+        .program_headers
+        .iter()
+        .find(|p| p.p_type == object::elf::PT_DYNAMIC)
+        .expect("PT_DYNAMIC");
+    // Read bytes from `written` at PT_DYNAMIC.p_offset.
+    let dyn_off = pt_dynamic.p_offset as usize;
+    let dyn_size = pt_dynamic.p_filesz as usize;
+    let dyn_bytes = &written[dyn_off..dyn_off + dyn_size];
+    let parsed = dx::parse_dynamic(dyn_bytes);
+    let dt_needed_count = parsed
+        .iter()
+        .filter(|e| e.tag == object::elf::DT_NEEDED as u64)
+        .count();
+    assert!(
+        dt_needed_count >= 9,
+        "expected ≥9 DT_NEEDED entries (libc + 8 phantom deps) \
+         in relocated .dynamic; got {dt_needed_count}",
+    );
+    let _ = dynamic_idx; // not needed for this assertion
+}
+
 // ---- ELF structural-equivalence checker --------------------------------
 //
 // Used by Stage 5 round-trip tests as a stronger oracle than "did
