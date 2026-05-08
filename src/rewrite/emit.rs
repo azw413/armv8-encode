@@ -512,7 +512,16 @@ pub(crate) fn symbol_needs_relocation(
     use crate::container::SymbolKind;
     let symbol = container.symbol(id);
     if symbol.is_undefined {
-        return true;
+        // Externs with a recorded `.plt` stub don't need a
+        // relocation: emit folds the call into a `bl <stub>` and
+        // the existing stub does the real linker work at first
+        // call. Without a stub we surface a relocation as before.
+        let has_plt_stub = container
+            .elf_image
+            .as_ref()
+            .map(|img| img.plt_stubs.contains_key(&id))
+            .unwrap_or(false);
+        return !has_plt_stub;
     }
     if symbol.kind == SymbolKind::Section {
         return true;

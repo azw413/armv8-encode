@@ -32,7 +32,7 @@
 
 mod dwarf;
 mod elf_image;
-mod elf_writer;
+pub(crate) mod elf_writer;
 mod reader;
 mod types;
 mod writer;

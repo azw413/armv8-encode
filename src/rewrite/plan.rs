@@ -48,6 +48,36 @@ impl RewritePlan {
         Self::default()
     }
 
+    /// Build a single-block plan from a flat list of
+    /// [`RewriteInstruction`]s, running the same macro-fusion pass
+    /// that [`Self::lift`] applies.
+    ///
+    /// Useful when constructing a fresh function (e.g. via
+    /// [`crate::rewrite::TextEditor::add_function`]) where the
+    /// caller wants `adrp + add` pairs against
+    /// [`Target::Symbol`] to fuse into a [`MacroKind::LoadAddress`]
+    /// macro automatically. Without fusion the rewriter would
+    /// emit the pair as two separate instructions and the lo12
+    /// addend would have to be computed by the caller.
+    ///
+    /// `container` is consulted for the same reasons as in
+    /// [`Self::lift_with_container`]: resolving target addresses
+    /// against defined symbols.
+    pub fn from_instructions(
+        instructions: Vec<RewriteInstruction>,
+        container: Option<&Container>,
+    ) -> Self {
+        let block_at_address = HashMap::new();
+        let relocations = HashMap::new();
+        let ops = fuse_macros(instructions, &block_at_address, container, &relocations);
+        Self {
+            blocks: vec![RewriteBlock {
+                id: BasicBlockId(0),
+                ops,
+            }],
+        }
+    }
+
     /// Lift a `(CFG, instructions)` pair into a rewrite plan.
     ///
     /// Each `BranchTarget(addr)` / `PageTarget(addr)` operand is matched
@@ -558,6 +588,25 @@ fn try_fuse_adrp_add(
         // Page offsets are 12 bits; anything outside this isn't a fused
         // pair we can represent.
         return None;
+    }
+
+    // If the caller hand-built the adrp with a symbolic Page
+    // target (e.g., a user constructing an appended function via
+    // [`crate::rewrite::TextEditor::add_function`] who wants to
+    // address an appended data blob), accept that as the macro
+    // target directly: the add's immediate must be 0 because the
+    // user is delegating lo12 computation to the rewriter.
+    if matches!(adrp_target, Target::Symbol(_)) && add_imm == 0 {
+        return Some(MacroOp {
+            kind: MacroKind::LoadAddress,
+            register: adrp_rd.clone(),
+            target: adrp_target,
+            original_addresses: [adrp.original_address, add.original_address]
+                .into_iter()
+                .flatten()
+                .collect(),
+            original_instructions: vec![adrp.clone(), add.clone()],
+        });
     }
 
     // If both halves of the pair carry matching relocations naming the

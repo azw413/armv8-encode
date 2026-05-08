@@ -51,7 +51,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         (
             BinaryFormat::Elf,
             ContainerKind::SharedObject | ContainerKind::Executable,
-        ) => lift_elf_image(bytes, &sections),
+        ) => lift_elf_image(bytes, &sections, &symbols),
         _ => None,
     };
 
@@ -75,6 +75,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
 fn lift_elf_image(
     bytes: &[u8],
     sections: &[Section],
+    symbols: &[Symbol],
 ) -> Option<crate::container::elf_image::ElfImage> {
     use crate::container::elf_image::{
         DynamicEntry, ElfImage, ProgramHeader, RawNoteSection, SectionLayout,
@@ -120,6 +121,7 @@ fn lift_elf_image(
         .skip(1) // null section excluded from neutral model
         .map(|hdr| SectionLayout {
             sh_offset: hdr.sh_offset(endian),
+            sh_size: hdr.sh_size(endian),
             sh_link: hdr.sh_link(endian),
             sh_info: hdr.sh_info(endian),
             sh_entsize: hdr.sh_entsize(endian),
@@ -176,6 +178,16 @@ fn lift_elf_image(
     // 5. Raw passthrough sections — find each by name and snapshot
     // its bytes. Using name-based lookup is fine here because these
     // sections have well-known canonical names.
+    // 4b. PLT stub addresses for extern dynsym entries. Walk
+    // `.rela.plt` in source order — each entry's index N lines up
+    // with the PLT stub at `.plt + plt_header + N * plt_entry_size`.
+    // The neutral `.symbols` list is keyed by `.symtab` index, so
+    // we match dynsym entries to our symbols by name (preferring
+    // undefined ones to disambiguate name collisions). This is
+    // load-bearing for the appended-code-calls-extern path: the
+    // emit pass folds Target::Symbol(extern) to bl <stub_addr>.
+    image.plt_stubs = build_plt_stub_map(&elf, sections, symbols);
+
     image.gnu_hash = raw_section_bytes(sections, ".gnu.hash");
     image.sysv_hash = raw_section_bytes(sections, ".hash");
     image.gnu_versym = raw_section_bytes(sections, ".gnu.version");
@@ -262,6 +274,107 @@ fn raw_section_bytes(
         section: s.id,
         bytes: s.bytes.clone(),
     })
+}
+
+/// Walk `.rela.plt` and compute the PLT stub address for each
+/// extern dynsym entry it references. Returns a map keyed by the
+/// neutral [`SymbolId`] (from the static `.symtab`-derived
+/// `Container.symbols` list).
+///
+/// AArch64's standard PLT layout per the ELF psABI:
+/// - 32-byte header (PLT0 — lazy resolver trampoline).
+/// - 16-byte stubs, one per `.rela.plt` entry, in source order.
+///
+/// The mapping from a `.rela.plt` index `N` to its stub address is
+/// therefore `plt.address + 32 + N * 16`. We only handle this
+/// standard layout; non-conforming inputs (e.g. PLT variants used
+/// by some GNU IFUNC schemes) get an empty map and the rewriter
+/// falls back to its existing relocation paths.
+fn build_plt_stub_map(
+    elf: &object::read::elf::ElfFile64<object::Endianness>,
+    sections: &[Section],
+    symbols: &[Symbol],
+) -> std::collections::HashMap<crate::container::SymbolId, u64> {
+    use object::elf;
+    use object::read::elf::Sym;
+    use std::collections::HashMap;
+
+    let mut map = HashMap::new();
+    let endian = elf.endian();
+
+    let Some(plt) = sections.iter().find(|s| s.name == ".plt") else {
+        return map;
+    };
+    const PLT_HEADER_SIZE: u64 = 32;
+    const PLT_ENTRY_SIZE: u64 = 16;
+
+    let Some(rela_plt) = sections.iter().find(|s| s.name == ".rela.plt") else {
+        return map;
+    };
+    const RELA_ENTRY_SIZE: usize = 24; // sizeof Elf64_Rela
+    if rela_plt.bytes.len() % RELA_ENTRY_SIZE != 0 {
+        return map;
+    }
+
+    let dynsym = elf.elf_dynamic_symbol_table();
+
+    let entries = rela_plt.bytes.len() / RELA_ENTRY_SIZE;
+    for index in 0..entries {
+        let off = index * RELA_ENTRY_SIZE;
+        // r_offset = bytes[off..off+8], r_info = bytes[off+8..off+16].
+        let r_info = u64::from_le_bytes(
+            rela_plt.bytes[off + 8..off + 16].try_into().unwrap(),
+        );
+        let r_sym = (r_info >> 32) as u32;
+        let r_type = (r_info & 0xffff_ffff) as u32;
+        if r_type != elf::R_AARCH64_JUMP_SLOT {
+            continue;
+        }
+
+        // Resolve the dynsym entry's name.
+        let dyn_table = dynsym;
+        let dyn_symbol = match dyn_table.symbol(object::read::SymbolIndex(r_sym as usize)) {
+            Ok(sym) => sym,
+            Err(_) => continue,
+        };
+        let Ok(name_bytes) = dyn_symbol.name(endian, dyn_table.strings()) else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+
+        // Match by name in the static `.symtab`-derived neutral
+        // list. Prefer the undefined entry (the dynamic import).
+        // The dynsym typically stores the bare name (`puts`)
+        // while static `.symtab` may carry the versioned form
+        // (`puts@GLIBC_2.17`). Compare base names on both sides
+        // so either spelling matches.
+        let dynsym_base = name.split_once('@').map(|(b, _)| b).unwrap_or(name);
+        let neutral_id = symbols
+            .iter()
+            .find(|s| {
+                if !s.is_undefined {
+                    return false;
+                }
+                let static_base = s
+                    .name
+                    .split_once('@')
+                    .map(|(b, _)| b)
+                    .unwrap_or(s.name.as_str());
+                static_base == dynsym_base
+            })
+            .map(|s| s.id);
+
+        let Some(neutral_id) = neutral_id else {
+            continue;
+        };
+
+        let stub_addr = plt.address + PLT_HEADER_SIZE + index as u64 * PLT_ENTRY_SIZE;
+        map.insert(neutral_id, stub_addr);
+    }
+
+    map
 }
 
 /// Classify a parsed file into the high-level [`ContainerKind`] taxonomy

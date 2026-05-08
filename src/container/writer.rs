@@ -61,6 +61,25 @@ pub enum ContainerWriteError {
     /// indicates a reader bug or a hand-built container that lacks
     /// the necessary metadata.
     ElfImageMissing,
+    /// A rewrite grew an ELF section past its source extent. The
+    /// in-place writer can't accommodate this; an
+    /// append-PT_LOAD-with-trampolines layout is needed. The first
+    /// iteration of that path (Stage 6.3) handles only inputs
+    /// without a PT_PHDR program header — see
+    /// [`PtPhdrNotSupported`] for that limit. This variant
+    /// preserved for the case where the grow-detection logic
+    /// itself rejects an input.
+    ElfTextGrewBeyondExtent {
+        section_name: String,
+        original_extent: u64,
+        new_size: u64,
+    },
+    /// The append-PT_LOAD path doesn't yet handle inputs with a
+    /// PT_PHDR program header, because relocating the program
+    /// header table to file end requires either removing or
+    /// rewriting that segment. Inputs without PT_PHDR (most
+    /// shared libraries) work fine.
+    PtPhdrNotSupported,
 }
 
 impl std::fmt::Display for ContainerWriteError {
@@ -87,6 +106,21 @@ impl std::fmt::Display for ContainerWriteError {
             ContainerWriteError::ElfImageMissing => write!(
                 f,
                 "container kind requires an ElfImage companion but none is attached",
+            ),
+            ContainerWriteError::ElfTextGrewBeyondExtent {
+                section_name,
+                original_extent,
+                new_size,
+            } => write!(
+                f,
+                "section {section_name:?} grew from {original_extent} to {new_size} \
+                 bytes; the in-place writer can't accommodate this — append-PT_LOAD \
+                 layout (Stage 6.3) handles this for non-PT_PHDR inputs",
+            ),
+            ContainerWriteError::PtPhdrNotSupported => write!(
+                f,
+                "input has a PT_PHDR program header; the Stage 6.3 \
+                 append-PT_LOAD writer doesn't yet relocate it",
             ),
         }
     }

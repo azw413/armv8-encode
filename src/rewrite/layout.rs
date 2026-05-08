@@ -265,8 +265,13 @@ pub(crate) fn resolve_target(
         Target::Absolute(addr) => Ok(addr),
         Target::Symbol(id) => {
             let container = container.ok_or(LayoutError::SymbolWithoutContainer)?;
+            // `callable_address_of_symbol` returns the defined
+            // address when the symbol has one, else the PLT stub
+            // address when the input has a stub for this extern.
+            // The latter lets new (appended) code call externs
+            // like `puts` via the existing `.plt` slot.
             container
-                .address_of_symbol(id)
+                .callable_address_of_symbol(id)
                 .ok_or(LayoutError::UndefinedSymbol { symbol_id: id.0 })
         }
         Target::Constant(_) => Err(LayoutError::UnresolvableTarget { kind: "Constant" }),

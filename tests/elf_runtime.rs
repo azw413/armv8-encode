@@ -416,6 +416,297 @@ fn et_dyn_round_trip_through_container_loads_and_runs() {
     );
 }
 
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_inplace_text_edit_changes_observable_output() {
+    // Stage 6 acceptance: edit libgreet.so's `.text` through the
+    // high-level [`TextEditor`] API and observe the change at
+    // runtime via the host program.
+    //
+    // The edit replaces greet_double's `lsl Wd, Wn, #1` (n*2)
+    // with `lsl Wd, Wn, #2` (n*4). After the rewrite, host's
+    // `funcs[0]()` returns 21*4 = 84 instead of 21*2 = 42.
+    //
+    // The same edit done via raw byte poking lives in
+    // `examples/text_edit_so.rs`; this test is the runtime
+    // counterpart that proves the high-level API drives the
+    // ET_DYN writer end-to-end.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{Aarch64Mnemonic, DecodedOperand};
+    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+
+    // Open the editor and locate greet_double's `lsl`.
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let function_address = editor
+        .function_address("greet_double")
+        .expect("greet_double symbol");
+    let lsl_index = editor
+        .instructions()
+        .iter()
+        .position(|insn| {
+            insn.address >= function_address && insn.mnemonic == Aarch64Mnemonic::Lsl
+        })
+        .expect("greet_double should contain an lsl");
+    let lsl_address = editor.instructions()[lsl_index].address;
+    let original_lsl = &editor.instructions()[lsl_index];
+
+    // Confirm the fixture's compiled shape matches what we expect
+    // before mutating. If the compiler changes shape the test
+    // should fail loudly here.
+    let (rd, rn) = match (&original_lsl.operands[0], &original_lsl.operands[1]) {
+        (DecodedOperand::Register(rd), DecodedOperand::Register(rn)) => (rd.clone(), rn.clone()),
+        other => panic!("unexpected lsl operands: {other:?}"),
+    };
+    let original_shift = match &original_lsl.operands[2] {
+        DecodedOperand::Immediate(n) => *n,
+        other => panic!("unexpected lsl shift: {other:?}"),
+    };
+    assert_eq!(
+        original_shift, 1,
+        "fixture greet_double should use `lsl Wd, Wn, #1`",
+    );
+
+    // Build and install a replacement instruction with shift=2.
+    let new_instruction = RewriteInstruction {
+        mnemonic: Aarch64Mnemonic::Lsl,
+        operands: vec![
+            RewriteOperand::Decoded(DecodedOperand::Register(rd)),
+            RewriteOperand::Decoded(DecodedOperand::Register(rn)),
+            RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+        ],
+        original_address: Some(lsl_address),
+    };
+    editor
+        .replace_instruction_at(lsl_address, new_instruction)
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.so");
+
+    // Replace libgreet.so with the rewritten version and run host.
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=84 offset=107\n",
+        "in-place .text edit through TextEditor should make \
+         greet_double return n*4=84 instead of n*2=42",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_appended_function_changes_observable_output() {
+    // Decorator pattern: append a new function to libgreet.so via
+    // TextEditor::add_function (lands in a fresh PT_LOAD R-X
+    // segment past the input's mapped range), then patch
+    // greet_double's first instruction to be `b greet_quintuple`
+    // so the host's existing call lands in the new code.
+    //
+    // greet_quintuple(n) = n * 5, so host's funcs[0](21) returns
+    // 21*5 = 105 instead of 21*2 = 42. This is the observable
+    // signal that the new segment loaded and its content executes.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{
+        Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
+        ShiftedRegister,
+    };
+    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+
+    // greet_quintuple(n) = n * 5: lsl w8,w0,#2; add w0,w8,w0; ret.
+    let w0 = Register { class: RegisterClass::W, index: 0 };
+    let w8 = Register { class: RegisterClass::W, index: 8 };
+    let x30 = Register { class: RegisterClass::X, index: 30 };
+    let new_function = vec![
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Lsl,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w8.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Add,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w8)),
+                RewriteOperand::Decoded(DecodedOperand::ShiftedRegister(ShiftedRegister {
+                    register: w0,
+                    shift: Shift { kind: ShiftKind::Lsl, amount: 0 },
+                })),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Ret,
+            operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+            original_address: None,
+        },
+    ];
+
+    let quintuple_id = editor
+        .add_function("greet_quintuple", new_function)
+        .expect("add_function");
+
+    // Patch greet_double's first instruction to tail-call
+    // greet_quintuple.
+    let greet_double_addr = editor
+        .function_address("greet_double")
+        .expect("greet_double symbol");
+    editor
+        .replace_instruction_at(
+            greet_double_addr,
+            RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::B,
+                operands: vec![RewriteOperand::Branch(Target::Symbol(quintuple_id))],
+                original_address: Some(greet_double_addr),
+            },
+        )
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.so");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=105 offset=107\n",
+        "appended greet_quintuple should make funcs[0]() = greet_double() \
+         tail-call into greet_quintuple, returning 21*5=105",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_appended_function_can_call_extern_via_plt() {
+    // Stage 8 acceptance: append a new function that calls an
+    // existing PLT-bound extern (`puts`), and prints a message
+    // from a string blob also placed in the appended segment.
+    //
+    // libgreet.c imports `puts` via the `_greet_unused_puts_anchor`
+    // hack so a .plt stub already exists. The rewriter's
+    // `callable_address_of_symbol` resolves Target::Symbol(puts)
+    // to that stub's address, and emit folds the call into a
+    // direct `bl <stub>`.
+    //
+    // The new function body matches the C ABI for a leaf-ish
+    // function that calls one extern: stp/mov/str + adrp/add +
+    // bl puts + ldr/lsl + ldp + ret.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
+    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+
+    // Resolve puts (versioned spelling on glibc).
+    let puts_id = editor
+        .symbol_by_name("puts@GLIBC_2.17")
+        .or_else(|_| editor.symbol_by_name("puts"))
+        .expect("libgreet.so should import puts via the anchor in libgreet.c");
+
+    // Append the message before the function so the function's
+    // adrp+add can target it.
+    let message = b"greet_double called via appended decorator\0";
+    let msg_id = editor
+        .add_data("greet_log_msg", message, /*align=*/ 1)
+        .expect("add_data");
+
+    // Helper to lift a known-good encoded word into a
+    // RewriteInstruction (skips hand-rolling operand vecs).
+    let template = |word: u32| {
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
+        RewriteInstruction {
+            mnemonic: decoded.mnemonic,
+            operands: decoded
+                .operands
+                .into_iter()
+                .map(RewriteOperand::Decoded)
+                .collect(),
+            original_address: None,
+        }
+    };
+
+    // adrp x0, &msg ; replace numeric PageTarget with symbolic.
+    let mut adrp_msg = template(0x90000000);
+    *adrp_msg
+        .operands
+        .iter_mut()
+        .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+        .unwrap() = RewriteOperand::Page(Target::Symbol(msg_id));
+    // add x0, x0, #0 ; placeholder offset, fused with adrp by the
+    // macro pass and resolved to lo12(msg).
+    let add_msg = template(0x91000000);
+    // bl puts ; replace numeric BranchTarget with symbolic.
+    let mut bl_puts = template(0x94000000);
+    *bl_puts
+        .operands
+        .iter_mut()
+        .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::BranchTarget(_))))
+        .unwrap() = RewriteOperand::Branch(Target::Symbol(puts_id));
+
+    let body = vec![
+        template(0xa9be7bfd),  // stp x29, x30, [sp, #-32]!
+        template(0x910003fd),  // mov x29, sp
+        template(0xb90013e0),  // str w0, [sp, #16]
+        adrp_msg,              // adrp x0, &msg
+        add_msg,               // add  x0, x0, #lo12(msg)
+        bl_puts,               // bl   puts
+        template(0xb94013e0),  // ldr w0, [sp, #16]
+        template(0x531f7800),  // lsl w0, w0, #1
+        template(0xa8c27bfd),  // ldp x29, x30, [sp], #32
+        template(0xd65f03c0),  // ret
+    ];
+    let log_id = editor
+        .add_function("greet_log_double", body)
+        .expect("add_function");
+
+    // Patch greet_double to tail-call the new function.
+    let greet_double_addr = editor
+        .function_address("greet_double")
+        .expect("greet_double symbol");
+    editor
+        .replace_instruction_at(
+            greet_double_addr,
+            RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::B,
+                operands: vec![RewriteOperand::Branch(Target::Symbol(log_id))],
+                original_address: Some(greet_double_addr),
+            },
+        )
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout,
+        "greet_double called via appended decorator\ndouble=42 offset=107\n",
+        "appended function should call puts via PLT stub before \
+         returning n*2 to the host",
+    );
+}
+
 // ---- ELF structural-equivalence checker --------------------------------
 //
 // Used by Stage 5 round-trip tests as a stronger oracle than "did

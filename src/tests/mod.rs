@@ -8,6 +8,7 @@ mod control_flow;
 mod coverage;
 mod data;
 mod decode;
+mod editor;
 mod encode;
 mod recursive;
 mod rewrite;

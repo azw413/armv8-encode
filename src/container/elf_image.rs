@@ -43,7 +43,8 @@
 //! references `.eh_frame` PC ranges that shift with text). That work
 //! happens then, not now.
 
-use crate::container::SectionId;
+use crate::container::{SectionId, SymbolId};
+use std::collections::HashMap;
 
 /// Companion data captured for ET_DYN / ET_EXEC inputs. Populated
 /// by [`crate::container::reader::parse`]; consumed by the ELF
@@ -140,6 +141,16 @@ pub struct ElfImage {
     /// don't model it; ET_EXEC round-trip depends on preserving it.
     pub e_entry: u64,
 
+    /// Map from extern dynsym entry → its `.plt` stub virtual
+    /// address. Lets the rewriter call into existing PLT stubs
+    /// from new (appended) code: emit folds
+    /// `Target::Symbol(extern_id)` to a `bl <stub>` instead of
+    /// emitting an unresolved relocation.
+    ///
+    /// Populated for ET_DYN / ET_EXEC inputs whose `.rela.plt`
+    /// the reader could parse; empty otherwise.
+    pub plt_stubs: HashMap<SymbolId, u64>,
+
     /// Mapping from program-header index to the list of section ids
     /// that segment contains, derived from PT_LOAD `p_offset` /
     /// `p_filesz` ranges. Stage 6 needs this to decide where to
@@ -203,6 +214,12 @@ pub struct SectionLayout {
     /// offset in the output via `Writer::reserve_until` so program
     /// header `p_offset` values still point at the right bytes.
     pub sh_offset: u64,
+    /// Source `sh_size` — the section's original extent in the
+    /// source file. The neutral [`crate::container::Section::size`]
+    /// updates whenever a rewrite shrinks or grows the section's
+    /// content; this field preserves the original so the writer
+    /// can detect length-changing edits and react (Stage 6).
+    pub sh_size: u64,
     /// Source `sh_link` (raw section index from the input). The
     /// writer preserves section ordering 1:1, so this index is also
     /// valid in the output. `0` means "no link" (the null section).
@@ -239,6 +256,7 @@ impl ElfImage {
             segment_sections: Vec::new(),
             section_layout: Vec::new(),
             e_entry: 0,
+            plt_stubs: HashMap::new(),
         }
     }
 }
