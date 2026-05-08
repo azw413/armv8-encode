@@ -550,7 +550,7 @@ cargo test --test elf_runtime -- --ignored --nocapture
 The `tests/macho_runtime/` directory mirrors the ELF harness but
 runs natively on Apple Silicon — no Docker/QEMU. Build script
 uses `clang -dynamiclib` plus `codesign -s -` (ad-hoc) so dyld
-loads the rewritten dylib. Five tests cover:
+loads the rewritten dylib. Seven tests cover:
 
 - baseline (sanity: fixture builds, signs, loads, runs).
 - ET_DYN-shaped round-trip — read `libgreet.dylib`, write it
@@ -580,10 +580,26 @@ loads the rewritten dylib. Five tests cover:
   observes the loaded value, proving the appended data
   lives at the expected vaddr in the R-X segment and the
   appended code reads from it correctly.
+- exported appended function — `add_function_exported`
+  appends `_greet_quintuple` and registers it for export.
+  The Mach-O writer rebuilds the export trie
+  (LC_DYLD_EXPORTS_TRIE) with the new entry, extends
+  LC_SYMTAB's symbol + string tables, and bumps
+  LC_DYSYMTAB.nextdefsym. host_dlopen looks up the new
+  symbol via `dlsym` at runtime and calls it; result=35
+  proves the trie + symtab regeneration is correct.
+- forced library load via `add_library_dependency` —
+  fixture ships an unlinked `libdep.dylib` whose ctor sets
+  a marker. Without rewriting, host's dlsym lookup of the
+  marker returns 0 (libdep not loaded). After
+  `add_library_dependency` injects an LC_LOAD_DYLIB into
+  libgreet.dylib's load-command list (using headerpad
+  room reserved at link time via `-Wl,-headerpad,0x1000`),
+  dyld pulls libdep in alongside libgreet and the marker
+  reads 0xab.
 
-Subsequent phases will add export, initialiser, and
-library-dependency tests as the Mach-O writer reaches parity
-with the ELF one.
+Subsequent phases will add initialiser tests as the Mach-O
+writer reaches parity with the ELF one.
 
 `add_data` writes read-only bytes into the same R-X segment
 as `add_function`. Writable appended data is future work —

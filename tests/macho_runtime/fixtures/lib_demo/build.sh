@@ -34,6 +34,19 @@ clang -arch arm64 \
 # identity means "ad-hoc" — no developer cert required.
 codesign --sign - --force libgreet.dylib
 
+# libdep.dylib: a tiny library NOT linked into the host or
+# libgreet.dylib. Used only by the Phase-7
+# add_library_dependency acceptance test, which rewrites
+# libgreet.dylib to add an LC_LOAD_DYLIB pointing here so dyld
+# pulls libdep in alongside libgreet.
+clang -arch arm64 \
+    -dynamiclib \
+    -O0 -g \
+    -fno-stack-protector \
+    -install_name '@rpath/libdep.dylib' \
+    -o libdep.dylib libdep.c
+codesign --sign - --force libdep.dylib
+
 clang -arch arm64 \
     -O0 -g \
     -L. -lgreet \
@@ -41,3 +54,14 @@ clang -arch arm64 \
     -o host host.c
 
 codesign --sign - --force host
+
+# host_dlopen does NOT statically link libgreet.dylib — dlsym
+# is the only path to any new export, isolating the export
+# trie + symtab regeneration from static-link symbol
+# resolution. Linking with -ldl is implicit on macOS (libdl is
+# part of libSystem).
+clang -arch arm64 \
+    -O0 -g \
+    -o host_dlopen host_dlopen.c
+
+codesign --sign - --force host_dlopen

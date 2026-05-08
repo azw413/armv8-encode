@@ -1306,14 +1306,24 @@ impl BinaryState {
         ) {
             return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
         }
-        // We need an ELF image to apply the eventual `.dynamic`
-        // edit at commit time. The actual DT_NULL-room check
-        // happens then — if there isn't enough trailing
-        // padding, the writer relocates `.dynamic` into the
-        // appended segment (rewriting PT_DYNAMIC) instead of
-        // failing here. See [`Self::extend_segment_for_grown_dynamic`].
-        if self.container.elf_image.is_none() {
-            return Err(TextEditorError::AppendMissingElfImage);
+        // We need format-specific image data at commit time:
+        // ELF requires elf_image (for `.dynamic` editing /
+        // .dynstr extension); Mach-O requires macho_image
+        // (for LC_LOAD_DYLIB splicing). Either being absent
+        // means the reader couldn't parse the input enough
+        // for the commit-time work to succeed.
+        match self.container.format {
+            crate::container::BinaryFormat::Elf
+                if self.container.elf_image.is_none() =>
+            {
+                return Err(TextEditorError::AppendMissingElfImage);
+            }
+            crate::container::BinaryFormat::Macho
+                if self.container.macho_image.is_none() =>
+            {
+                return Err(TextEditorError::AppendMissingElfImage);
+            }
+            _ => {}
         }
         self.pending_library_deps.push(library_name.to_string());
         Ok(())
@@ -1984,29 +1994,18 @@ impl BinaryEditor {
         );
 
         // Library-dep additions need to land in the appended
-        // segment (they grow `.dynstr`, which can't grow in
-        // place). If a caller used only `add_library_dependency`
-        // and no `add_function` / `add_data`, lazily initialise
-        // an empty appended segment so the override-supporting
-        // writer path runs.
+        // segment (ELF: they grow `.dynstr`, which can't grow
+        // in place; Mach-O: the LC_LOAD_DYLIB splice just
+        // needs the appended-segment writer path active so
+        // the commit goes through `write_with_appended_segment`
+        // rather than the round-trip writer). If a caller used
+        // only `add_library_dependency` and no `add_function` /
+        // `add_data`, lazily initialise an empty appended
+        // segment so the override-supporting writer path runs.
         if self.binary.appended.is_none() && !self.binary.pending_library_deps.is_empty() {
-            let image = self
-                .binary
-                .container
-                .elf_image
-                .as_ref()
-                .ok_or(TextEditorError::AppendMissingElfImage)?;
-            let max_input_vaddr = image
-                .program_headers
-                .iter()
-                .filter(|p| p.p_type == object::elf::PT_LOAD)
-                .map(|p| p.p_vaddr.saturating_add(p.p_memsz))
-                .max()
-                .unwrap_or(0);
-            const PAGE: u64 = 0x10000;
-            let aligned = (max_input_vaddr + PAGE - 1) & !(PAGE - 1);
+            let segment_vaddr = self.binary.pick_append_vaddr()?;
             self.binary.appended = Some(AppendedFunctionsState {
-                segment_vaddr: aligned.max(PAGE),
+                segment_vaddr,
                 bytes: Vec::new(),
                 exports: Vec::new(),
             });
@@ -2055,7 +2054,7 @@ impl BinaryEditor {
                 };
 
                 if is_macho {
-                    // Phase 3 Mach-O append-segment path.
+                    // Phase 3+ Mach-O append-segment path.
                     // Caller-staged section_overrides (e.g. from
                     // text-edit commits above) are merged with
                     // the editor's queue so the writer applies
@@ -2067,12 +2066,31 @@ impl BinaryEditor {
                     for (idx, bytes) in &binary.section_overrides {
                         all_overrides.push((*idx, bytes.clone()));
                     }
+                    // Phase 5: registered exports become
+                    // MachOExportRequest entries the writer
+                    // splices into LC_DYLD_EXPORTS_TRIE +
+                    // LC_SYMTAB.
+                    let macho_exports: Vec<crate::container::macho_writer::MachOExportRequest> =
+                        appended
+                            .exports
+                            .iter()
+                            .map(|exp| {
+                                crate::container::macho_writer::MachOExportRequest {
+                                    name: exp.name.clone(),
+                                    vaddr: exp.vaddr,
+                                }
+                            })
+                            .collect();
                     let segment = crate::container::macho_writer::AppendedSegment::new(
                         appended.segment_vaddr,
                         appended.bytes,
                     );
                     return crate::container::macho_writer::write_with_appended_segment(
-                        &updated, segment, &all_overrides,
+                        &updated,
+                        segment,
+                        &all_overrides,
+                        &macho_exports,
+                        &binary.pending_library_deps,
                     )
                     .map_err(TextEditorError::from);
                 }

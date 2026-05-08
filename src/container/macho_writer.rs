@@ -44,6 +44,21 @@ use std::io::Write;
 /// macOS.
 pub(crate) const APPEND_PAGE_ALIGN: u64 = 0x4000;
 
+/// One symbol the caller wants to expose via the Mach-O
+/// export trie + symbol table. Mach-O's external-defined
+/// symbols all have the same shape from the writer's view:
+/// a name + a vmaddr.
+#[derive(Debug, Clone)]
+pub struct MachOExportRequest {
+    /// Full symbol name including the leading underscore
+    /// (e.g. `_greet_quintuple`). Mach-O symbols are
+    /// underscore-prefixed by convention.
+    pub name: String,
+    /// Symbol vmaddr (matches the address dyld will resolve
+    /// `dlsym` to).
+    pub vaddr: u64,
+}
+
 /// Inputs to the Mach-O append-segment writer.
 pub struct AppendedSegment {
     /// Virtual address where the new segment loads. Must be
@@ -255,6 +270,8 @@ pub fn write_with_appended_segment(
     container: &Container,
     appended: AppendedSegment,
     section_overrides: &[(usize, Vec<u8>)],
+    exports: &[MachOExportRequest],
+    library_deps: &[String],
 ) -> Result<Vec<u8>, ContainerWriteError> {
     let image = container
         .macho_image
@@ -286,13 +303,20 @@ pub fn write_with_appended_segment(
     }
 
     // Headerpad check: we need 152 bytes (segment_command_64 +
-    // one section_64) for the new LC_SEGMENT_64 entry. If
-    // there isn't room, fail with actionable guidance — the
-    // user must rebuild with bigger headerpad.
+    // one section_64) for the new LC_SEGMENT_64 entry, plus
+    // dylib_command bytes (24 + path + NUL + pad-to-8) for
+    // each library dependency. If there isn't room, fail
+    // with actionable guidance — the user must rebuild with
+    // bigger headerpad.
     const NEW_LC_SIZE: u64 = 152;
-    if layout.headerpad() < NEW_LC_SIZE {
+    let dep_lc_total: u64 = library_deps
+        .iter()
+        .map(|name| dylib_command_size(name))
+        .sum();
+    let total_lc_growth = NEW_LC_SIZE + dep_lc_total;
+    if layout.headerpad() < total_lc_growth {
         return Err(ContainerWriteError::ObjectWrite(format!(
-            "Mach-O append: not enough headerpad room ({} bytes, need {NEW_LC_SIZE}). \
+            "Mach-O append: not enough headerpad room ({} bytes, need {total_lc_growth}). \
              Rebuild the input with `-Wl,-headerpad,0x1000` (or larger) so the \
              writer has space to grow the load-command list in place.",
             layout.headerpad(),
@@ -439,6 +463,14 @@ pub fn write_with_appended_segment(
     bytes[16..20].copy_from_slice(&new_ncmds.to_le_bytes());
     bytes[20..24].copy_from_slice(&new_sizeofcmds.to_le_bytes());
 
+    // Phase 7: splice LC_LOAD_DYLIB entries for each library
+    // dependency. Same headerpad-eating splice pattern as the
+    // LC_SEGMENT_64 above; consumes `dep_lc_total` bytes
+    // we already accounted for in the headerpad check.
+    if !library_deps.is_empty() {
+        inject_lc_load_dylibs(&mut bytes, library_deps)?;
+    }
+
     // Strip the existing LC_CODE_SIGNATURE entry. codesign
     // --force adds a fresh one at the right position (past
     // the appended segment) when re-signing, and our prior
@@ -447,6 +479,15 @@ pub fn write_with_appended_segment(
     // confused about strict-validation invariants ("the
     // signature lives at __LINKEDIT.end" is no longer true).
     strip_lc_code_signature(&mut bytes)?;
+
+    // Phase 5: extend the export trie + symtab + strtab to
+    // include the requested exports. New blobs are appended
+    // to the file end (which becomes the trailing edge of
+    // __LINKEDIT), and the relevant LC_*-pointed offsets are
+    // patched to follow.
+    if !exports.is_empty() {
+        extend_exports_in_place(&mut bytes, layout, exports, linkedit_shift)?;
+    }
 
     // Re-sign. With LC_CODE_SIGNATURE stripped above and
     // __LINKEDIT shifted past __APPENDED, codesign --force
@@ -579,6 +620,405 @@ fn shift_linkedit_offsets(
         cursor += cmdsize;
     }
     Ok(())
+}
+
+/// Splice one LC_LOAD_DYLIB entry per requested library
+/// dependency into the load-command list. Each entry carries
+/// the library path inline (with NUL terminator + pad-to-8).
+/// Patches `mach_header_64.ncmds` (+= deps.len()) and
+/// `sizeofcmds` (+= total dylib_command bytes), and consumes
+/// the same byte count of headerpad zeros after the LC list.
+fn inject_lc_load_dylibs(
+    bytes: &mut Vec<u8>,
+    deps: &[String],
+) -> Result<(), ContainerWriteError> {
+    if bytes.len() < 24 {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O dep: input too short for mach_header_64".into(),
+        ));
+    }
+    let mut ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let mut sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    let lc_start = 32usize;
+    let lc_end = lc_start + sizeofcmds as usize;
+
+    // Build all dep load commands up front so we know the
+    // total splice size.
+    let lcs: Vec<Vec<u8>> = deps.iter().map(|d| build_dylib_command(d)).collect();
+    let total_size: usize = lcs.iter().map(|lc| lc.len()).sum();
+
+    // Find splice point: just before LC_CODE_SIGNATURE if
+    // present, else at lc_end. We use the same helper as
+    // LC_SEGMENT_64 splicing.
+    let insert_at = find_insert_offset_for_lc(bytes, lc_start, lc_end)?;
+
+    // Splice all bytes at once.
+    let mut splice: Vec<u8> = Vec::with_capacity(total_size);
+    for lc in &lcs {
+        splice.extend_from_slice(lc);
+    }
+    bytes.splice(insert_at..insert_at, splice.iter().copied());
+
+    // Drain matching headerpad zeros after the (now
+    // shifted) lc_end.
+    let post_splice_lc_end = lc_end + total_size;
+    bytes.drain(post_splice_lc_end..post_splice_lc_end + total_size);
+
+    // Patch ncmds + sizeofcmds.
+    ncmds += deps.len() as u32;
+    sizeofcmds += total_size as u32;
+    bytes[16..20].copy_from_slice(&ncmds.to_le_bytes());
+    bytes[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
+    let _ = lc_end;
+    Ok(())
+}
+
+/// Encoded size of a `dylib_command` for the given path.
+/// 24-byte fixed header + path + NUL, padded to 8-byte
+/// alignment.
+fn dylib_command_size(path: &str) -> u64 {
+    let raw = 24 + path.len() + 1;
+    ((raw + 7) & !7) as u64
+}
+
+/// Build the bytes of a dylib_command (LC_LOAD_DYLIB with the
+/// inline path string).
+fn build_dylib_command(path: &str) -> Vec<u8> {
+    use object::macho;
+
+    let cmdsize = dylib_command_size(path) as usize;
+    let mut out = vec![0u8; cmdsize];
+    // u32 cmd
+    out[0..4].copy_from_slice(&macho::LC_LOAD_DYLIB.to_le_bytes());
+    // u32 cmdsize
+    out[4..8].copy_from_slice(&(cmdsize as u32).to_le_bytes());
+    // dylib.name.offset = 24 (path follows the fixed header).
+    out[8..12].copy_from_slice(&24u32.to_le_bytes());
+    // dylib.timestamp = 2 (matches what ld emits — arbitrary
+    // non-zero value; dyld doesn't check it).
+    out[12..16].copy_from_slice(&2u32.to_le_bytes());
+    // dylib.current_version = 0x0001_0000 (1.0.0). Dyld
+    // checks the dependency's actual version against
+    // compatibility_version below; current_version is
+    // informational.
+    out[16..20].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    // dylib.compatibility_version = 0x0001_0000 (1.0.0).
+    // Setting low avoids `compatibility_version too low`
+    // errors at load when the actual library is anything
+    // sensible.
+    out[20..24].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    // Path bytes + trailing NUL (the rest is already zero
+    // from the vec![0; cmdsize] init).
+    let path_bytes = path.as_bytes();
+    out[24..24 + path_bytes.len()].copy_from_slice(path_bytes);
+    // out[24 + path_bytes.len()] = 0 — already zero.
+    out
+}
+
+/// Append a rebuilt export trie + extended symtab/strtab to
+/// the file and patch the relevant load commands to point at
+/// the new copies. The new blobs go past the (already-shifted)
+/// __LINKEDIT region so codesign treats them as part of
+/// __LINKEDIT when it extends the segment.
+fn extend_exports_in_place(
+    bytes: &mut Vec<u8>,
+    layout: &crate::container::macho_image::MachOLayout,
+    exports: &[MachOExportRequest],
+    linkedit_shift: u64,
+) -> Result<(), ContainerWriteError> {
+    use crate::container::macho_export_trie as trie;
+    use crate::container::macho_symtab as symtab;
+    use object::macho;
+
+    // Phase 5 needs LC_DYLD_EXPORTS_TRIE, LC_SYMTAB, and
+    // LC_DYSYMTAB in the input. (We don't yet support
+    // LC_DYLD_INFO_ONLY-style export-tries; those live in a
+    // different place but the same shape.)
+    let exports_trie_orig = layout
+        .exports_trie
+        .ok_or_else(|| {
+            ContainerWriteError::ObjectWrite(
+                "Mach-O export: input has no LC_DYLD_EXPORTS_TRIE; \
+                 LC_DYLD_INFO_ONLY-style export tries aren't yet \
+                 supported"
+                    .into(),
+            )
+        })?;
+    let symtab_orig = layout.symtab.ok_or_else(|| {
+        ContainerWriteError::ObjectWrite(
+            "Mach-O export: input has no LC_SYMTAB".into(),
+        )
+    })?;
+    let dysymtab_orig = layout.dysymtab.ok_or_else(|| {
+        ContainerWriteError::ObjectWrite(
+            "Mach-O export: input has no LC_DYSYMTAB".into(),
+        )
+    })?;
+
+    // Read the existing trie + symtab + strtab from their
+    // post-shift positions. The shift_linkedit_offsets pass
+    // already updated the LC fields in the load-command list,
+    // but we kept the pre-shift offsets in the captured
+    // `layout` for exactly this reason.
+    let trie_off_now = (exports_trie_orig.dataoff + linkedit_shift) as usize;
+    let trie_size = exports_trie_orig.datasize as usize;
+    let trie_bytes = bytes[trie_off_now..trie_off_now + trie_size].to_vec();
+    let mut existing_exports = trie::parse(&trie_bytes)?;
+
+    let symoff_now = (symtab_orig.symoff + linkedit_shift) as usize;
+    let symtab_bytes_len = symtab_orig.nsyms as usize * 16;
+    let mut symtab_entries =
+        symtab::parse_symtab(&bytes[symoff_now..symoff_now + symtab_bytes_len])?;
+
+    let stroff_now = (symtab_orig.stroff + linkedit_shift) as usize;
+    let strsize = symtab_orig.strsize as usize;
+    let mut strtab_bytes = bytes[stroff_now..stroff_now + strsize].to_vec();
+
+    // For each requested export:
+    //   1. append name to strtab
+    //   2. add nlist_64 entry (external defined)
+    //   3. add MachOExport to the trie list
+    //
+    // We pick the section index for the new symbols as the
+    // last section in the file — the __APPENDED segment's
+    // section, which gets reserved at the end of the section
+    // header table by Mach-O's section-numbering. Actually,
+    // Mach-O symbol n_sect is 1-indexed across ALL sections in
+    // the file. Counting from the parsed layout: the new
+    // __APPENDED section is the last one. Its section number
+    // = layout.sections.len() + 1.
+    //
+    // Phase 3 added one section (`__appended` inside
+    // `__APPENDED`), so the new section's 1-indexed number is
+    // layout.sections.len() + 1.
+    let appended_n_sect = (layout.sections.len() as u8) + 1;
+
+    for export in exports {
+        let (strtab_off, new_strtab) = symtab::append_strtab(&strtab_bytes, &export.name);
+        strtab_bytes = new_strtab;
+        let nlist = symtab::external_defined_nlist(strtab_off, appended_n_sect, export.vaddr);
+        // Insert at iextdefsym + nextdefsym (just after the
+        // existing externals). We update nextdefsym below.
+        let insert_at = (dysymtab_orig.iextdefsym + dysymtab_orig.nextdefsym) as usize;
+        symtab_entries.insert(insert_at, nlist);
+        existing_exports.push(trie::MachOExport {
+            name: export.name.clone(),
+            flags: 0,
+            address_offset: export.vaddr,
+        });
+    }
+    let new_dysymtab_nextdefsym = dysymtab_orig.nextdefsym + exports.len() as u32;
+
+    // Encode the new blobs.
+    let new_trie_bytes = trie::build(&existing_exports);
+    let new_symtab_bytes = symtab::encode_symtab(&symtab_entries);
+    let new_strtab_bytes = strtab_bytes;
+
+    // Place them at the end of the current file. Order: trie,
+    // symtab, strtab. Each starts at the next 8-byte boundary
+    // past the previous (codesign / dyld are happier with
+    // aligned linkedit blobs).
+    let mut new_trie_off = bytes.len() as u64;
+    new_trie_off = (new_trie_off + 7) & !7;
+    bytes.resize(new_trie_off as usize, 0);
+    bytes.extend_from_slice(&new_trie_bytes);
+
+    let mut new_symtab_off = bytes.len() as u64;
+    new_symtab_off = (new_symtab_off + 7) & !7;
+    bytes.resize(new_symtab_off as usize, 0);
+    bytes.extend_from_slice(&new_symtab_bytes);
+
+    let new_strtab_off = bytes.len() as u64;
+    bytes.extend_from_slice(&new_strtab_bytes);
+
+    // Patch LC_DYLD_EXPORTS_TRIE.
+    patch_lc_linkedit_data(
+        bytes,
+        macho::LC_DYLD_EXPORTS_TRIE,
+        new_trie_off,
+        new_trie_bytes.len() as u64,
+    )?;
+
+    // Patch LC_SYMTAB. nsyms grew by `exports.len()`.
+    patch_lc_symtab(
+        bytes,
+        new_symtab_off,
+        symtab_orig.nsyms + exports.len() as u32,
+        new_strtab_off,
+        new_strtab_bytes.len() as u32,
+    )?;
+
+    // Patch LC_DYSYMTAB.nextdefsym, and shift iundefsym to
+    // follow.
+    patch_lc_dysymtab(
+        bytes,
+        dysymtab_orig.iextdefsym,
+        new_dysymtab_nextdefsym,
+        dysymtab_orig.iundefsym + exports.len() as u32,
+        dysymtab_orig.nundefsym,
+    )?;
+
+    // Extend __LINKEDIT.filesize/vmsize so it covers the new
+    // blobs. codesign will further extend filesize when it
+    // writes the signature; we just need to ensure the new
+    // blobs aren't outside __LINKEDIT.
+    let new_file_end = bytes.len() as u64;
+    extend_linkedit_segment(bytes, layout.load_commands_offset, new_file_end)?;
+
+    Ok(())
+}
+
+/// Patch the `dataoff` / `datasize` fields of an
+/// `linkedit_data_command` (e.g. LC_DYLD_EXPORTS_TRIE,
+/// LC_FUNCTION_STARTS) by walking the load-command list.
+fn patch_lc_linkedit_data(
+    bytes: &mut [u8],
+    cmd_id: u32,
+    dataoff: u64,
+    datasize: u64,
+) -> Result<(), ContainerWriteError> {
+    let lc = find_load_command(bytes, cmd_id)?;
+    let Some(off) = lc else {
+        return Err(ContainerWriteError::ObjectWrite(format!(
+            "Mach-O export: load command 0x{cmd_id:x} not found",
+        )));
+    };
+    bytes[off + 8..off + 12].copy_from_slice(&(dataoff as u32).to_le_bytes());
+    bytes[off + 12..off + 16].copy_from_slice(&(datasize as u32).to_le_bytes());
+    Ok(())
+}
+
+fn patch_lc_symtab(
+    bytes: &mut [u8],
+    symoff: u64,
+    nsyms: u32,
+    stroff: u64,
+    strsize: u32,
+) -> Result<(), ContainerWriteError> {
+    use object::macho;
+    let Some(off) = find_load_command(bytes, macho::LC_SYMTAB)? else {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O export: LC_SYMTAB not found".into(),
+        ));
+    };
+    bytes[off + 8..off + 12].copy_from_slice(&(symoff as u32).to_le_bytes());
+    bytes[off + 12..off + 16].copy_from_slice(&nsyms.to_le_bytes());
+    bytes[off + 16..off + 20].copy_from_slice(&(stroff as u32).to_le_bytes());
+    bytes[off + 20..off + 24].copy_from_slice(&strsize.to_le_bytes());
+    Ok(())
+}
+
+fn patch_lc_dysymtab(
+    bytes: &mut [u8],
+    iextdefsym: u32,
+    nextdefsym: u32,
+    iundefsym: u32,
+    nundefsym: u32,
+) -> Result<(), ContainerWriteError> {
+    use object::macho;
+    let Some(off) = find_load_command(bytes, macho::LC_DYSYMTAB)? else {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O export: LC_DYSYMTAB not found".into(),
+        ));
+    };
+    // Field layout: cmd, cmdsize, ilocalsym, nlocalsym,
+    // iextdefsym, nextdefsym, iundefsym, nundefsym, ...
+    bytes[off + 16..off + 20].copy_from_slice(&iextdefsym.to_le_bytes());
+    bytes[off + 20..off + 24].copy_from_slice(&nextdefsym.to_le_bytes());
+    bytes[off + 24..off + 28].copy_from_slice(&iundefsym.to_le_bytes());
+    bytes[off + 28..off + 32].copy_from_slice(&nundefsym.to_le_bytes());
+    Ok(())
+}
+
+/// Extend `__LINKEDIT` segment's filesize/vmsize so its file
+/// region runs from its (post-shift) fileoff to `new_end`.
+/// Used by Phase 5 to grow __LINKEDIT enough to cover newly-
+/// appended trie/symtab/strtab blobs.
+fn extend_linkedit_segment(
+    bytes: &mut [u8],
+    load_commands_offset: u64,
+    new_file_end: u64,
+) -> Result<(), ContainerWriteError> {
+    use object::macho;
+
+    if bytes.len() < 24 {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O export: input too short for mach_header_64".into(),
+        ));
+    }
+    let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let lc_start = load_commands_offset as usize;
+    let lc_end = lc_start + sizeofcmds;
+
+    let mut cursor = lc_start;
+    while cursor + 8 <= lc_end {
+        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if cmdsize == 0 || cursor + cmdsize > lc_end {
+            break;
+        }
+        if cmd == macho::LC_SEGMENT_64 && cmdsize >= 24 {
+            let segname = &bytes[cursor + 8..cursor + 24];
+            let end = segname.iter().position(|&b| b == 0).unwrap_or(segname.len());
+            if std::str::from_utf8(&segname[..end]).unwrap_or("") == "__LINKEDIT" {
+                let fileoff = u64::from_le_bytes(
+                    bytes[cursor + 40..cursor + 48].try_into().unwrap(),
+                );
+                let new_filesize = new_file_end.saturating_sub(fileoff);
+                let old_filesize = u64::from_le_bytes(
+                    bytes[cursor + 48..cursor + 56].try_into().unwrap(),
+                );
+                if new_filesize > old_filesize {
+                    bytes[cursor + 48..cursor + 56]
+                        .copy_from_slice(&new_filesize.to_le_bytes());
+                }
+                let old_vmsize = u64::from_le_bytes(
+                    bytes[cursor + 32..cursor + 40].try_into().unwrap(),
+                );
+                if new_filesize > old_vmsize {
+                    let new_vmsize = (new_filesize + 0x4000 - 1) & !(0x4000 - 1);
+                    bytes[cursor + 32..cursor + 40]
+                        .copy_from_slice(&new_vmsize.to_le_bytes());
+                }
+                return Ok(());
+            }
+        }
+        cursor += cmdsize;
+    }
+    Err(ContainerWriteError::ObjectWrite(
+        "Mach-O export: __LINKEDIT segment not found".into(),
+    ))
+}
+
+/// Find a load command by `cmd` ID and return its offset in
+/// the byte buffer (byte position of the start of the
+/// load_command struct).
+fn find_load_command(
+    bytes: &[u8],
+    cmd_id: u32,
+) -> Result<Option<usize>, ContainerWriteError> {
+    if bytes.len() < 32 {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O export: input too short".into(),
+        ));
+    }
+    let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let lc_end = 32 + sizeofcmds;
+    let mut cursor = 32usize;
+    while cursor + 8 <= lc_end {
+        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if cmdsize == 0 || cursor + cmdsize > lc_end {
+            break;
+        }
+        if cmd == cmd_id {
+            return Ok(Some(cursor));
+        }
+        cursor += cmdsize;
+    }
+    Ok(None)
 }
 
 /// Strip the `LC_CODE_SIGNATURE` load command from the file

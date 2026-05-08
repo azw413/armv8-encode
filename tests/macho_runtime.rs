@@ -486,6 +486,150 @@ fn et_dyn_appended_data_referenced_by_appended_function() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn et_dyn_exported_function_resolves_via_dlopen() {
+    // Phase 5 acceptance: append a new function via
+    // `add_function_exported`, which routes the registered
+    // symbol through the Mach-O writer's export-trie /
+    // LC_SYMTAB extender. After commit, host_dlopen looks up
+    // the new symbol via dlsym at runtime and calls it.
+    //
+    // dlsym resolution walks the export trie (which we
+    // rebuilt from the parsed-existing-exports list plus our
+    // new entry) and resolves via LC_SYMTAB / LC_DYSYMTAB
+    // (which we extended). A successful lookup confirms the
+    // trie + symtab updates are well-formed.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{
+        Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
+        ShiftedRegister,
+    };
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+
+    // _greet_quintuple(n) = n * 5: lsl w8, w0, #2; add w0, w8, w0; ret.
+    let w0 = Register { class: RegisterClass::W, index: 0 };
+    let w8 = Register { class: RegisterClass::W, index: 8 };
+    let x30 = Register { class: RegisterClass::X, index: 30 };
+    let body = vec![
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Lsl,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w8.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Add,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w8)),
+                RewriteOperand::Decoded(DecodedOperand::ShiftedRegister(ShiftedRegister {
+                    register: w0,
+                    shift: Shift { kind: ShiftKind::Lsl, amount: 0 },
+                })),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Ret,
+            operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+            original_address: None,
+        },
+    ];
+
+    editor
+        .binary
+        .add_function_exported("_greet_quintuple", body)
+        .expect("add_function_exported");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+
+    // dlsym resolves the symbol WITHOUT the leading
+    // underscore (the underscore is a Mach-O ABI artifact;
+    // dlsym strips it on input). So callers ask for
+    // "_greet_quintuple" minus the leading underscore.
+    let stdout = run_in_lib_demo_with_args("host_dlopen", &["greet_quintuple", "7"]);
+    assert_eq!(
+        stdout, "result=35\n",
+        "dlsym(libgreet.dylib, \"greet_quintuple\")(7) should return 7*5=35; got {stdout:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
+fn et_dyn_add_library_dependency_forces_extra_load() {
+    // Phase 7 acceptance: `add_library_dependency` injects an
+    // LC_LOAD_DYLIB entry into libgreet.dylib pointing at
+    // libdep.dylib (a sibling fixture NOT linked into either
+    // host or libgreet). Without rewriting, dyld doesn't pull
+    // libdep in and the host's dlsym lookup of
+    // `libdep_loaded_marker` returns 0. After the rewrite,
+    // dyld pulls libdep in alongside libgreet, libdep's
+    // constructor sets the marker to 0xab, and host reads
+    // 0xab via dlsym(RTLD_DEFAULT, ...).
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+
+    // Sanity: libgreet shouldn't already depend on libdep.
+    let pre_load_dylib_count = container
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .layout
+        .segments
+        .iter()
+        .filter(|s| s.name == "__LINKEDIT")
+        .count();
+    let _ = pre_load_dylib_count;
+
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .add_library_dependency("@rpath/libdep.dylib")
+        .expect("add_library_dependency");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+
+    // Regular host still works.
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after add_library_dependency",
+    );
+
+    // Acceptance: marker = 171 proves libdep was loaded.
+    let stdout_libdep = run_in_lib_demo_with_args("host", &["libdep"]);
+    assert_eq!(
+        stdout_libdep,
+        "libdep_marker=171\n",
+        "expected libdep_marker=171 (0xab) after libdep was \
+         force-loaded via LC_LOAD_DYLIB; got {stdout_libdep:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_round_trip_through_container_loads_and_runs() {
     // Phase 1 acceptance: read libgreet.dylib, round-trip it
     // through Container::to_bytes (which routes through the

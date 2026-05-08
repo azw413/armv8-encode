@@ -72,6 +72,44 @@ pub struct MachOLayout {
     /// rewrites this on every commit; we capture it so a future
     /// strip-and-resign path can locate the existing signature.
     pub code_signature: Option<MachOLinkeditData>,
+    /// `LC_DYLD_EXPORTS_TRIE` data range. The export trie maps
+    /// symbol names to vmaddr offsets; dyld walks it during
+    /// `dlsym` lookups. Phase-5 (export) extends this trie.
+    pub exports_trie: Option<MachOLinkeditData>,
+    /// `LC_SYMTAB` parameters. Captured so Phase-5 can locate
+    /// the existing symbol table + string table to extend
+    /// them.
+    pub symtab: Option<MachOSymtab>,
+    /// `LC_DYSYMTAB` external-symbol counts. Captured so
+    /// Phase-5 can update the iextdefsym/nextdefsym range
+    /// when a new defined external is added.
+    pub dysymtab: Option<MachODysymtab>,
+}
+
+/// `LC_SYMTAB` parameters (offsets, counts) captured at
+/// parse time. Phase-5 needs all four values to extend the
+/// symbol table.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MachOSymtab {
+    pub symoff: u64,
+    pub nsyms: u32,
+    pub stroff: u64,
+    pub strsize: u32,
+}
+
+/// `LC_DYSYMTAB` external-symbol range captured at parse
+/// time. Phase-5 uses iextdefsym + nextdefsym to know where
+/// in the symbol table the new export should land
+/// (immediately after existing externals, before
+/// undefineds).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MachODysymtab {
+    pub ilocalsym: u32,
+    pub nlocalsym: u32,
+    pub iextdefsym: u32,
+    pub nextdefsym: u32,
+    pub iundefsym: u32,
+    pub nundefsym: u32,
 }
 
 /// One `LC_SEGMENT_64` entry's interesting fields.
@@ -146,6 +184,9 @@ impl MachOLayout {
         let mut segments: Vec<MachOSegment> = Vec::new();
         let mut sections: Vec<MachOSection> = Vec::new();
         let mut code_signature: Option<MachOLinkeditData> = None;
+        let mut exports_trie: Option<MachOLinkeditData> = None;
+        let mut symtab: Option<MachOSymtab> = None;
+        let mut dysymtab: Option<MachODysymtab> = None;
 
         let mut cursor = load_commands_offset as usize;
         for _ in 0..ncmds {
@@ -183,6 +224,80 @@ impl MachOLayout {
                             as u64;
                     code_signature = Some(MachOLinkeditData { dataoff, datasize });
                 }
+                macho::LC_DYLD_EXPORTS_TRIE => {
+                    if cmdsize < 16 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_DYLD_EXPORTS_TRIE cmdsize < 16".into(),
+                        ));
+                    }
+                    let dataoff = u32::from_le_bytes(
+                        bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                    ) as u64;
+                    let datasize = u32::from_le_bytes(
+                        bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                    ) as u64;
+                    exports_trie = Some(MachOLinkeditData { dataoff, datasize });
+                }
+                macho::LC_SYMTAB => {
+                    // symtab_command: u32 cmd, cmdsize, u32
+                    // symoff, nsyms, stroff, strsize.
+                    if cmdsize < 24 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_SYMTAB cmdsize < 24".into(),
+                        ));
+                    }
+                    let symoff = u32::from_le_bytes(
+                        bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                    ) as u64;
+                    let nsyms = u32::from_le_bytes(
+                        bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                    );
+                    let stroff = u32::from_le_bytes(
+                        bytes[cursor + 16..cursor + 20].try_into().unwrap(),
+                    ) as u64;
+                    let strsize = u32::from_le_bytes(
+                        bytes[cursor + 20..cursor + 24].try_into().unwrap(),
+                    );
+                    symtab = Some(MachOSymtab {
+                        symoff,
+                        nsyms,
+                        stroff,
+                        strsize,
+                    });
+                }
+                macho::LC_DYSYMTAB => {
+                    if cmdsize < 80 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_DYSYMTAB cmdsize < 80".into(),
+                        ));
+                    }
+                    let ilocalsym = u32::from_le_bytes(
+                        bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                    );
+                    let nlocalsym = u32::from_le_bytes(
+                        bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                    );
+                    let iextdefsym = u32::from_le_bytes(
+                        bytes[cursor + 16..cursor + 20].try_into().unwrap(),
+                    );
+                    let nextdefsym = u32::from_le_bytes(
+                        bytes[cursor + 20..cursor + 24].try_into().unwrap(),
+                    );
+                    let iundefsym = u32::from_le_bytes(
+                        bytes[cursor + 24..cursor + 28].try_into().unwrap(),
+                    );
+                    let nundefsym = u32::from_le_bytes(
+                        bytes[cursor + 28..cursor + 32].try_into().unwrap(),
+                    );
+                    dysymtab = Some(MachODysymtab {
+                        ilocalsym,
+                        nlocalsym,
+                        iextdefsym,
+                        nextdefsym,
+                        iundefsym,
+                        nundefsym,
+                    });
+                }
                 _ => {}
             }
             cursor += cmdsize;
@@ -195,6 +310,9 @@ impl MachOLayout {
             segments,
             sections,
             code_signature,
+            exports_trie,
+            symtab,
+            dysymtab,
         })
     }
 
