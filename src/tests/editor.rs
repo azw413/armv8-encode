@@ -62,6 +62,7 @@ fn fixture_container() -> Container {
         relocations: Vec::new(),
         file_flags: None,
         elf_image: None,
+        macho_image: None,
         dwarf: None,
     }
 }

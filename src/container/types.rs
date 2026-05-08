@@ -278,6 +278,13 @@ pub struct Container {
     /// `.eh_frame_hdr`, `.interp`) survives round-trip. `None` for
     /// ET_REL inputs and for non-ELF formats.
     pub elf_image: Option<crate::container::elf_image::ElfImage>,
+    /// Format-specific data captured for ET_DYN-shaped Mach-O
+    /// inputs (MH_DYLIB / MH_EXECUTE). Populated by the reader
+    /// for [`ContainerKind::SharedObject`] /
+    /// [`ContainerKind::Executable`] Mach-O inputs; consumed by
+    /// the Mach-O writer for round-trip output. `None` for
+    /// MH_OBJECT inputs and for non-Mach-O formats.
+    pub macho_image: Option<crate::container::macho_image::MachOImage>,
     /// DWARF debug info, populated when the container has `.debug_info` /
     /// `__debug_info` sections that parse cleanly. `None` when no DWARF is
     /// present or parsing failed (best-effort — DWARF is metadata, not

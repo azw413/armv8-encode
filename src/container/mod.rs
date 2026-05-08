@@ -35,6 +35,8 @@ pub mod dynsym_extension;
 mod elf_image;
 pub(crate) mod elf_writer;
 pub(crate) mod gnu_hash;
+mod macho_image;
+pub(crate) mod macho_writer;
 mod reader;
 mod types;
 mod writer;
@@ -42,6 +44,7 @@ mod writer;
 pub use elf_image::{
     DynamicEntry, ElfImage, ProgramHeader, RawNoteSection, RawSectionBytes, SectionLayout,
 };
+pub use macho_image::MachOImage;
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
     DwarfInfo, FileFlags, Function, FunctionProvenance, Relocation, RelocationId, RelocationKind,
@@ -79,6 +82,9 @@ impl Container {
             (_, ContainerKind::Relocatable) => writer::write(self),
             (BinaryFormat::Elf, ContainerKind::SharedObject | ContainerKind::Executable) => {
                 elf_writer::write(self)
+            }
+            (BinaryFormat::Macho, ContainerKind::SharedObject | ContainerKind::Executable) => {
+                macho_writer::write(self)
             }
             _ => Err(ContainerWriteError::UnsupportedKind { kind: self.kind }),
         }

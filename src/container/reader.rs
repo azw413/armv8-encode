@@ -55,6 +55,19 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         _ => None,
     };
 
+    // For Mach-O ET_DYN-shaped inputs, snapshot the raw bytes
+    // so the round-trip writer can emit them verbatim with
+    // section overrides applied at original file offsets. We
+    // don't need parsed load-command metadata until later
+    // phases.
+    let macho_image = match (format, kind) {
+        (
+            BinaryFormat::Macho,
+            ContainerKind::SharedObject | ContainerKind::Executable,
+        ) => Some(crate::container::macho_image::MachOImage::new(bytes.to_vec())),
+        _ => None,
+    };
+
     Ok(Container {
         format,
         architecture,
@@ -64,6 +77,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         relocations,
         file_flags,
         elf_image,
+        macho_image,
         dwarf,
     })
 }

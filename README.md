@@ -523,6 +523,30 @@ Run:
 cargo test --test elf_runtime -- --ignored --nocapture
 ```
 
+### Mach-O runtime harness (native macOS arm64)
+
+The `tests/macho_runtime/` directory mirrors the ELF harness but
+runs natively on Apple Silicon — no Docker/QEMU. Build script
+uses `clang -dynamiclib` plus `codesign -s -` (ad-hoc) so dyld
+loads the rewritten dylib. Two tests cover:
+
+- baseline (sanity: fixture builds, signs, loads, runs).
+- ET_DYN-shaped round-trip — read `libgreet.dylib`, write it
+  back through `Container::to_bytes` (Phase 1 passthrough
+  writer + ad-hoc re-sign), host loads and runs the rewritten
+  copy with identical stdout.
+
+Subsequent phases will add in-place edit, append, export,
+initialiser, and library-dependency tests as the Mach-O writer
+reaches parity with the ELF one.
+
+```sh
+cargo test --test macho_runtime -- --ignored --nocapture
+```
+
+Requires macOS on aarch64 with Xcode command-line tools
+(`clang`, `codesign`) on PATH.
+
 ## Examples — quick API tour
 
 ### Decode and inspect
