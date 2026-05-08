@@ -377,6 +377,115 @@ fn et_dyn_appended_function_changes_observable_output() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn et_dyn_appended_data_referenced_by_appended_function() {
+    // Phase 4 acceptance: `add_data` lays a read-only blob in
+    // the same appended segment as `add_function`; the
+    // appended function references it via `adrp + add`
+    // (macro-fused into a `LoadAddress` against the data
+    // symbol). Acceptance: host observes the value loaded
+    // from the appended data, proving:
+    //   1. the data lives at the expected vaddr inside the
+    //      new R-X segment;
+    //   2. the appended function's adrp+add fused correctly
+    //      against the symbolic data address;
+    //   3. an `ldr w0, [x0]` reads the right bytes — i.e. the
+    //      writer placed the data at the same file offset
+    //      dyld maps to the segment's vmaddr+offset.
+    //
+    // Concretely: append a 4-byte u32 literal `55`, then an
+    // `_greet_const_double` function that loads the literal
+    // and returns it (ignoring its argument). Patch
+    // `_greet_double`'s first instruction to tail-call
+    // `_greet_const_double`. host's `greet_double(21)` no
+    // longer returns 42; it returns 55 regardless of input.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+
+    // Append a 4-byte u32 literal `55` to the appended segment.
+    // 4-byte aligned so the subsequent ldr is well-defined.
+    let value_id = editor
+        .binary
+        .add_data("_greet_const_value", &55i32.to_le_bytes(), 4)
+        .expect("add_data");
+
+    // Build `_greet_const_double`:
+    //   adrp x0, &_greet_const_value      ; symbolic page
+    //   add  x0, x0, #lo12(...)           ; symbolic, fuses into LoadAddress
+    //   ldr  w0, [x0]                     ; w0 = 55
+    //   ret
+    let template = |word: u32| {
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
+        RewriteInstruction {
+            mnemonic: decoded.mnemonic,
+            operands: decoded
+                .operands
+                .into_iter()
+                .map(RewriteOperand::Decoded)
+                .collect(),
+            original_address: None,
+        }
+    };
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    let body = vec![
+        symbolic_adrp(0x90000000, Target::Symbol(value_id)),
+        template(0x91000000), // add x0, x0, #lo12 (fused with adrp)
+        template(0xb9400000), // ldr w0, [x0]
+        template(0xd65f03c0), // ret
+    ];
+    let func_id = editor
+        .binary
+        .add_function("_greet_const_double", body)
+        .expect("add_function");
+
+    // Tail-call from greet_double's first instruction.
+    let greet_double_addr = editor
+        .binary
+        .function_address("_greet_double")
+        .expect("_greet_double symbol");
+    editor
+        .text
+        .as_mut()
+        .unwrap()
+        .replace_instruction_at(
+            greet_double_addr,
+            RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::B,
+                operands: vec![RewriteOperand::Branch(Target::Symbol(func_id))],
+                original_address: Some(greet_double_addr),
+            },
+        )
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=55 offset=107\n",
+        "appended function should load the appended data \
+         literal (55) and return it; got {stdout:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_round_trip_through_container_loads_and_runs() {
     // Phase 1 acceptance: read libgreet.dylib, round-trip it
     // through Container::to_bytes (which routes through the

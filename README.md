@@ -550,7 +550,7 @@ cargo test --test elf_runtime -- --ignored --nocapture
 The `tests/macho_runtime/` directory mirrors the ELF harness but
 runs natively on Apple Silicon — no Docker/QEMU. Build script
 uses `clang -dynamiclib` plus `codesign -s -` (ad-hoc) so dyld
-loads the rewritten dylib. Four tests cover:
+loads the rewritten dylib. Five tests cover:
 
 - baseline (sanity: fixture builds, signs, loads, runs).
 - ET_DYN-shaped round-trip — read `libgreet.dylib`, write it
@@ -571,10 +571,24 @@ loads the rewritten dylib. Four tests cover:
   range. Host observes `double=105` (21*5) confirming dyld
   loaded the new segment and PC-relative branches in/out
   of it resolve.
+- appended data referenced by appended function — call
+  `add_data` with a 4-byte `u32` literal, then
+  `add_function` with a body that loads the literal via
+  `adrp + add` (macro-fused into a `LoadAddress` against
+  the data symbol) and `ldr w0, [x0]`. Patches
+  `_greet_double` to tail-call the new function. Host
+  observes the loaded value, proving the appended data
+  lives at the expected vaddr in the R-X segment and the
+  appended code reads from it correctly.
 
 Subsequent phases will add export, initialiser, and
 library-dependency tests as the Mach-O writer reaches parity
 with the ELF one.
+
+`add_data` writes read-only bytes into the same R-X segment
+as `add_function`. Writable appended data is future work —
+macOS rejects RWX mappings, so writable data would need a
+separate RW segment.
 
 ```sh
 cargo test --test macho_runtime -- --ignored --nocapture
