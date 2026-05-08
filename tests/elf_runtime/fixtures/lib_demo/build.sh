@@ -31,7 +31,18 @@ cd "$(dirname "$0")"
 clang --target=aarch64-linux-gnu \
     -fPIC -shared -O0 -g \
     -fno-stack-protector \
+    -Wl,-rpath,'$ORIGIN' -Wl,--disable-new-dtags \
     -o libgreet.so libgreet.c -ldl
+
+# libdep.so: a tiny library NOT linked into the host or
+# libgreet.so. Used only by the add_library_dependency
+# acceptance test, which rewrites libgreet.so to add a
+# DT_NEEDED entry pointing here so the loader pulls libdep
+# in alongside libgreet.
+clang --target=aarch64-linux-gnu \
+    -fPIC -shared -O0 -g \
+    -fno-stack-protector \
+    -o libdep.so libdep.c
 
 # `-Wl,-rpath,$ORIGIN` makes the loader look next to the host
 # executable for `libgreet.so`. Without it the test would need

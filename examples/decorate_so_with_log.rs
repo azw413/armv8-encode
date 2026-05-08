@@ -59,7 +59,7 @@
 
 use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -77,25 +77,28 @@ fn main() -> ExitCode {
     }
     let bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     // The one anchor we rely on. libgreet.c forces a PLT entry
     // for dlsym via `_greet_unused_dlsym_anchor`; from there our
     // appended code can resolve any symbol visible to the
     // process at runtime.
     let dlsym_id = editor
+        .binary
         .symbol_by_name("dlsym@GLIBC_2.34")
-        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
-        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .or_else(|_| editor.binary.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.binary.symbol_by_name("dlsym"))
         .expect("libgreet.so should import dlsym (see _greet_unused_dlsym_anchor)");
     println!("found dlsym anchor as SymbolId({})", dlsym_id.0);
 
     // The two strings the new function references: the symbol
     // name to resolve, plus the message to print.
     let puts_name_id = editor
+        .binary
         .add_data("greet_log_putsname", b"puts\0", /*align=*/ 1)
         .expect("add_data puts_name");
     let msg_id = editor
+        .binary
         .add_data(
             "greet_log_msg",
             b"greet_double called via appended decorator (dlsym)\0",
@@ -165,15 +168,20 @@ fn main() -> ExitCode {
         template(0xd65f03c0),    // ret
     ];
     let log_id = editor
+        .binary
         .add_function("greet_log_double", body)
         .expect("add_function");
     println!("added greet_log_double as SymbolId({})", log_id.0);
 
     // Patch greet_double to tail-call greet_log_double.
     let greet_double_addr = editor
+        .binary
         .function_address("greet_double")
         .expect("greet_double symbol");
     editor
+        .text
+        .as_mut()
+        .unwrap()
         .replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {

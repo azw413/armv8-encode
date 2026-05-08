@@ -444,25 +444,26 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
     let (lib_path, _) = build_lib_demo_fixture();
 
     use armv8_encode::isa::aarch64::{Aarch64Mnemonic, DecodedOperand};
-    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
 
     let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
 
     // Open the editor and locate greet_double's `lsl`.
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
     let function_address = editor
-        .function_address("greet_double")
+        .binary.function_address("greet_double")
         .expect("greet_double symbol");
-    let lsl_index = editor
+    let text = editor.text.as_ref().expect("text section lifted");
+    let lsl_index = text
         .instructions()
         .iter()
         .position(|insn| {
             insn.address >= function_address && insn.mnemonic == Aarch64Mnemonic::Lsl
         })
         .expect("greet_double should contain an lsl");
-    let lsl_address = editor.instructions()[lsl_index].address;
-    let original_lsl = &editor.instructions()[lsl_index];
+    let lsl_address = text.instructions()[lsl_index].address;
+    let original_lsl = &text.instructions()[lsl_index];
 
     // Confirm the fixture's compiled shape matches what we expect
     // before mutating. If the compiler changes shape the test
@@ -491,7 +492,7 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
         original_address: Some(lsl_address),
     };
     editor
-        .replace_instruction_at(lsl_address, new_instruction)
+        .text.as_mut().unwrap().replace_instruction_at(lsl_address, new_instruction)
         .expect("replace_instruction_at");
 
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
@@ -527,11 +528,11 @@ fn et_dyn_appended_function_changes_observable_output() {
         Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
         ShiftedRegister,
     };
-    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 
     let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     // greet_quintuple(n) = n * 5: lsl w8,w0,#2; add w0,w8,w0; ret.
     let w0 = Register { class: RegisterClass::W, index: 0 };
@@ -567,16 +568,16 @@ fn et_dyn_appended_function_changes_observable_output() {
     ];
 
     let quintuple_id = editor
-        .add_function("greet_quintuple", new_function)
+        .binary.add_function("greet_quintuple", new_function)
         .expect("add_function");
 
     // Patch greet_double's first instruction to tail-call
     // greet_quintuple.
     let greet_double_addr = editor
-        .function_address("greet_double")
+        .binary.function_address("greet_double")
         .expect("greet_double symbol");
     editor
-        .replace_instruction_at(
+        .text.as_mut().unwrap().replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,
@@ -634,19 +635,19 @@ fn et_dyn_appended_function_resolves_extern_via_dlsym() {
     let (lib_path, _) = build_lib_demo_fixture();
 
     use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
-    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 
     let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     // The one anchor we rely on. Versioned name on glibc is
     // `dlsym@GLIBC_2.34` (or older); fall back to bare `dlsym`
     // for non-versioned inputs.
     let dlsym_id = editor
-        .symbol_by_name("dlsym@GLIBC_2.34")
-        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
-        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .binary.symbol_by_name("dlsym@GLIBC_2.34")
+        .or_else(|_| editor.binary.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.binary.symbol_by_name("dlsym"))
         .expect("libgreet.so should import dlsym via _greet_unused_dlsym_anchor");
 
     // Two strings: the name to resolve, and the message we'll
@@ -654,10 +655,10 @@ fn et_dyn_appended_function_resolves_extern_via_dlsym() {
     let puts_name = b"puts\0";
     let message = b"greet_double called via appended decorator (dlsym)\0";
     let puts_name_id = editor
-        .add_data("greet_log_putsname", puts_name, 1)
+        .binary.add_data("greet_log_putsname", puts_name, 1)
         .expect("add_data puts_name");
     let msg_id = editor
-        .add_data("greet_log_msg", message, 1)
+        .binary.add_data("greet_log_msg", message, 1)
         .expect("add_data msg");
 
     // Helper: lift a known-good encoded word into a
@@ -721,15 +722,15 @@ fn et_dyn_appended_function_resolves_extern_via_dlsym() {
         template(0xd65f03c0),    // ret
     ];
     let log_id = editor
-        .add_function("greet_log_double", body)
+        .binary.add_function("greet_log_double", body)
         .expect("add_function");
 
     // Patch greet_double to tail-call the new function.
     let greet_double_addr = editor
-        .function_address("greet_double")
+        .binary.function_address("greet_double")
         .expect("greet_double symbol");
     editor
-        .replace_instruction_at(
+        .text.as_mut().unwrap().replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,
@@ -774,11 +775,11 @@ fn et_dyn_exported_function_resolves_via_dlopen() {
         Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
         ShiftedRegister,
     };
-    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
 
     let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     // Build greet_quintuple(n) = n * 5 (lsl by 2 then add).
     let w0 = Register { class: RegisterClass::W, index: 0 };
@@ -814,7 +815,7 @@ fn et_dyn_exported_function_resolves_via_dlopen() {
     ];
 
     editor
-        .add_function_exported("greet_quintuple", body)
+        .binary.add_function_exported("greet_quintuple", body)
         .expect("add_function_exported");
 
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
@@ -852,7 +853,7 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
     let (lib_path, _) = build_lib_demo_fixture();
 
     use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
-    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 
     let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
@@ -874,18 +875,18 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
          (printf reachable via dlsym only) doesn't apply",
     );
 
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
     let dlsym_id = editor
-        .symbol_by_name("dlsym@GLIBC_2.34")
-        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
-        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .binary.symbol_by_name("dlsym@GLIBC_2.34")
+        .or_else(|_| editor.binary.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.binary.symbol_by_name("dlsym"))
         .expect("dlsym anchor");
 
     let printf_name_id = editor
-        .add_data("greet_printf_name", b"printf\0", 1)
+        .binary.add_data("greet_printf_name", b"printf\0", 1)
         .expect("add_data printf_name");
     let format_id = editor
-        .add_data(
+        .binary.add_data(
             "greet_printf_format",
             b"appended printf says n=%d\n\0",
             1,
@@ -942,14 +943,14 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
         template(0xd65f03c0),    // ret
     ];
     let log_id = editor
-        .add_function("greet_printf_double", body)
+        .binary.add_function("greet_printf_double", body)
         .expect("add_function");
 
     let greet_double_addr = editor
-        .function_address("greet_double")
+        .binary.function_address("greet_double")
         .expect("greet_double symbol");
     editor
-        .replace_instruction_at(
+        .text.as_mut().unwrap().replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,
@@ -1017,16 +1018,16 @@ fn rewrite_libgreet_with_initialiser(
     lib_path: &std::path::Path,
     position: armv8_encode::rewrite::InitialiserPosition,
 ) {
-    use armv8_encode::rewrite::TextEditor;
+    use armv8_encode::rewrite::BinaryEditor;
     let lib_bytes = std::fs::read(lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
     let marker_id = editor
-        .symbol_by_name("greet_ctor_marker")
+        .binary.symbol_by_name("greet_ctor_marker")
         .expect("greet_ctor_marker should be defined in libgreet.so");
     let body = build_marker_init_body(marker_id);
     let _user_body_id = editor
-        .add_initialiser("greet_appended_init", body, position)
+        .binary.add_initialiser("greet_appended_init", body, position)
         .expect("add_initialiser");
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
     let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet");
@@ -1146,19 +1147,19 @@ fn et_dyn_add_initialiser_append_adds_brand_new_slot_without_hijack() {
     require_docker();
     let (lib_path, _) = build_lib_demo_fixture();
 
-    use armv8_encode::rewrite::{InitialiserPosition, TextEditor};
+    use armv8_encode::rewrite::{BinaryEditor, InitialiserPosition};
 
     let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
 
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
     let marker_id = editor
-        .symbol_by_name("greet_ctor_marker")
+        .binary.symbol_by_name("greet_ctor_marker")
         .expect("greet_ctor_marker should be defined in libgreet.so");
     let body = build_marker_init_body(marker_id);
 
     let _user_body_id = editor
-        .add_initialiser(
+        .binary.add_initialiser(
             "greet_appended_init",
             body,
             InitialiserPosition::Append,
@@ -1188,6 +1189,81 @@ fn et_dyn_add_initialiser_append_adds_brand_new_slot_without_hijack() {
         "expected ctor_marker=16 (greet_ctor ran first → 1, \
          then appended slot overwrote with 0x10); got \
          {stdout_ctor:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_library_dependency_forces_extra_load() {
+    // Acceptance for `add_library_dependency`. libdep.so
+    // exists in the fixture but is NOT linked into the host
+    // or libgreet — its constructor sets a global marker to
+    // 0xab. Without rewriting, the loader doesn't pull
+    // libdep in and the marker stays 0. After
+    // `add_library_dependency("libdep.so")`, libgreet's
+    // .dynamic gains a DT_NEEDED pointing at the new dynstr
+    // entry, the loader pulls libdep in alongside libgreet,
+    // and libdep's ctor runs.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
+    editor
+        .binary.add_library_dependency("libdep.so")
+        .expect("add_library_dependency");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let rewritten = Container::from_bytes(&written).expect("re-parse rewritten libgreet");
+
+    // Static check: the rewritten library's .dynamic should
+    // now have at least 2 DT_NEEDED entries (original libc
+    // plus our new libdep). We can't easily check the dynstr
+    // bytes because the rebuilt .dynstr lives in the appended
+    // segment which isn't currently exposed via the neutral
+    // container model — runtime behaviour below is the more
+    // direct signal.
+    let dynamic_index = rewritten
+        .sections
+        .iter()
+        .position(|s| s.name == ".dynamic")
+        .expect(".dynamic section");
+    let dynamic_bytes = &rewritten.sections[dynamic_index].bytes;
+    use armv8_encode::container::dynsym_extension as dx;
+    let new_dynamic = dx::parse_dynamic(dynamic_bytes);
+    let dt_needed_count = new_dynamic
+        .iter()
+        .filter(|e| e.tag == object::elf::DT_NEEDED as u64)
+        .count();
+    assert!(
+        dt_needed_count >= 2,
+        "expected at least 2 DT_NEEDED entries (original libc + new libdep), \
+         got {dt_needed_count}",
+    );
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+
+    // Regular host call still works.
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after \
+         add_library_dependency",
+    );
+
+    // Acceptance: marker = 0xab proves libdep was loaded.
+    let stdout_libdep = run_in_lib_demo_with_args("host", &["libdep"]);
+    assert_eq!(
+        stdout_libdep,
+        "libdep_marker=171\n",
+        "expected libdep_marker=171 (0xab) after libdep was \
+         force-loaded via DT_NEEDED; got {stdout_libdep:?}",
     );
 }
 

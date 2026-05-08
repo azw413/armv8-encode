@@ -49,7 +49,7 @@
 
 use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand, Register, RegisterClass};
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -86,11 +86,12 @@ fn main() -> ExitCode {
     // ---------------------------------------------------------------
     // Step 2: open a TextEditor over the .text section.
     // ---------------------------------------------------------------
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
+    let text = editor.text.as_ref().expect("text section lifted");
     println!(
         "editor opened: base=0x{:x}, {} instructions",
-        editor.base_address(),
-        editor.instructions().len(),
+        text.base_address(),
+        text.instructions().len(),
     );
 
     // ---------------------------------------------------------------
@@ -103,19 +104,20 @@ fn main() -> ExitCode {
     // walk from the function's entry until we hit the lsl.
     // ---------------------------------------------------------------
     let function_address = editor
+        .binary
         .function_address("greet_double")
         .expect("greet_double symbol present in .text");
     println!("greet_double starts at 0x{:x}", function_address);
 
-    let lsl_index = editor
+    let lsl_index = text
         .instructions()
         .iter()
         .position(|insn| {
             insn.address >= function_address && insn.mnemonic == Aarch64Mnemonic::Lsl
         })
         .expect("greet_double should contain an `lsl` instruction");
-    let lsl_address = editor.instructions()[lsl_index].address;
-    let original_lsl = &editor.instructions()[lsl_index];
+    let lsl_address = text.instructions()[lsl_index].address;
+    let original_lsl = &text.instructions()[lsl_index];
     println!(
         "  found `{}` at 0x{:x}: operands={:?}",
         original_lsl.mnemonic.as_str(),
@@ -164,6 +166,9 @@ fn main() -> ExitCode {
     // Step 5: install the new instruction.
     // ---------------------------------------------------------------
     editor
+        .text
+        .as_mut()
+        .unwrap()
         .replace_instruction_at(lsl_address, new_instruction)
         .expect("replace_instruction_at");
     println!("installed `lsl {wd}, {wn}, #2` (n*4) at 0x{:x}", lsl_address,
@@ -178,7 +183,7 @@ fn main() -> ExitCode {
     // Note: commit_to_bytes consumes the editor. Capture any state
     // we'll need afterwards (here, the base address) first.
     // ---------------------------------------------------------------
-    let base_address = editor.base_address();
+    let base_address = editor.text.as_ref().unwrap().base_address();
     let rewritten = editor.commit_to_bytes().expect("commit_to_bytes");
     let out_path = PathBuf::from("/tmp/libgreet_text_edit_example.so");
     std::fs::write(&out_path, &rewritten).expect("write rewritten .so");

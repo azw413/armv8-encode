@@ -32,7 +32,7 @@ so other ISAs can plug in later.
 - **Edit `.rodata`/`.data`** as a sequence of pointer + bytes items
   (e.g. swap a function-pointer slot in a vtable).
 - **Edit `.text` of a real `.so`** in place via the high-level
-  [`TextEditor`] API.
+  [`BinaryEditor`] API.
 - **Append a new function** to an `.so` in a fresh executable
   segment, complete with new read-only data, and have the new code
   call existing extern functions through the PLT.
@@ -41,6 +41,16 @@ so other ISAs can plug in later.
   code can call `dlsym(RTLD_DEFAULT, "name")` to resolve any symbol
   the dynamic loader can find — `printf`, `strlen`, `getenv`,
   anything — without needing it to be pre-anchored in the source.
+- **Force-load another library at this one's load time.**
+  `add_library_dependency("libfoo.so")` appends the name to a
+  rebuilt `.dynstr` (in the appended segment) and inserts a
+  `DT_NEEDED` tag in `.dynamic`. The dynamic linker resolves
+  every `DT_NEEDED` before firing this library's constructors,
+  so the named library is guaranteed to be present and its
+  symbols reachable through `dlsym(RTLD_DEFAULT, ...)` by the
+  time any code in this library runs. Pairs naturally with
+  `add_initialiser` for "load this side library, then run my
+  init code that uses it."
 - **Run code at library load time.**
   `add_initialiser(name, body, position)` registers a
   load-time constructor. Three insertion strategies:
@@ -219,23 +229,46 @@ idiom). Two macros are recognised today:
 Macros are recognised at lift time, edited as a unit, and expanded
 back to their component instructions on emit.
 
-#### High-level `TextEditor` API
+#### High-level `BinaryEditor` API
 
-The [`TextEditor`](src/rewrite/editor.rs) wraps the lift → edit →
-layout → emit → commit pipeline behind a smaller, typed surface:
+The [`BinaryEditor`](src/rewrite/editor.rs) wraps the lift → edit →
+layout → emit → commit pipeline behind a smaller, typed surface.
+It splits its operations across two scoped sub-views:
+
+- `editor.binary` ([`BinaryState`]) — whole-binary methods: append
+  functions, declare dependencies, register exports, etc.
+- `editor.text` ([`LiftedTextSection`], optional) — section-scoped
+  methods: redirect branches, replace instructions, etc. Populated
+  by [`BinaryEditor::lift_text_section`].
 
 ```rust
 use armv8_encode::container::Container;
-use armv8_encode::rewrite::{Target, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, Target};
 
 let bytes = std::fs::read("libgreet.so")?;
 let container = Container::from_bytes(&bytes)?;
 
-let mut editor = TextEditor::for_section(&container, ".text")?;
-let printf = editor.symbol_by_name("printf")?;
-editor.redirect_branch_at(0x1234, Target::Symbol(printf))?;
+let mut editor = BinaryEditor::for_section(&container, ".text")?;
+let printf = editor.binary.symbol_by_name("printf")?;
+editor
+    .text
+    .as_mut()
+    .unwrap()
+    .redirect_branch_at(0x1234, Target::Symbol(printf))?;
 let new_bytes = editor.commit_to_bytes()?;
 std::fs::write("libgreet.rewritten.so", new_bytes)?;
+```
+
+When you need to interleave whole-binary and section-scoped edits,
+destructure once so both `&mut` references coexist:
+
+```rust
+let BinaryEditor { binary, text, .. } = &mut editor;
+let text = text.as_mut().unwrap();
+
+let log = binary.add_function("hello_log", body)?;
+let target = binary.function_address("greet_double").unwrap();
+text.replace_instruction_at(target, /* b log */)?;
 ```
 
 The editor proxies the rewrite primitives:
@@ -271,6 +304,12 @@ The editor proxies the rewrite primitives:
   rewriter's macro-fusion pass folds the pair into a
   `LoadAddress` macro that resolves at the appended segment's
   vaddr.
+- `editor.binary.add_library_dependency(library_name) -> ()` — force the
+  dynamic linker to load another shared library when this one
+  is loaded. Appends the name to `.dynstr` (rebuilt in the
+  appended segment) and inserts a `DT_NEEDED` tag in
+  `.dynamic`. Returns `DynamicTooFull` if `.dynamic` lacks the
+  trailing `DT_NULL` slot needed to absorb the new tag.
 - `add_initialiser(name, body, position) -> SymbolId` — register
   a function that runs at library load time. Three positions:
   - `First` / `Last` — hijack an existing `.init_array` slot
@@ -344,7 +383,7 @@ capability:
 - **`examples/text_edit_so.rs`** — read `libgreet.so`, find
   `greet_double`'s `lsl` instruction, replace it (changing
   `n*2` to `n*4`), write the result, re-parse to confirm.
-  Demonstrates the `TextEditor` API end-to-end on an ET_DYN.
+  Demonstrates the `BinaryEditor` API end-to-end on an ET_DYN.
 - **`examples/decorate_so.rs`** — append a new function
   `greet_quintuple` to `libgreet.so` and patch `greet_double` to
   tail-call it. Demonstrates `add_function` + `replace_instruction_at`
@@ -417,9 +456,9 @@ ARMV8_COMPARE_STRICT=1 cargo test --test otool_compare -- --ignored --nocapture
 ### ELF runtime harness (Docker, all platforms)
 
 The `tests/elf_runtime/` directory builds a small aarch64 Linux
-fixture (`libgreet.so` + `host` + `host_dlopen`) inside a Docker
+fixture (`libgreet.so` + `libdep.so` + `host` + `host_dlopen`) inside a Docker
 image, exercises the full read → edit → write → load → run
-pipeline, and asserts on host stdout. Thirteen tests cover:
+pipeline, and asserts on host stdout. Fourteen tests cover:
 
 - baseline (sanity: harness works, fixture runs).
 - identity round-trip — `Container::to_bytes()` produces a
@@ -430,7 +469,7 @@ pipeline, and asserts on host stdout. Thirteen tests cover:
 - ET_DYN round-trip — read `libgreet.so`, write it back, host
   loads and runs against the rewritten copy.
 - in-place text edit — patch `greet_double`'s `lsl` constant via
-  `TextEditor`, host observes new return value.
+  `BinaryEditor`, host observes new return value.
 - appended function — add `greet_quintuple` via `add_function`,
   redirect `greet_double` to it, host observes new return value.
 - appended function resolving extern via dlsym — add
@@ -462,6 +501,12 @@ pipeline, and asserts on host stdout. Thirteen tests cover:
   ends at 16 (greet_ctor sets bit 0x1, then the appended slot
   overwrites with 0x10 because it runs *after* the originals
   rather than via a hijack-and-chain-back).
+- forced library load via `add_library_dependency` — fixture
+  ships an unlinked `libdep.so` whose ctor sets a marker.
+  Without rewriting, host's dlsym lookup of the marker
+  returns 0 (libdep not loaded). After `add_library_dependency`
+  injects a DT_NEEDED for libdep into libgreet's `.dynamic`,
+  the loader pulls libdep in and the marker reads 0xab.
 
 Setup (one-time):
 
@@ -537,15 +582,14 @@ for function in container.functions() {
 ```rust
 use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{Aarch64Mnemonic, DecodedOperand};
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
 
 let bytes = std::fs::read("libgreet.so")?;
 let container = Container::from_bytes(&bytes)?;
-let mut editor = TextEditor::for_section(&container, ".text")?;
+let mut editor = BinaryEditor::for_section(&container, ".text")?;
 
-// Find an instruction by walking editor.instructions(), build a
-// replacement, install it. The example below assumes you've located
-// `lsl_addr` and want to swap an `lsl Rd, Rn, #1` for `#2`.
+// Find an instruction by walking editor.text.instructions(),
+// build a replacement, install it.
 # let lsl_addr = 0u64;
 # let rd = todo!(); let rn = todo!();
 let new_lsl = RewriteInstruction {
@@ -557,7 +601,11 @@ let new_lsl = RewriteInstruction {
     ],
     original_address: Some(lsl_addr),
 };
-editor.replace_instruction_at(lsl_addr, new_lsl)?;
+editor
+    .text
+    .as_mut()
+    .unwrap()
+    .replace_instruction_at(lsl_addr, new_lsl)?;
 
 let rewritten = editor.commit_to_bytes()?;
 std::fs::write("libgreet.rewritten.so", rewritten)?;
@@ -568,30 +616,34 @@ std::fs::write("libgreet.rewritten.so", rewritten)?;
 ```rust
 use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 
 let bytes = std::fs::read("libgreet.so")?;
 let container = Container::from_bytes(&bytes)?;
-let mut editor = TextEditor::for_section(&container, ".text")?;
+let mut editor = BinaryEditor::for_section(&container, ".text")?;
+
+// Destructure once so both scopes are usable side-by-side.
+let BinaryEditor { binary, text, .. } = &mut editor;
+let text = text.as_mut().unwrap();
 
 // Resolve an existing PLT-bound extern. The reader populated
 // elf_image.plt_stubs at parse time; emit will fold a call to
 // this symbol into `bl <plt_stub>`.
-let puts = editor.symbol_by_name("puts@GLIBC_2.17")?;
+let puts = binary.symbol_by_name("puts@GLIBC_2.17")?;
 
 // Append a string in the new segment.
-let msg_id = editor.add_data("hello_msg", b"hello from new code\0", 1)?;
+let msg_id = binary.add_data("hello_msg", b"hello from new code\0", 1)?;
 
 // Build a new function (instructions elided — see
 // examples/decorate_so_with_log.rs for the full body). The adrp+add
 // pair against Target::Symbol(msg_id) fuses into a LoadAddress
 // macro; bl Target::Symbol(puts) folds to the existing PLT stub.
 # let body: Vec<RewriteInstruction> = vec![];
-let log_id = editor.add_function("hello_log", body)?;
+let log_id = binary.add_function("hello_log", body)?;
 
 // Redirect an existing function to call the new one.
-let target = editor.function_address("greet_double").unwrap();
-editor.replace_instruction_at(
+let target = binary.function_address("greet_double").unwrap();
+text.replace_instruction_at(
     target,
     RewriteInstruction {
         mnemonic: Aarch64Mnemonic::B,

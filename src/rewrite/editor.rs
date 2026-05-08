@@ -40,7 +40,9 @@
 //!   `lay_out` + `emit` cycle (e.g., raw byte poking via
 //!   [`Container::with_section_bytes`]).
 
-use crate::container::{Container, ContainerWriteError, SectionId, Symbol, SymbolId, SymbolKind};
+use crate::container::{
+    Container, ContainerWriteError, SectionId, Symbol, SymbolId, SymbolKind,
+};
 use crate::isa::aarch64::{self, DecodedInstruction, DisassembleError, EncodeError};
 use crate::mc::{build_cfg, ControlFlowGraph};
 use crate::rewrite::commit::commit_to_container;
@@ -209,34 +211,69 @@ impl From<EncodeError> for TextEditorError {
     }
 }
 
-/// Editable view over one named text section of a [`Container`].
+/// High-level editor for an ELF/Mach-O binary.
 ///
-/// Created by [`Self::for_section`]; modified by the proxy methods
-/// (`redirect_branch_at`, `replace_instruction_at`, etc.); resolved
-/// by [`Self::commit`] which produces the rewritten container.
+/// Composes two scopes:
 ///
-/// The editor borrows the source container during construction
-/// (cheap — the container's contents are cloned in
-/// [`commit_to_container`] anyway); after construction it owns its
-/// own state.
+/// - [`BinaryEditor::binary`] — whole-binary operations
+///   (appending functions, registering dynamic exports,
+///   declaring library dependencies, etc.). Available
+///   without lifting any text section.
+/// - [`BinaryEditor::text`] — section-scoped operations
+///   (redirecting branches, replacing instructions, etc.).
+///   Populated by calling [`Self::lift_text_section`].
+///
+/// The two scopes live in separate fields so callers can hold
+/// `&mut` references to both simultaneously via destructuring:
+///
+/// ```ignore
+/// let mut editor = BinaryEditor::new(&container)?;
+/// editor.lift_text_section(".text")?;
+///
+/// let BinaryEditor { binary, text, .. } = &mut editor;
+/// let text = text.as_mut().unwrap();
+///
+/// let new_fn = binary.add_function("foo", body)?;
+/// let addr = text.function_address("greet_double").unwrap();
+/// text.replace_instruction_at(addr, /* b new_fn */)?;
+/// ```
+///
+/// `commit_to_bytes` consumes both scopes and runs the writer
+/// pipeline, producing a runnable byte stream.
 #[derive(Debug, Clone)]
-pub struct TextEditor {
+pub struct BinaryEditor {
+    /// Whole-binary editing state. Always present.
+    pub binary: BinaryState,
+    /// The currently-lifted text section, if any. Populated
+    /// by [`Self::lift_text_section`]. Section-scoped methods
+    /// (e.g. `replace_instruction_at`) live on
+    /// [`LiftedTextSection`] and are accessed via this field.
+    pub text: Option<LiftedTextSection>,
+}
+
+/// Backwards-compatible alias for the old name. New code
+/// should use [`BinaryEditor`].
+#[deprecated(
+    since = "0.1.0",
+    note = "renamed to BinaryEditor; use BinaryEditor::new(&container) or \
+            BinaryEditor::for_section(&container, name) (the old constructor) \
+            instead",
+)]
+pub type TextEditor = BinaryEditor;
+
+/// Whole-binary editing state.
+///
+/// Holds the working copy of the [`Container`] plus the
+/// queues / overrides accumulated by editor methods (appended
+/// functions, dynamic-tag updates, etc.). Every method here
+/// operates without needing a lifted text section.
+#[derive(Debug, Clone)]
+pub struct BinaryState {
     /// The container being edited. Mutated as functions are added
     /// (their symbols land in `container.symbols`); the existing
     /// section table and bytes stay otherwise unchanged until
-    /// [`Self::commit`] runs the layout pipeline.
+    /// [`BinaryEditor::commit`] runs the layout pipeline.
     container: Container,
-    /// Section id we're rewriting.
-    section_id: SectionId,
-    /// Base address the section loads at.
-    base_address: u64,
-    /// Decoded instructions for the section (cached so subsequent
-    /// edit operations don't re-disassemble).
-    instructions: Vec<DecodedInstruction>,
-    /// CFG built from the instructions; lift consumes both.
-    cfg: ControlFlowGraph,
-    /// The mutable plan. Edit primitives delegate to this.
-    plan: RewritePlan,
     /// Functions added via [`Self::add_function`]. Each entry is
     /// already laid out and emitted at its assigned virtual
     /// address; commit only needs to concatenate and append.
@@ -258,6 +295,35 @@ pub struct TextEditor {
     /// [`InitialiserPosition::Append`]. Resolved at commit
     /// time alongside (or instead of) the dynsym-export rebuild.
     pending_appended_init_slots: Vec<u64>,
+    /// Library names queued by [`Self::add_library_dependency`].
+    /// At commit time each name is appended to `.dynstr` and a
+    /// new `DT_NEEDED` tag is inserted into `.dynamic` pointing
+    /// at the new dynstr offset. The new `.dynstr` lives in the
+    /// appended segment (via the same machinery the export path
+    /// uses).
+    pending_library_deps: Vec<String>,
+}
+
+/// A text section lifted into editable IR form.
+///
+/// Created by [`BinaryEditor::lift_text_section`]; modified by
+/// section-scoped methods (`redirect_branch_at`,
+/// `replace_instruction_at`, etc.). Lives in
+/// [`BinaryEditor::text`] so the parent editor can hold `&mut`
+/// references to both scopes via destructuring.
+#[derive(Debug, Clone)]
+pub struct LiftedTextSection {
+    /// Section id we're rewriting.
+    section_id: SectionId,
+    /// Base address the section loads at.
+    base_address: u64,
+    /// Decoded instructions for the section (cached so subsequent
+    /// edit operations don't re-disassemble).
+    instructions: Vec<DecodedInstruction>,
+    /// CFG built from the instructions; lift consumes both.
+    cfg: ControlFlowGraph,
+    /// The mutable plan. Edit primitives delegate to this.
+    plan: RewritePlan,
 }
 
 /// Cumulative state for functions appended via
@@ -343,14 +409,36 @@ struct ExportedSymbol {
     size: u64,
 }
 
-impl TextEditor {
-    /// Lift the named text section of `container` into an editor.
+impl BinaryEditor {
+    /// Construct a new editor over `container` without lifting any
+    /// text section. Use this when the only edits are
+    /// whole-binary (e.g. [`BinaryState::add_library_dependency`],
+    /// [`BinaryState::add_function`]).
+    pub fn new(container: &Container) -> Result<Self, TextEditorError> {
+        Ok(Self {
+            binary: BinaryState {
+                container: container.clone(),
+                appended: None,
+                section_overrides: Vec::new(),
+                pending_appended_init_slots: Vec::new(),
+                pending_library_deps: Vec::new(),
+            },
+            text: None,
+        })
+    }
+
+    /// Lift the named text section into the [`Self::text`] field
+    /// so its instructions are editable. Replaces any
+    /// previously-lifted section.
     ///
-    /// `name` is matched literally against `container.sections[i].name`.
-    /// The section must be a [`SectionKind::Text`](crate::container::SectionKind::Text);
+    /// `name` is matched literally against
+    /// `container.sections[i].name`. The section must be a
+    /// [`SectionKind::Text`](crate::container::SectionKind::Text);
     /// non-text sections return [`TextEditorError::SectionNotText`].
-    pub fn for_section(container: &Container, name: &str) -> Result<Self, TextEditorError> {
-        let section = container
+    pub fn lift_text_section(&mut self, name: &str) -> Result<(), TextEditorError> {
+        let section = self
+            .binary
+            .container
             .sections
             .iter()
             .find(|s| s.name == name)
@@ -364,21 +452,50 @@ impl TextEditor {
 
         let instructions = aarch64::disassemble_bytes(base, code)?;
         let cfg = build_cfg(&instructions);
-        let plan = RewritePlan::lift_with_container(&cfg, &instructions, container);
+        let plan = RewritePlan::lift_with_container(
+            &cfg,
+            &instructions,
+            &self.binary.container,
+        );
 
-        Ok(Self {
-            container: container.clone(),
+        self.text = Some(LiftedTextSection {
             section_id: section.id,
             base_address: base,
             instructions,
             cfg,
             plan,
-            appended: None,
-            section_overrides: Vec::new(),
-            pending_appended_init_slots: Vec::new(),
-        })
+        });
+        Ok(())
     }
 
+    /// Convenience constructor: build a new [`BinaryEditor`] and
+    /// lift the named text section in one step. Equivalent to
+    /// `BinaryEditor::new(container)?.lift_text_section(name)?`.
+    /// Preserved for callers migrating from the old `TextEditor::for_section`.
+    pub fn for_section(container: &Container, name: &str) -> Result<Self, TextEditorError> {
+        let mut editor = Self::new(container)?;
+        editor.lift_text_section(name)?;
+        Ok(editor)
+    }
+
+    /// Iterate over symbols defined in the lifted text section.
+    /// Useful for "edit every function in `.text`" workflows.
+    /// Panics if no text section has been lifted.
+    pub fn symbols_in_section(&self) -> impl Iterator<Item = &Symbol> + '_ {
+        let id = self
+            .text
+            .as_ref()
+            .expect("lift_text_section before symbols_in_section")
+            .section_id;
+        self.binary
+            .container
+            .symbols
+            .iter()
+            .filter(move |s| s.section == Some(id) && !s.is_undefined)
+    }
+}
+
+impl BinaryState {
     /// Look up a symbol by name. Returns the first defined or
     /// undefined symbol whose name matches exactly.
     ///
@@ -410,29 +527,23 @@ impl TextEditor {
             .ok_or_else(|| TextEditorError::SymbolNotFound(name.to_string()))
     }
 
-    /// Iterate over symbols defined in the section being edited.
-    /// Useful for "edit every function in `.text`" workflows.
-    pub fn symbols_in_section(&self) -> impl Iterator<Item = &Symbol> + '_ {
-        let id = self.section_id;
-        self.container
-            .symbols
-            .iter()
-            .filter(move |s| s.section == Some(id) && !s.is_undefined)
-    }
-
-    /// Address of the function symbol with this name, if it lives
-    /// in the section being edited. Convenience for "I want to
-    /// redirect the first instruction of `foo`."
+    /// Address of the *defined* function symbol with this name,
+    /// if any. Skips undefined / extern symbols (which have no
+    /// address in this binary). For binaries with at most one
+    /// defined `STT_FUNC` per name (the common case) this is the
+    /// natural "where does foo live?" lookup.
     pub fn function_address(&self, name: &str) -> Option<u64> {
         self.container
             .symbols
             .iter()
             .find(|s| {
-                s.name == name && s.kind == SymbolKind::Function && s.section == Some(self.section_id)
+                s.name == name && s.kind == SymbolKind::Function && !s.is_undefined
             })
             .map(|s| s.address)
     }
+}
 
+impl LiftedTextSection {
     /// Direct access to the underlying [`RewritePlan`]. Use this
     /// when you need to inspect or mutate the plan beyond what
     /// the editor's proxy methods expose.
@@ -462,6 +573,12 @@ impl TextEditor {
     /// Base virtual address of the edited section.
     pub fn base_address(&self) -> u64 {
         self.base_address
+    }
+
+    /// The section id this view edits. Lets callers correlate
+    /// with [`BinaryState::container`] for cross-cutting work.
+    pub fn section_id(&self) -> SectionId {
+        self.section_id
     }
 
     /// Redirect the branch instruction at `address` to a new
@@ -528,7 +645,9 @@ impl TextEditor {
         self.plan.remove_at_address(address)?;
         Ok(())
     }
+}
 
+impl BinaryState {
     /// Append a new function to the binary in a fresh executable
     /// segment.
     ///
@@ -1139,6 +1258,79 @@ impl TextEditor {
         Ok(symbol_id)
     }
 
+    /// Force the dynamic linker to load another shared library
+    /// when this one is loaded.
+    ///
+    /// Internally this appends `library_name` to a rebuilt
+    /// `.dynstr` (placed in the appended segment) and inserts
+    /// a new `DT_NEEDED` tag in `.dynamic` pointing at the new
+    /// string offset. The loader walks `DT_NEEDED` tags during
+    /// dependency resolution and `dlopen`s each one before
+    /// firing this library's constructors, so the named
+    /// library is guaranteed to be loaded — and its symbols
+    /// reachable through `dlsym(RTLD_DEFAULT, ...)` — by the
+    /// time any code in this library runs.
+    ///
+    /// `library_name` is the SONAME the loader should resolve
+    /// (e.g. `"libcurl.so.4"`, `"libfoo.so"`). If the host
+    /// also depends on the same library, the loader
+    /// deduplicates — adding a redundant dependency is a
+    /// no-op at runtime, just a few wasted bytes.
+    ///
+    /// ## Limits
+    ///
+    /// - Each new dependency consumes one trailing `DT_NULL`
+    ///   slot in `.dynamic`. If there aren't enough,
+    ///   [`TextEditorError::DynamicTooFull`] is returned.
+    ///   Growing `.dynamic` itself is future work.
+    /// - The library is added unconditionally to
+    ///   `DT_NEEDED`; there's no way to express weak deps,
+    ///   `RUNPATH`/`RPATH` overrides, or version requirements
+    ///   yet.
+    ///
+    /// ## API note
+    ///
+    /// This method lives on `TextEditor` for continuity with
+    /// the other `add_*` editor methods, even though it
+    /// doesn't touch the text section. The editor has
+    /// outgrown its name; treat it as a binary-level editor
+    /// that's reached via a text-section entry point.
+    pub fn add_library_dependency(
+        &mut self,
+        library_name: &str,
+    ) -> Result<(), TextEditorError> {
+        if !matches!(
+            self.container.kind,
+            crate::container::ContainerKind::SharedObject
+                | crate::container::ContainerKind::Executable,
+        ) {
+            return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
+        }
+        // Cheap up-front check: each new dep needs one DT_NULL.
+        // Combined with anything already queued plus what other
+        // editor methods (Stage-B init array) may consume.
+        let image = self
+            .container
+            .elf_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let null_count = image
+            .dynamic
+            .iter()
+            .filter(|e| e.tag == object::elf::DT_NULL as u64)
+            .count();
+        // Reserve one DT_NULL as the terminator. Each previously
+        // queued dep consumed one, this one takes one more.
+        let already_queued = self.pending_library_deps.len();
+        if null_count <= already_queued + 1 + 1 {
+            return Err(TextEditorError::DynamicTooFull {
+                needed: already_queued + 2,
+            });
+        }
+        self.pending_library_deps.push(library_name.to_string());
+        Ok(())
+    }
+
     /// Run the layout + emit + commit pipeline and return the
     /// rewritten container.
     ///
@@ -1155,104 +1347,18 @@ impl TextEditor {
     /// On any failure (layout, emit, encoding) the editor's state
     /// is consumed and the error is returned; recovering and
     /// retrying requires constructing a fresh editor.
-    pub fn commit(self) -> Result<Container, TextEditorError> {
-        let layout = lay_out(&self.plan, self.base_address, Some(&self.container))?;
-        let output: EmitOutput = emit(&self.plan, &layout, Some(&self.container))?;
-        let edited = commit_to_container(&self.container, self.section_id, output);
-        Ok(edited)
-    }
-
-    /// Like [`Self::commit`] but also serializes the resulting
-    /// container to bytes. Convenience for the common case where
-    /// the caller wants a runnable `.so`/`.o` blob immediately.
-    ///
-    /// When functions were registered via [`Self::add_function`],
-    /// this drives the elf_writer's append-segment path so the
-    /// new functions land in a fresh PT_LOAD R-X segment beyond
-    /// the input's mapped range.
-    pub fn commit_to_bytes(self) -> Result<Vec<u8>, TextEditorError> {
-        match self.appended {
-            None => {
-                // No appended functions — straightforward path.
-                let edited = self.commit_in_place()?;
-                edited.to_bytes().map_err(TextEditorError::from)
-            }
-            Some(appended) => {
-                // Run the in-place layout/emit for the existing
-                // section so any branch redirects to new functions
-                // get folded against the (already-updated)
-                // symbol table.
-                let layout = lay_out(&self.plan, self.base_address, Some(&self.container))?;
-                let output = emit(&self.plan, &layout, Some(&self.container))?;
-                let updated = commit_to_container(&self.container, self.section_id, output);
-
-                let image = updated
-                    .elf_image
-                    .as_ref()
-                    .ok_or(TextEditorError::AppendMissingElfImage)?
-                    .clone();
-                let mut overrides = std::collections::HashMap::new();
-                let section_index = self.section_id.0;
-                overrides.insert(
-                    section_index,
-                    updated.sections[section_index].bytes.clone(),
-                );
-                // Apply any queued whole-section overrides
-                // (e.g. .rela.dyn rewritten by add_initialiser).
-                // Insert in order so later queues win on the same
-                // section index.
-                for (idx, bytes) in &self.section_overrides {
-                    overrides.insert(*idx, bytes.clone());
-                }
-
-                // If exports were registered, extend the dynsym
-                // family and pack the new copies into the
-                // appended segment at the end. This produces
-                // additional bytes that follow the function/data
-                // bodies.
-                let mut segment_bytes = if appended.exports.is_empty() {
-                    appended.bytes.clone()
-                } else {
-                    Self::extend_segment_for_exports(
-                        appended.segment_vaddr,
-                        &appended.bytes,
-                        &appended.exports,
-                        &image,
-                        &updated,
-                        &mut overrides,
-                    )?
-                };
-                // If add_initialiser(Append) was called, extend
-                // the segment with a rebuilt .init_array (and
-                // matching .rela.dyn) and stage the .dynamic
-                // tag updates that point the loader at them.
-                if !self.pending_appended_init_slots.is_empty() {
-                    segment_bytes = Self::extend_segment_for_appended_init_slots(
-                        appended.segment_vaddr,
-                        segment_bytes,
-                        &self.pending_appended_init_slots,
-                        &image,
-                        &updated,
-                        &mut overrides,
-                    )?;
-                }
-                let segment = crate::container::elf_writer::AppendedSegment::new(
-                    appended.segment_vaddr,
-                    segment_bytes,
-                );
-                crate::container::elf_writer::write_with_appended_segment_inner(
-                    &updated, &image, segment, overrides,
-                )
-                .map_err(TextEditorError::from)
-            }
-        }
-    }
-
     /// Pack extended `.dynsym` / `.dynstr` / `.gnu.version` /
     /// `.gnu.hash` blobs into the appended segment after the
     /// existing bytes, and stage a section-bytes override for
     /// `.dynamic` so its DT_SYMTAB / DT_STRTAB / DT_STRSZ /
     /// DT_GNU_HASH / DT_VERSYM tags follow the new copies.
+    /// Also handles library dependencies (`add_library_dependency`):
+    /// each dep name is appended to `.dynstr` and a new
+    /// `DT_NEEDED` tag is inserted into `.dynamic`.
+    ///
+    /// Either `exports` or `library_deps` may be empty; at
+    /// least one must be non-empty when this is called (the
+    /// caller gates on that).
     ///
     /// Returns the extended segment bytes. The original `.dynsym`
     /// etc. sections in the file stay in place but become
@@ -1262,6 +1368,7 @@ impl TextEditor {
         segment_vaddr: u64,
         existing_segment_bytes: &[u8],
         exports: &[ExportedSymbol],
+        library_deps: &[String],
         image: &crate::container::ElfImage,
         container: &Container,
         overrides: &mut std::collections::HashMap<usize, Vec<u8>>,
@@ -1320,66 +1427,96 @@ impl TextEditor {
             versym_bytes = dx::append_gnu_versym(&versym_bytes, 1);
         }
 
-        // Rebuild .gnu.hash from the full extended dynsym.
-        // symbol_base is the index of the first hashable entry in
-        // the source dynsym (read it from the existing .gnu.hash
-        // header).
-        let source_gnu_hash = image
-            .gnu_hash
-            .as_ref()
-            .ok_or(TextEditorError::AppendMissingElfImage)?;
-        if source_gnu_hash.bytes.len() < 16 {
-            return Err(TextEditorError::AppendMissingElfImage);
+        // Library dependencies: append each name to .dynstr;
+        // collect the resulting offsets so we can insert one
+        // DT_NEEDED tag per dep below.
+        let mut dt_needed_offsets: Vec<u32> = Vec::with_capacity(library_deps.len());
+        for dep in library_deps {
+            let (name_offset, new_dynstr) = dx::append_dynstr(&dynstr_bytes, dep);
+            dynstr_bytes = new_dynstr;
+            dt_needed_offsets.push(name_offset);
         }
-        let symbol_base = u32::from_le_bytes(
-            source_gnu_hash.bytes[4..8].try_into().unwrap(),
-        );
 
-        let hashable: Vec<gnu_hash::HashableSymbol<'_>> = dynsym_entries
-            .iter()
-            .enumerate()
-            .skip(symbol_base as usize)
-            .map(|(i, entry)| {
-                let name = name_at_offset(&dynstr_bytes, entry.st_name);
-                gnu_hash::HashableSymbol {
-                    dynsym_index: i as u32,
-                    name,
-                }
-            })
-            .collect();
-
-        // nbuckets=1 keeps the layout invariant simple regardless
-        // of where new exports land. bloom_size=1 (one 64-bit
-        // word) is fine for small export sets; bloom_shift=6
-        // matches what GNU emits for ELF64.
-        let new_gnu_hash_bytes =
-            gnu_hash::build_gnu_hash(&hashable, symbol_base, 1, 1, 6);
-        let new_dynsym_bytes = dx::encode_dynsym(&dynsym_entries);
-
-        // Pack the four blobs into the segment with appropriate
-        // alignment. Order: existing segment content → dynsym →
-        // dynstr → versym → gnu_hash. dynsym and gnu_hash align
-        // to 8; versym aligns to 2; dynstr aligns to 1.
+        // Pack the segment. The dynsym/gnu_hash/versym rebuild
+        // is only needed when there are exports; for a deps-
+        // only call we only repack .dynstr and update the
+        // dynamic tags.
         let mut segment_bytes = existing_segment_bytes.to_vec();
-
-        let dynsym_vaddr = pack(&mut segment_bytes, segment_vaddr, &new_dynsym_bytes, 8);
-        let dynstr_vaddr = pack(&mut segment_bytes, segment_vaddr, &dynstr_bytes, 1);
-        let versym_vaddr = pack(&mut segment_bytes, segment_vaddr, &versym_bytes, 2);
-        let gnu_hash_vaddr =
-            pack(&mut segment_bytes, segment_vaddr, &new_gnu_hash_bytes, 8);
-
-        // Build a fresh .dynamic tag list pointing at the new
-        // copies. We update the address-bearing tags and DT_STRSZ
-        // (since dynstr grew).
         use object::elf::*;
-        let updates: &[(u64, u64)] = &[
-            (DT_SYMTAB as u64, dynsym_vaddr),
-            (DT_STRTAB as u64, dynstr_vaddr),
-            (DT_STRSZ as u64, dynstr_bytes.len() as u64),
-            (DT_GNU_HASH as u64, gnu_hash_vaddr),
-            (DT_VERSYM as u64, versym_vaddr),
-        ];
-        let new_dynamic_entries = dx::update_dynamic_tags(&image.dynamic, updates);
+        let mut tag_updates: Vec<(u64, u64)> = Vec::new();
+
+        if !exports.is_empty() {
+            // Rebuild .gnu.hash from the full extended dynsym.
+            // symbol_base is the index of the first hashable
+            // entry in the source dynsym (read it from the
+            // existing .gnu.hash header).
+            let source_gnu_hash = image
+                .gnu_hash
+                .as_ref()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            if source_gnu_hash.bytes.len() < 16 {
+                return Err(TextEditorError::AppendMissingElfImage);
+            }
+            let symbol_base = u32::from_le_bytes(
+                source_gnu_hash.bytes[4..8].try_into().unwrap(),
+            );
+
+            let hashable: Vec<gnu_hash::HashableSymbol<'_>> = dynsym_entries
+                .iter()
+                .enumerate()
+                .skip(symbol_base as usize)
+                .map(|(i, entry)| {
+                    let name = name_at_offset(&dynstr_bytes, entry.st_name);
+                    gnu_hash::HashableSymbol {
+                        dynsym_index: i as u32,
+                        name,
+                    }
+                })
+                .collect();
+
+            // nbuckets=1 keeps the layout invariant simple
+            // regardless of where new exports land. bloom_size=1
+            // (one 64-bit word) is fine for small export sets;
+            // bloom_shift=6 matches what GNU emits for ELF64.
+            let new_gnu_hash_bytes =
+                gnu_hash::build_gnu_hash(&hashable, symbol_base, 1, 1, 6);
+            let new_dynsym_bytes = dx::encode_dynsym(&dynsym_entries);
+
+            // Order: existing segment content → dynsym →
+            // dynstr → versym → gnu_hash.
+            let dynsym_vaddr = pack(&mut segment_bytes, segment_vaddr, &new_dynsym_bytes, 8);
+            let dynstr_vaddr = pack(&mut segment_bytes, segment_vaddr, &dynstr_bytes, 1);
+            let versym_vaddr = pack(&mut segment_bytes, segment_vaddr, &versym_bytes, 2);
+            let gnu_hash_vaddr =
+                pack(&mut segment_bytes, segment_vaddr, &new_gnu_hash_bytes, 8);
+
+            tag_updates.extend_from_slice(&[
+                (DT_SYMTAB as u64, dynsym_vaddr),
+                (DT_STRTAB as u64, dynstr_vaddr),
+                (DT_STRSZ as u64, dynstr_bytes.len() as u64),
+                (DT_GNU_HASH as u64, gnu_hash_vaddr),
+                (DT_VERSYM as u64, versym_vaddr),
+            ]);
+        } else {
+            // Deps-only path: only `.dynstr` got new bytes.
+            let dynstr_vaddr = pack(&mut segment_bytes, segment_vaddr, &dynstr_bytes, 1);
+            tag_updates.extend_from_slice(&[
+                (DT_STRTAB as u64, dynstr_vaddr),
+                (DT_STRSZ as u64, dynstr_bytes.len() as u64),
+            ]);
+        }
+
+        let mut new_dynamic_entries = dx::update_dynamic_tags(&image.dynamic, &tag_updates);
+        if !dt_needed_offsets.is_empty() {
+            let additions: Vec<(u64, u64)> = dt_needed_offsets
+                .iter()
+                .map(|&off| (DT_NEEDED as u64, off as u64))
+                .collect();
+            new_dynamic_entries = dx::insert_dynamic_tags(&new_dynamic_entries, &additions)
+                .ok_or(TextEditorError::DynamicTooFull {
+                    needed: additions.len(),
+                })?;
+        }
         let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries);
 
         // Stage the .dynamic override. Find its section index in
@@ -1570,9 +1707,20 @@ impl TextEditor {
             .unwrap_or(0);
         let new_relacount = original_relacount + added_slot_count as u64;
 
-        // Update or insert .dynamic tags.
-        let has_init_array_tag = image
-            .dynamic
+        // Update or insert .dynamic tags. If the dynsym/deps
+        // path already staged a .dynamic override, chain off
+        // that — otherwise we'd lose its DT_NEEDED additions
+        // when we re-encode from `image.dynamic`.
+        let dynamic_index = container
+            .sections
+            .iter()
+            .position(|s| s.name == ".dynamic")
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let starting_dynamic: Vec<crate::container::DynamicEntry> = match overrides.get(&dynamic_index) {
+            Some(bytes) => dx::parse_dynamic(bytes),
+            None => image.dynamic.clone(),
+        };
+        let has_init_array_tag = starting_dynamic
             .iter()
             .any(|e| e.tag == DT_INIT_ARRAY as u64);
         let updates: &[(u64, u64)] = &[
@@ -1585,7 +1733,7 @@ impl TextEditor {
             (DT_INIT_ARRAY as u64, new_init_array_vaddr),
             (DT_INIT_ARRAYSZ as u64, new_init_array_size),
         ];
-        let mut new_dynamic_entries = dx::update_dynamic_tags(&image.dynamic, updates);
+        let mut new_dynamic_entries = dx::update_dynamic_tags(&starting_dynamic, updates);
         if !has_init_array_tag {
             // Need to actually add the tags rather than rely on
             // update_dynamic_tags (which only modifies
@@ -1601,11 +1749,6 @@ impl TextEditor {
                 )?;
         }
         let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries);
-        let dynamic_index = container
-            .sections
-            .iter()
-            .position(|s| s.name == ".dynamic")
-            .ok_or(TextEditorError::AppendMissingElfImage)?;
         overrides.insert(dynamic_index, new_dynamic_bytes);
 
         // We've placed a new .rela.dyn in the appended segment
@@ -1639,15 +1782,180 @@ impl TextEditor {
         Ok(segment_bytes)
     }
 
-    /// In-place commit (no appended functions). Same as
-    /// [`Self::commit`] without consuming `appended`. Used
-    /// internally; not exposed because callers already have
-    /// `commit` for this case.
-    fn commit_in_place(self) -> Result<Container, TextEditorError> {
-        let layout = lay_out(&self.plan, self.base_address, Some(&self.container))?;
-        let output: EmitOutput = emit(&self.plan, &layout, Some(&self.container))?;
-        let edited = commit_to_container(&self.container, self.section_id, output);
+}
+
+impl BinaryEditor {
+    /// Run the layout + emit + commit pipeline and return the
+    /// rewritten container.
+    ///
+    /// The returned container can be serialized via
+    /// [`Container::to_bytes`] to obtain a runnable byte stream
+    /// — when no functions were appended via
+    /// [`BinaryState::add_function`]. In the appended-function
+    /// case, the returned container's `to_bytes` would *not*
+    /// include the appended segment (the neutral container
+    /// model has no slot for it). Callers who appended functions
+    /// should use [`Self::commit_to_bytes`] instead, which drives
+    /// the writer path that emits the new segment.
+    ///
+    /// On any failure (layout, emit, encoding) the editor's state
+    /// is consumed and the error is returned; recovering and
+    /// retrying requires constructing a fresh editor.
+    pub fn commit(self) -> Result<Container, TextEditorError> {
+        let text = self
+            .text
+            .ok_or_else(|| TextEditorError::SectionNotFound(
+                "<no lifted text section; call lift_text_section before commit>".into(),
+            ))?;
+        let layout = lay_out(&text.plan, text.base_address, Some(&self.binary.container))?;
+        let output: EmitOutput =
+            emit(&text.plan, &layout, Some(&self.binary.container))?;
+        let edited = commit_to_container(&self.binary.container, text.section_id, output);
         Ok(edited)
+    }
+
+    /// Like [`Self::commit`] but also serializes the resulting
+    /// container to bytes. Convenience for the common case where
+    /// the caller wants a runnable `.so`/`.o` blob immediately.
+    ///
+    /// When functions were registered via
+    /// [`BinaryState::add_function`], this drives the elf_writer's
+    /// append-segment path so the new functions land in a fresh
+    /// PT_LOAD segment beyond the input's mapped range.
+    ///
+    /// Callers who only used whole-binary methods (e.g. just
+    /// [`BinaryState::add_library_dependency`]) without lifting a
+    /// text section can call this directly — the in-section
+    /// rewrite phase is skipped when no text section is present.
+    pub fn commit_to_bytes(mut self) -> Result<Vec<u8>, TextEditorError> {
+        // Library-dep additions need to land in the appended
+        // segment (they grow `.dynstr`, which can't grow in
+        // place). If a caller used only `add_library_dependency`
+        // and no `add_function` / `add_data`, lazily initialise
+        // an empty appended segment so the override-supporting
+        // writer path runs.
+        if self.binary.appended.is_none() && !self.binary.pending_library_deps.is_empty() {
+            let image = self
+                .binary
+                .container
+                .elf_image
+                .as_ref()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            let max_input_vaddr = image
+                .program_headers
+                .iter()
+                .filter(|p| p.p_type == object::elf::PT_LOAD)
+                .map(|p| p.p_vaddr.saturating_add(p.p_memsz))
+                .max()
+                .unwrap_or(0);
+            const PAGE: u64 = 0x10000;
+            let aligned = (max_input_vaddr + PAGE - 1) & !(PAGE - 1);
+            self.binary.appended = Some(AppendedFunctionsState {
+                segment_vaddr: aligned.max(PAGE),
+                bytes: Vec::new(),
+                exports: Vec::new(),
+            });
+        }
+        // Take the lifted section and the binary state out so
+        // we can consume both.
+        let BinaryEditor { binary, text } = self;
+        match binary.appended {
+            None => {
+                // No appended functions — straightforward path.
+                // Requires a lifted text section (otherwise
+                // there's nothing to commit and no edits to make).
+                let text = text.ok_or_else(|| TextEditorError::SectionNotFound(
+                    "<no lifted text section and no whole-binary edits to commit>".into(),
+                ))?;
+                let layout = lay_out(&text.plan, text.base_address, Some(&binary.container))?;
+                let output: EmitOutput =
+                    emit(&text.plan, &layout, Some(&binary.container))?;
+                let edited = commit_to_container(&binary.container, text.section_id, output);
+                edited.to_bytes().map_err(TextEditorError::from)
+            }
+            Some(appended) => {
+                // Run the in-place layout/emit for the lifted
+                // section (if any) so branch redirects to new
+                // functions get folded against the
+                // (already-updated) symbol table. If no section
+                // was lifted, skip in-section rewriting — only
+                // whole-binary edits land.
+                let mut overrides = std::collections::HashMap::new();
+                let updated = match text {
+                    Some(text) => {
+                        let layout =
+                            lay_out(&text.plan, text.base_address, Some(&binary.container))?;
+                        let output =
+                            emit(&text.plan, &layout, Some(&binary.container))?;
+                        let updated =
+                            commit_to_container(&binary.container, text.section_id, output);
+                        let section_index = text.section_id.0;
+                        overrides.insert(
+                            section_index,
+                            updated.sections[section_index].bytes.clone(),
+                        );
+                        updated
+                    }
+                    None => binary.container.clone(),
+                };
+
+                let image = updated
+                    .elf_image
+                    .as_ref()
+                    .ok_or(TextEditorError::AppendMissingElfImage)?
+                    .clone();
+
+                // Apply any queued whole-section overrides
+                // (e.g. .rela.dyn rewritten by add_initialiser).
+                // Insert in order so later queues win on the same
+                // section index.
+                for (idx, bytes) in &binary.section_overrides {
+                    overrides.insert(*idx, bytes.clone());
+                }
+
+                // If exports or library dependencies were
+                // registered, extend the dynsym family / dynstr
+                // and pack the new copies into the appended
+                // segment at the end.
+                let needs_dynsym_dynstr_rebuild = !appended.exports.is_empty()
+                    || !binary.pending_library_deps.is_empty();
+                let mut segment_bytes = if !needs_dynsym_dynstr_rebuild {
+                    appended.bytes.clone()
+                } else {
+                    BinaryState::extend_segment_for_exports(
+                        appended.segment_vaddr,
+                        &appended.bytes,
+                        &appended.exports,
+                        &binary.pending_library_deps,
+                        &image,
+                        &updated,
+                        &mut overrides,
+                    )?
+                };
+                // If add_initialiser(Append) was called, extend
+                // the segment with a rebuilt .init_array (and
+                // matching .rela.dyn) and stage the .dynamic
+                // tag updates that point the loader at them.
+                if !binary.pending_appended_init_slots.is_empty() {
+                    segment_bytes = BinaryState::extend_segment_for_appended_init_slots(
+                        appended.segment_vaddr,
+                        segment_bytes,
+                        &binary.pending_appended_init_slots,
+                        &image,
+                        &updated,
+                        &mut overrides,
+                    )?;
+                }
+                let segment = crate::container::elf_writer::AppendedSegment::new(
+                    appended.segment_vaddr,
+                    segment_bytes,
+                );
+                crate::container::elf_writer::write_with_appended_segment_inner(
+                    &updated, &image, segment, overrides,
+                )
+                .map_err(TextEditorError::from)
+            }
+        }
     }
 }
 

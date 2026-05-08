@@ -32,7 +32,7 @@
 use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{self, DecodedOperand};
 use armv8_encode::rewrite::{
-    InitialiserPosition, RewriteInstruction, RewriteOperand, Target, TextEditor,
+    BinaryEditor, InitialiserPosition, RewriteInstruction, RewriteOperand, Target,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -52,9 +52,10 @@ fn main() -> ExitCode {
     let bytes = std::fs::read(&lib_path).expect("read libgreet.so");
     let container = Container::from_bytes(&bytes).expect("parse libgreet.so");
 
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     let marker_id = editor
+        .binary
         .symbol_by_name("greet_ctor_marker")
         .expect("greet_ctor_marker should be defined in libgreet.so");
     println!(
@@ -104,6 +105,7 @@ fn main() -> ExitCode {
     // greet_ctor). Switch to ::Last to insert just before the
     // final ctor only.
     let user_body_id = editor
+        .binary
         .add_initialiser(
             "greet_appended_init",
             body,

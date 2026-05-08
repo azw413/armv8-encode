@@ -1,5 +1,5 @@
-//! Tests for the [`TextEditor`] convenience API. The editor is a
-//! thin wrapper over the rewrite-layer primitives; these tests
+//! Tests for the [`BinaryEditor`] convenience API. The editor is
+//! a thin wrapper over the rewrite-layer primitives; these tests
 //! cover the wrapping itself (error mapping, lookups, the
 //! commit-pipeline plumbing) rather than rewrite semantics, which
 //! [`crate::tests::rewrite`] covers.
@@ -9,7 +9,7 @@ use crate::container::{
     Symbol, SymbolBinding, SymbolId, SymbolKind,
 };
 use crate::isa::aarch64::{self, Aarch64Mnemonic};
-use crate::rewrite::{Target, TextEditor, TextEditorError};
+use crate::rewrite::{BinaryEditor, Target, TextEditorError};
 
 /// Build a tiny ELF ET_REL container with a `.text` section
 /// containing two instructions and one defined function symbol.
@@ -69,17 +69,18 @@ fn fixture_container() -> Container {
 #[test]
 fn for_section_finds_named_text_section_and_lifts_it() {
     let container = fixture_container();
-    let editor = TextEditor::for_section(&container, ".text").expect("for_section");
-    assert_eq!(editor.base_address(), 0x1000);
-    assert_eq!(editor.instructions().len(), 2);
-    assert_eq!(editor.instructions()[0].mnemonic, Aarch64Mnemonic::Bl);
-    assert_eq!(editor.instructions()[1].mnemonic, Aarch64Mnemonic::Ret);
+    let editor = BinaryEditor::for_section(&container, ".text").expect("for_section");
+    let text = editor.text.as_ref().expect("text lifted");
+    assert_eq!(text.base_address(), 0x1000);
+    assert_eq!(text.instructions().len(), 2);
+    assert_eq!(text.instructions()[0].mnemonic, Aarch64Mnemonic::Bl);
+    assert_eq!(text.instructions()[1].mnemonic, Aarch64Mnemonic::Ret);
 }
 
 #[test]
 fn for_section_reports_missing_section_cleanly() {
     let container = fixture_container();
-    match TextEditor::for_section(&container, ".no_such_section") {
+    match BinaryEditor::for_section(&container, ".no_such_section") {
         Err(TextEditorError::SectionNotFound(name)) => {
             assert_eq!(name, ".no_such_section");
         }
@@ -101,7 +102,7 @@ fn for_section_rejects_non_text_sections() {
         flags: None,
         raw_sh_type: None,
     });
-    match TextEditor::for_section(&container, ".rodata") {
+    match BinaryEditor::for_section(&container, ".rodata") {
         Err(TextEditorError::SectionNotText { name }) => assert_eq!(name, ".rodata"),
         other => panic!("expected SectionNotText, got {other:?}"),
     }
@@ -110,10 +111,10 @@ fn for_section_rejects_non_text_sections() {
 #[test]
 fn symbol_by_name_resolves_known_symbols() {
     let container = fixture_container();
-    let editor = TextEditor::for_section(&container, ".text").unwrap();
-    assert_eq!(editor.symbol_by_name("main").unwrap(), SymbolId(0));
-    assert_eq!(editor.symbol_by_name("printf").unwrap(), SymbolId(1));
-    match editor.symbol_by_name("missing") {
+    let editor = BinaryEditor::for_section(&container, ".text").unwrap();
+    assert_eq!(editor.binary.symbol_by_name("main").unwrap(), SymbolId(0));
+    assert_eq!(editor.binary.symbol_by_name("printf").unwrap(), SymbolId(1));
+    match editor.binary.symbol_by_name("missing") {
         Err(TextEditorError::SymbolNotFound(name)) => assert_eq!(name, "missing"),
         other => panic!("expected SymbolNotFound, got {other:?}"),
     }
@@ -136,28 +137,28 @@ fn function_by_name_filters_to_function_kind() {
         is_undefined: false,
         flags: None,
     });
-    let editor = TextEditor::for_section(&container, ".text").unwrap();
-    assert_eq!(editor.function_by_name("main").unwrap(), SymbolId(0));
-    match editor.function_by_name("data_named_main") {
+    let editor = BinaryEditor::for_section(&container, ".text").unwrap();
+    assert_eq!(editor.binary.function_by_name("main").unwrap(), SymbolId(0));
+    match editor.binary.function_by_name("data_named_main") {
         Err(TextEditorError::SymbolNotFound(_)) => {}
         other => panic!("expected SymbolNotFound for OBJECT symbol, got {other:?}"),
     }
 }
 
 #[test]
-fn function_address_returns_address_when_in_section() {
+fn function_address_returns_address_for_defined_function() {
     let container = fixture_container();
-    let editor = TextEditor::for_section(&container, ".text").unwrap();
-    assert_eq!(editor.function_address("main"), Some(0x1000));
-    // printf is undefined and has section=None, so it isn't "in" the section.
-    assert_eq!(editor.function_address("printf"), None);
-    assert_eq!(editor.function_address("nope"), None);
+    let editor = BinaryEditor::for_section(&container, ".text").unwrap();
+    assert_eq!(editor.binary.function_address("main"), Some(0x1000));
+    // printf is undefined, so function_address skips it.
+    assert_eq!(editor.binary.function_address("printf"), None);
+    assert_eq!(editor.binary.function_address("nope"), None);
 }
 
 #[test]
 fn symbols_in_section_lists_only_defined_symbols_in_target_section() {
     let container = fixture_container();
-    let editor = TextEditor::for_section(&container, ".text").unwrap();
+    let editor = BinaryEditor::for_section(&container, ".text").unwrap();
     let names: Vec<_> = editor.symbols_in_section().map(|s| s.name.as_str()).collect();
     // Only `main` is defined in `.text`. `printf` is undefined,
     // so it's excluded.
@@ -167,12 +168,15 @@ fn symbols_in_section_lists_only_defined_symbols_in_target_section() {
 #[test]
 fn redirect_branch_at_proxies_through_to_plan() {
     let container = fixture_container();
-    let mut editor = TextEditor::for_section(&container, ".text").unwrap();
-    let printf = editor.symbol_by_name("printf").unwrap();
+    let mut editor = BinaryEditor::for_section(&container, ".text").unwrap();
+    let printf = editor.binary.symbol_by_name("printf").unwrap();
 
     // The bl at 0x1000 originally targets 0x1004. Redirect it to
     // the printf extern.
     editor
+        .text
+        .as_mut()
+        .unwrap()
         .redirect_branch_at(0x1000, Target::Symbol(printf))
         .expect("redirect_branch_at");
 
@@ -189,8 +193,13 @@ fn redirect_branch_at_proxies_through_to_plan() {
 #[test]
 fn redirect_branch_at_unknown_address_returns_edit_error() {
     let container = fixture_container();
-    let mut editor = TextEditor::for_section(&container, ".text").unwrap();
-    match editor.redirect_branch_at(0xdeadbeef, Target::Absolute(0)) {
+    let mut editor = BinaryEditor::for_section(&container, ".text").unwrap();
+    match editor
+        .text
+        .as_mut()
+        .unwrap()
+        .redirect_branch_at(0xdeadbeef, Target::Absolute(0))
+    {
         Err(TextEditorError::Edit(_)) => {}
         other => panic!("expected Edit error, got {other:?}"),
     }
@@ -199,7 +208,7 @@ fn redirect_branch_at_unknown_address_returns_edit_error() {
 #[test]
 fn commit_returns_container_with_rewritten_text_section() {
     let container = fixture_container();
-    let editor = TextEditor::for_section(&container, ".text").unwrap();
+    let editor = BinaryEditor::for_section(&container, ".text").unwrap();
     // No edits — commit should produce a structurally-equivalent
     // container.
     let edited = editor.commit().expect("commit");
@@ -211,10 +220,10 @@ fn commit_returns_container_with_rewritten_text_section() {
 #[test]
 fn plan_mut_exposes_underlying_rewrite_plan_for_advanced_use() {
     let container = fixture_container();
-    let mut editor = TextEditor::for_section(&container, ".text").unwrap();
+    let mut editor = BinaryEditor::for_section(&container, ".text").unwrap();
     // Touch the plan via the escape hatch; the editor's commit
     // pipeline should still work.
-    let plan = editor.plan_mut();
+    let plan = editor.text.as_mut().unwrap().plan_mut();
     assert!(!plan.blocks.is_empty(), "plan should have at least one block");
     let _bytes = editor.commit_to_bytes().expect("commit_to_bytes after plan_mut");
 }

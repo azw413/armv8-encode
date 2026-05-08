@@ -48,7 +48,7 @@ use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{
     Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind, ShiftedRegister,
 };
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -69,7 +69,7 @@ fn main() -> ExitCode {
     println!("read {} bytes from {}", bytes.len(), lib_path.display());
 
     let container = Container::from_bytes(&bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     // ---------------------------------------------------------------
     // Build greet_quintuple(n) = n * 5.
@@ -118,6 +118,7 @@ fn main() -> ExitCode {
     //      gnu_hash and points .dynamic at the new copies.
     // ---------------------------------------------------------------
     let id = editor
+        .binary
         .add_function_exported("greet_quintuple", body)
         .expect("add_function_exported");
     println!(

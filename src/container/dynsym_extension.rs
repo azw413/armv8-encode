@@ -205,6 +205,24 @@ pub fn insert_dynamic_tags(
     Some(out)
 }
 
+/// Parse `.dynamic` bytes (Elf64_Dyn × N) back into a tag list.
+/// Inverse of [`encode_dynamic`]. Caller is responsible for
+/// the byte length being a multiple of 16.
+pub fn parse_dynamic(bytes: &[u8]) -> Vec<crate::container::DynamicEntry> {
+    use crate::container::DynamicEntry;
+    assert!(
+        bytes.len() % 16 == 0,
+        ".dynamic byte length must be a multiple of 16",
+    );
+    let mut out = Vec::with_capacity(bytes.len() / 16);
+    for chunk in bytes.chunks_exact(16) {
+        let tag = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        out.push(DynamicEntry { tag, value });
+    }
+    out
+}
+
 /// Encode a `.dynamic` tag list into bytes (Elf64_Dyn × N).
 /// Each entry is 16 bytes: u64 d_tag, u64 d_un.d_val.
 pub fn encode_dynamic(entries: &[crate::container::DynamicEntry]) -> Vec<u8> {

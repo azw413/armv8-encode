@@ -63,7 +63,7 @@ use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{
     Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind, ShiftedRegister,
 };
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -87,7 +87,7 @@ fn main() -> ExitCode {
     println!("read {} bytes from {}", bytes.len(), lib_path.display());
 
     let container = Container::from_bytes(&bytes).expect("parse libgreet.so");
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
 
     // ---------------------------------------------------------------
     // Step 1: build the new function as a list of RewriteInstructions.
@@ -143,6 +143,7 @@ fn main() -> ExitCode {
     // SymbolId we can use as a Target::Symbol elsewhere.
     // ---------------------------------------------------------------
     let quintuple_id = editor
+        .binary
         .add_function("greet_quintuple", new_function)
         .expect("add_function greet_quintuple");
     println!(
@@ -157,6 +158,7 @@ fn main() -> ExitCode {
     // the new branch, and land in greet_quintuple's body.
     // ---------------------------------------------------------------
     let greet_double_addr = editor
+        .binary
         .function_address("greet_double")
         .expect("greet_double symbol present");
     let tail_call = RewriteInstruction {
@@ -165,6 +167,9 @@ fn main() -> ExitCode {
         original_address: Some(greet_double_addr),
     };
     editor
+        .text
+        .as_mut()
+        .unwrap()
         .replace_instruction_at(greet_double_addr, tail_call)
         .expect("replace_instruction_at");
     println!(

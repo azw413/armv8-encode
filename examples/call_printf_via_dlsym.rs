@@ -38,7 +38,7 @@
 
 use armv8_encode::container::Container;
 use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
-use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -72,17 +72,20 @@ fn main() -> ExitCode {
         println!("confirmed: libgreet.so does NOT import printf");
     }
 
-    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
     let dlsym_id = editor
+        .binary
         .symbol_by_name("dlsym@GLIBC_2.34")
-        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
-        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .or_else(|_| editor.binary.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.binary.symbol_by_name("dlsym"))
         .expect("libgreet.so should import dlsym (see _greet_unused_dlsym_anchor)");
 
     let printf_name_id = editor
+        .binary
         .add_data("greet_printf_name", b"printf\0", 1)
         .expect("add_data printf_name");
     let format_id = editor
+        .binary
         .add_data(
             "greet_printf_format",
             b"appended printf says n=%d\n\0",
@@ -162,13 +165,18 @@ fn main() -> ExitCode {
         template(0xd65f03c0),    // ret
     ];
     let log_id = editor
+        .binary
         .add_function("greet_printf_double", body)
         .expect("add_function");
 
     let greet_double_addr = editor
+        .binary
         .function_address("greet_double")
         .expect("greet_double symbol");
     editor
+        .text
+        .as_mut()
+        .unwrap()
         .replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
