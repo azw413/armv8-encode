@@ -31,8 +31,10 @@
 //! ```
 
 mod dwarf;
+pub(crate) mod dynsym_extension;
 mod elf_image;
 pub(crate) mod elf_writer;
+pub(crate) mod gnu_hash;
 mod reader;
 mod types;
 mod writer;

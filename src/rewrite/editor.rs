@@ -213,6 +213,32 @@ struct AppendedFunctionsState {
     /// order. The function at `segment_vaddr + offset` lives at
     /// `bytes[offset..offset+len]`.
     bytes: Vec<u8>,
+    /// Functions registered with the dynamic linker via
+    /// [`TextEditor::add_function_exported`]. At commit time the
+    /// writer extends `.dynsym` / `.dynstr` / `.gnu.version` and
+    /// regenerates `.gnu.hash` to expose these for dlopen/dlsym.
+    /// Empty when callers only use the unexported `add_function`.
+    exports: Vec<ExportedSymbol>,
+}
+
+/// One symbol slated for promotion to a dynsym export at commit
+/// time. Created by [`TextEditor::add_function_exported`].
+#[derive(Debug, Clone)]
+struct ExportedSymbol {
+    /// Symbol id in the container's static `.symtab`. Reserved
+    /// for future cross-checks (e.g., refusing duplicate exports
+    /// of the same id); current commit path resolves by name and
+    /// vaddr only.
+    #[allow(dead_code)]
+    symbol_id: SymbolId,
+    /// Public name to write into `.dynstr`. Same string as the
+    /// symbol's static name today.
+    name: String,
+    /// Virtual address (assigned when add_function laid the
+    /// body out).
+    vaddr: u64,
+    /// Function size in bytes.
+    size: u64,
 }
 
 impl TextEditor {
@@ -500,6 +526,7 @@ impl TextEditor {
             let state = self.appended.get_or_insert(AppendedFunctionsState {
                 segment_vaddr,
                 bytes: Vec::new(),
+                exports: Vec::new(),
             });
             state.bytes.resize(cumulative_offset as usize, 0);
         }
@@ -538,9 +565,66 @@ impl TextEditor {
         let state = self.appended.get_or_insert(AppendedFunctionsState {
             segment_vaddr,
             bytes: Vec::new(),
+            exports: Vec::new(),
         });
         state.bytes.extend_from_slice(&output.bytes);
 
+        Ok(symbol_id)
+    }
+
+    /// Append a new function to the binary *and* expose it as a
+    /// dynamic export.
+    ///
+    /// Same shape as [`Self::add_function`], plus: the symbol is
+    /// promoted to the dynamic symbol table at commit time. After
+    /// linking, callers using `dlopen` + `dlsym(handle, name)`
+    /// (or another library linking against the rewritten one)
+    /// will resolve the new function by name.
+    ///
+    /// Promotion involves rebuilding `.dynsym`, `.dynstr`,
+    /// `.gnu.version`, and `.gnu.hash` and pointing the
+    /// `.dynamic` `DT_SYMTAB`/`DT_STRTAB`/`DT_GNU_HASH`/`DT_VERSYM`
+    /// tags at fresh copies placed in the appended segment. The
+    /// original copies stay in the file but become orphaned (the
+    /// loader follows the `.dynamic` tags, so they're inert).
+    ///
+    /// ## Limits
+    ///
+    /// - The new export is unversioned (versym = 1, the
+    ///   generic-base version). Versioned exports
+    ///   (`.gnu.version_d`-tracked) aren't yet supported.
+    /// - The export's binding is `STB_GLOBAL` and visibility is
+    ///   `STV_DEFAULT`. No way yet to mark it `STV_HIDDEN` or
+    ///   `STV_PROTECTED`.
+    /// - The regenerated `.gnu.hash` uses `nbuckets = 1` (every
+    ///   hashable dynsym entry chains in one bucket). Lookup
+    ///   stays fast for small export sets; large export counts
+    ///   may want a higher bucket count, which would require
+    ///   sorting dynsym by hash bucket and remapping indices in
+    ///   `.rela.plt` / `.rela.dyn` / `.gnu.version` — out of
+    ///   scope today.
+    pub fn add_function_exported(
+        &mut self,
+        name: &str,
+        instructions: Vec<RewriteInstruction>,
+    ) -> Result<SymbolId, TextEditorError> {
+        let symbol_id = self.add_function(name, instructions)?;
+        // The function symbol's vaddr/size were populated by
+        // add_function. Capture them for the dynsym promotion.
+        let symbol = self.container.symbol(symbol_id);
+        let export = ExportedSymbol {
+            symbol_id,
+            name: name.to_string(),
+            vaddr: symbol.address,
+            size: symbol.size,
+        };
+        // appended is guaranteed Some at this point — add_function
+        // initialises it on first call.
+        self.appended
+            .as_mut()
+            .expect("add_function leaves appended state populated")
+            .exports
+            .push(export);
         Ok(symbol_id)
     }
 
@@ -603,6 +687,7 @@ impl TextEditor {
         let state = self.appended.get_or_insert(AppendedFunctionsState {
             segment_vaddr,
             bytes: Vec::new(),
+            exports: Vec::new(),
         });
         let cumulative = state.bytes.len() as u64;
         let aligned_cumulative = if align <= 1 {
@@ -681,10 +766,6 @@ impl TextEditor {
                 let output = emit(&self.plan, &layout, Some(&self.container))?;
                 let updated = commit_to_container(&self.container, self.section_id, output);
 
-                // Drive the writer's append-segment path with the
-                // updated container, the rewritten section's bytes
-                // as a per-section override, and the appended
-                // bytes as the new segment.
                 let image = updated
                     .elf_image
                     .as_ref()
@@ -696,9 +777,27 @@ impl TextEditor {
                     section_index,
                     updated.sections[section_index].bytes.clone(),
                 );
+
+                // If exports were registered, extend the dynsym
+                // family and pack the new copies into the
+                // appended segment at the end. This produces
+                // additional bytes that follow the function/data
+                // bodies.
+                let segment_bytes = if appended.exports.is_empty() {
+                    appended.bytes.clone()
+                } else {
+                    Self::extend_segment_for_exports(
+                        appended.segment_vaddr,
+                        &appended.bytes,
+                        &appended.exports,
+                        &image,
+                        &updated,
+                        &mut overrides,
+                    )?
+                };
                 let segment = crate::container::elf_writer::AppendedSegment::new(
                     appended.segment_vaddr,
-                    appended.bytes,
+                    segment_bytes,
                 );
                 crate::container::elf_writer::write_with_appended_segment_inner(
                     &updated, &image, segment, overrides,
@@ -706,6 +805,152 @@ impl TextEditor {
                 .map_err(TextEditorError::from)
             }
         }
+    }
+
+    /// Pack extended `.dynsym` / `.dynstr` / `.gnu.version` /
+    /// `.gnu.hash` blobs into the appended segment after the
+    /// existing bytes, and stage a section-bytes override for
+    /// `.dynamic` so its DT_SYMTAB / DT_STRTAB / DT_STRSZ /
+    /// DT_GNU_HASH / DT_VERSYM tags follow the new copies.
+    ///
+    /// Returns the extended segment bytes. The original `.dynsym`
+    /// etc. sections in the file stay in place but become
+    /// orphaned — the dynamic linker follows the `.dynamic` tags
+    /// (by virtual address) and never reads them again.
+    fn extend_segment_for_exports(
+        segment_vaddr: u64,
+        existing_segment_bytes: &[u8],
+        exports: &[ExportedSymbol],
+        image: &crate::container::ElfImage,
+        container: &Container,
+        overrides: &mut std::collections::HashMap<usize, Vec<u8>>,
+    ) -> Result<Vec<u8>, TextEditorError> {
+        use crate::container::dynsym_extension as dx;
+        use crate::container::gnu_hash;
+
+        // Source blobs we need to extend. They're populated for
+        // any ET_DYN input the reader handled.
+        let source_dynsym = image
+            .dynsym
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let source_dynstr = image
+            .dynstr
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let source_versym = image
+            .gnu_versym
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+
+        // Walk source dynsym; we'll append one entry per export.
+        let mut dynsym_entries = dx::parse_dynsym(&source_dynsym.bytes);
+        let mut dynstr_bytes = source_dynstr.bytes.clone();
+        let mut versym_bytes = source_versym.bytes.clone();
+
+        // The shndx for the appended segment's section. We don't
+        // know its final section index until the writer emits;
+        // for now use 0 (SHN_UNDEF). The dynamic linker resolves
+        // exports by name + value, not by section index, so this
+        // is fine. Tools that walk by shndx may show "?" but
+        // dlopen/dlsym work.
+        let appended_shndx: u16 = 0;
+
+        for export in exports {
+            // Append the name to .dynstr.
+            let (name_offset, new_dynstr) = dx::append_dynstr(&dynstr_bytes, &export.name);
+            dynstr_bytes = new_dynstr;
+
+            // STB_GLOBAL << 4 | STT_FUNC = 0x12.
+            let st_info = (object::elf::STB_GLOBAL << 4) | object::elf::STT_FUNC;
+            // STV_DEFAULT visibility.
+            let st_other = object::elf::STV_DEFAULT;
+
+            dynsym_entries.push(dx::DynsymEntry {
+                st_name: name_offset,
+                st_info,
+                st_other,
+                st_shndx: appended_shndx,
+                st_value: export.vaddr,
+                st_size: export.size,
+            });
+
+            // versym: 1 = base version (unversioned but defined).
+            versym_bytes = dx::append_gnu_versym(&versym_bytes, 1);
+        }
+
+        // Rebuild .gnu.hash from the full extended dynsym.
+        // symbol_base is the index of the first hashable entry in
+        // the source dynsym (read it from the existing .gnu.hash
+        // header).
+        let source_gnu_hash = image
+            .gnu_hash
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        if source_gnu_hash.bytes.len() < 16 {
+            return Err(TextEditorError::AppendMissingElfImage);
+        }
+        let symbol_base = u32::from_le_bytes(
+            source_gnu_hash.bytes[4..8].try_into().unwrap(),
+        );
+
+        let hashable: Vec<gnu_hash::HashableSymbol<'_>> = dynsym_entries
+            .iter()
+            .enumerate()
+            .skip(symbol_base as usize)
+            .map(|(i, entry)| {
+                let name = name_at_offset(&dynstr_bytes, entry.st_name);
+                gnu_hash::HashableSymbol {
+                    dynsym_index: i as u32,
+                    name,
+                }
+            })
+            .collect();
+
+        // nbuckets=1 keeps the layout invariant simple regardless
+        // of where new exports land. bloom_size=1 (one 64-bit
+        // word) is fine for small export sets; bloom_shift=6
+        // matches what GNU emits for ELF64.
+        let new_gnu_hash_bytes =
+            gnu_hash::build_gnu_hash(&hashable, symbol_base, 1, 1, 6);
+        let new_dynsym_bytes = dx::encode_dynsym(&dynsym_entries);
+
+        // Pack the four blobs into the segment with appropriate
+        // alignment. Order: existing segment content → dynsym →
+        // dynstr → versym → gnu_hash. dynsym and gnu_hash align
+        // to 8; versym aligns to 2; dynstr aligns to 1.
+        let mut segment_bytes = existing_segment_bytes.to_vec();
+
+        let dynsym_vaddr = pack(&mut segment_bytes, segment_vaddr, &new_dynsym_bytes, 8);
+        let dynstr_vaddr = pack(&mut segment_bytes, segment_vaddr, &dynstr_bytes, 1);
+        let versym_vaddr = pack(&mut segment_bytes, segment_vaddr, &versym_bytes, 2);
+        let gnu_hash_vaddr =
+            pack(&mut segment_bytes, segment_vaddr, &new_gnu_hash_bytes, 8);
+
+        // Build a fresh .dynamic tag list pointing at the new
+        // copies. We update the address-bearing tags and DT_STRSZ
+        // (since dynstr grew).
+        use object::elf::*;
+        let updates: &[(u64, u64)] = &[
+            (DT_SYMTAB as u64, dynsym_vaddr),
+            (DT_STRTAB as u64, dynstr_vaddr),
+            (DT_STRSZ as u64, dynstr_bytes.len() as u64),
+            (DT_GNU_HASH as u64, gnu_hash_vaddr),
+            (DT_VERSYM as u64, versym_vaddr),
+        ];
+        let new_dynamic_entries = dx::update_dynamic_tags(&image.dynamic, updates);
+        let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries);
+
+        // Stage the .dynamic override. Find its section index in
+        // the container.
+        let dynamic_index = container
+            .sections
+            .iter()
+            .position(|s| s.name == ".dynamic")
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        overrides.insert(dynamic_index, new_dynamic_bytes);
+
+        Ok(segment_bytes)
     }
 
     /// In-place commit (no appended functions). Same as
@@ -717,5 +962,37 @@ impl TextEditor {
         let output: EmitOutput = emit(&self.plan, &layout, Some(&self.container))?;
         let edited = commit_to_container(&self.container, self.section_id, output);
         Ok(edited)
+    }
+}
+
+/// Append `payload` to `segment_bytes` at the next `align`-aligned
+/// offset and return the virtual address it lands at. Used by
+/// [`TextEditor::extend_segment_for_exports`] to pack the four
+/// rebuilt sections after the function bodies.
+fn pack(segment_bytes: &mut Vec<u8>, segment_vaddr: u64, payload: &[u8], align: u64) -> u64 {
+    if align > 1 {
+        let current = segment_bytes.len() as u64;
+        let aligned = (current + align - 1) & !(align - 1);
+        if aligned > current {
+            segment_bytes.resize(aligned as usize, 0);
+        }
+    }
+    let offset = segment_bytes.len() as u64;
+    segment_bytes.extend_from_slice(payload);
+    segment_vaddr + offset
+}
+
+/// Read a NUL-terminated name at `offset` in a string-table-style
+/// byte slice. Returns an empty slice if the offset is out of
+/// range or no NUL is found before the end (defensive — callers
+/// should pass valid offsets).
+fn name_at_offset(strtab: &[u8], offset: u32) -> &[u8] {
+    let offset = offset as usize;
+    if offset >= strtab.len() {
+        return &[];
+    }
+    match strtab[offset..].iter().position(|&b| b == 0) {
+        Some(end) => &strtab[offset..offset + end],
+        None => &[],
     }
 }

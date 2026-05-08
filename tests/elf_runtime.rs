@@ -171,13 +171,21 @@ fn build_lib_demo_fixture() -> (PathBuf, PathBuf) {
 /// `libgreet.so` via the `$ORIGIN` rpath baked at link time). Returns
 /// stdout. The binary path is relative to the fixture directory.
 fn run_in_lib_demo(binary_name: &str) -> String {
-    let run = docker_run(
-        "fixtures/lib_demo",
-        &["timeout", "10", &format!("./{binary_name}")],
-    );
+    run_in_lib_demo_with_args(binary_name, &[])
+}
+
+fn run_in_lib_demo_with_args(binary_name: &str, args: &[&str]) -> String {
+    let mut argv: Vec<String> = vec![
+        "timeout".into(),
+        "10".into(),
+        format!("./{binary_name}"),
+    ];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let run = docker_run("fixtures/lib_demo", &argv_refs);
     assert!(
         run.status.success(),
-        "running ./{binary_name} in lib_demo failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
+        "running ./{binary_name} {args:?} in lib_demo failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr),
@@ -593,20 +601,35 @@ fn et_dyn_appended_function_changes_observable_output() {
 #[test]
 #[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
             --ignored --nocapture"]
-fn et_dyn_appended_function_can_call_extern_via_plt() {
-    // Stage 8 acceptance: append a new function that calls an
-    // existing PLT-bound extern (`puts`), and prints a message
-    // from a string blob also placed in the appended segment.
+fn et_dyn_appended_function_resolves_extern_via_dlsym() {
+    // Stage 8 acceptance (revised): append a new function that
+    // resolves `puts` at runtime via `dlsym(RTLD_DEFAULT, "puts")`,
+    // then calls through the resolved pointer.
     //
-    // libgreet.c imports `puts` via the `_greet_unused_puts_anchor`
-    // hack so a .plt stub already exists. The rewriter's
-    // `callable_address_of_symbol` resolves Target::Symbol(puts)
-    // to that stub's address, and emit folds the call into a
-    // direct `bl <stub>`.
+    // libgreet.c imports just one extern as an "anchor" —
+    // `dlsym` itself — via the `_greet_unused_dlsym_anchor`
+    // trick. From there, appended code can resolve any symbol
+    // visible to the process at runtime, so we don't need a
+    // separate PLT entry per extern we want to call. This
+    // generalises the previous approach (one anchor per extern)
+    // to one anchor that subsumes all of them.
     //
-    // The new function body matches the C ABI for a leaf-ish
-    // function that calls one extern: stp/mov/str + adrp/add +
-    // bl puts + ldr/lsl + ldp + ret.
+    // The new function body shape:
+    //   stp x29, x30, [sp, #-32]!   ; save frame
+    //   str x19, [sp, #16]          ; save callee-saved x19
+    //   mov x29, sp
+    //   mov x19, x0                 ; spill n into x19 (survives dlsym)
+    //   mov x0, xzr                 ; arg 1 = RTLD_DEFAULT (= 0)
+    //   adrp x1, &"puts" ; add x1   ; arg 2 = name string
+    //   bl  dlsym                   ; via existing PLT stub
+    //   mov x16, x0                 ; resolved puts pointer
+    //   adrp x0, &msg ; add x0      ; arg to puts
+    //   blr x16                     ; call resolved puts
+    //   mov w0, w19                 ; restore n
+    //   lsl w0, w0, #1              ; n * 2
+    //   ldr x19, [sp, #16]          ; restore x19
+    //   ldp x29, x30, [sp], #32    ; restore frame, dealloc
+    //   ret
     require_docker();
     let (lib_path, _) = build_lib_demo_fixture();
 
@@ -617,20 +640,27 @@ fn et_dyn_appended_function_can_call_extern_via_plt() {
     let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
     let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
 
-    // Resolve puts (versioned spelling on glibc).
-    let puts_id = editor
-        .symbol_by_name("puts@GLIBC_2.17")
-        .or_else(|_| editor.symbol_by_name("puts"))
-        .expect("libgreet.so should import puts via the anchor in libgreet.c");
+    // The one anchor we rely on. Versioned name on glibc is
+    // `dlsym@GLIBC_2.34` (or older); fall back to bare `dlsym`
+    // for non-versioned inputs.
+    let dlsym_id = editor
+        .symbol_by_name("dlsym@GLIBC_2.34")
+        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .expect("libgreet.so should import dlsym via _greet_unused_dlsym_anchor");
 
-    // Append the message before the function so the function's
-    // adrp+add can target it.
-    let message = b"greet_double called via appended decorator\0";
+    // Two strings: the name to resolve, and the message we'll
+    // pass to the resolved puts. Both NUL-terminated.
+    let puts_name = b"puts\0";
+    let message = b"greet_double called via appended decorator (dlsym)\0";
+    let puts_name_id = editor
+        .add_data("greet_log_putsname", puts_name, 1)
+        .expect("add_data puts_name");
     let msg_id = editor
-        .add_data("greet_log_msg", message, /*align=*/ 1)
-        .expect("add_data");
+        .add_data("greet_log_msg", message, 1)
+        .expect("add_data msg");
 
-    // Helper to lift a known-good encoded word into a
+    // Helper: lift a known-good encoded word into a
     // RewriteInstruction (skips hand-rolling operand vecs).
     let template = |word: u32| {
         let decoded = aarch64::decode_instruction(0, word).expect("decode template");
@@ -644,36 +674,51 @@ fn et_dyn_appended_function_can_call_extern_via_plt() {
             original_address: None,
         }
     };
-
-    // adrp x0, &msg ; replace numeric PageTarget with symbolic.
-    let mut adrp_msg = template(0x90000000);
-    *adrp_msg
-        .operands
-        .iter_mut()
-        .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
-        .unwrap() = RewriteOperand::Page(Target::Symbol(msg_id));
-    // add x0, x0, #0 ; placeholder offset, fused with adrp by the
-    // macro pass and resolved to lo12(msg).
-    let add_msg = template(0x91000000);
-    // bl puts ; replace numeric BranchTarget with symbolic.
-    let mut bl_puts = template(0x94000000);
-    *bl_puts
-        .operands
-        .iter_mut()
-        .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::BranchTarget(_))))
-        .unwrap() = RewriteOperand::Branch(Target::Symbol(puts_id));
+    // Helper: build an `adrp Rd, <symbol>` by template + symbolic
+    // page operand swap.
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    // Helper: build a `bl <symbol>` by template + symbolic
+    // branch operand swap.
+    let symbolic_bl = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::BranchTarget(_))))
+            .unwrap() = RewriteOperand::Branch(target);
+        t
+    };
 
     let body = vec![
-        template(0xa9be7bfd),  // stp x29, x30, [sp, #-32]!
-        template(0x910003fd),  // mov x29, sp
-        template(0xb90013e0),  // str w0, [sp, #16]
-        adrp_msg,              // adrp x0, &msg
-        add_msg,               // add  x0, x0, #lo12(msg)
-        bl_puts,               // bl   puts
-        template(0xb94013e0),  // ldr w0, [sp, #16]
-        template(0x531f7800),  // lsl w0, w0, #1
-        template(0xa8c27bfd),  // ldp x29, x30, [sp], #32
-        template(0xd65f03c0),  // ret
+        template(0xa9be7bfd),    // stp x29, x30, [sp, #-32]!
+        template(0xf9000bf3),    // str x19, [sp, #16]
+        template(0x910003fd),    // mov x29, sp
+        // mov x19, x0  — spill n to a callee-saved register
+        // (encoded here as `orr x19, xzr, x0`).
+        template(0xaa0003f3),    // mov x19, x0
+        // mov x0, xzr  — RTLD_DEFAULT = 0
+        template(0xaa1f03e0),    // mov x0, xzr
+        symbolic_adrp(0x90000001, Target::Symbol(puts_name_id)), // adrp x1, &"puts"
+        template(0x91000021),    // add  x1, x1, #0  (lo12 fused by macro)
+        symbolic_bl(0x94000000, Target::Symbol(dlsym_id)),      // bl dlsym
+        // mov x16, x0  — save resolved puts pointer
+        // (encoded here as `orr x16, xzr, x0`).
+        template(0xaa0003f0),    // mov x16, x0
+        symbolic_adrp(0x90000000, Target::Symbol(msg_id)),      // adrp x0, &msg
+        template(0x91000000),    // add  x0, x0, #0  (lo12 fused by macro)
+        template(0xd63f0200),    // blr x16  — call resolved puts
+        // mov w0, w19  — restore n
+        template(0x2a1303e0),    // mov w0, w19
+        template(0x531f7800),    // lsl w0, w0, #1   — n * 2
+        template(0xf9400bf3),    // ldr x19, [sp, #16]
+        template(0xa8c27bfd),    // ldp x29, x30, [sp], #32
+        template(0xd65f03c0),    // ret
     ];
     let log_id = editor
         .add_function("greet_log_double", body)
@@ -701,9 +746,229 @@ fn et_dyn_appended_function_can_call_extern_via_plt() {
     let stdout = run_in_lib_demo("host");
     assert_eq!(
         stdout,
-        "greet_double called via appended decorator\ndouble=42 offset=107\n",
-        "appended function should call puts via PLT stub before \
-         returning n*2 to the host",
+        "greet_double called via appended decorator (dlsym)\ndouble=42 offset=107\n",
+        "appended function should resolve puts via dlsym then call it \
+         before returning n*2 to the host",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_exported_function_resolves_via_dlopen() {
+    // Stage 9 acceptance: append a new function and *export* it
+    // via TextEditor::add_function_exported. The export means
+    // the writer rebuilds .dynsym, .dynstr, .gnu.version, and
+    // regenerates .gnu.hash, then points the .dynamic
+    // DT_SYMTAB/DT_STRTAB/DT_GNU_HASH/DT_VERSYM tags at the new
+    // copies in the appended segment.
+    //
+    // The host_dlopen binary uses dlopen + dlsym at runtime to
+    // look up the export by name. Resolution goes through
+    // .gnu.hash, so a successful dlsym confirms the regenerated
+    // hash is correct.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{
+        Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
+        ShiftedRegister,
+    };
+    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, TextEditor};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+
+    // Build greet_quintuple(n) = n * 5 (lsl by 2 then add).
+    let w0 = Register { class: RegisterClass::W, index: 0 };
+    let w8 = Register { class: RegisterClass::W, index: 8 };
+    let x30 = Register { class: RegisterClass::X, index: 30 };
+    let body = vec![
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Lsl,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w8.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Add,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w8)),
+                RewriteOperand::Decoded(DecodedOperand::ShiftedRegister(ShiftedRegister {
+                    register: w0,
+                    shift: Shift { kind: ShiftKind::Lsl, amount: 0 },
+                })),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Ret,
+            operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+            original_address: None,
+        },
+    ];
+
+    editor
+        .add_function_exported("greet_quintuple", body)
+        .expect("add_function_exported");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.so");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+
+    // dlopen + dlsym lookup. host_dlopen prints `result=<n>` on
+    // success; if dlsym can't find greet_quintuple it prints
+    // `dlerror: ...` and exits non-zero (which our
+    // run_in_lib_demo helper would catch via the status assert).
+    let stdout = run_in_lib_demo_with_args("host_dlopen", &["greet_quintuple", "7"]);
+    assert_eq!(
+        stdout, "result=35\n",
+        "dlsym(libgreet.so, \"greet_quintuple\")(7) should return 7*5=35; \
+         got {stdout:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
+    // Universal-resolver acceptance: append a function that
+    // calls `printf` even though libgreet.so never imports
+    // printf directly. The only PLT-bound extern is `dlsym`
+    // (the anchor). The new function does
+    // `dlsym(RTLD_DEFAULT, "printf")` and then calls through
+    // the resolved pointer.
+    //
+    // Distinguishes the dlsym pattern from the previous
+    // "anchor every extern" approach: one anchor, infinite
+    // reachable externs.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
+    use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+
+    // Sanity: libgreet.so should NOT have a PLT stub for
+    // printf. Without that we can be sure the call is going
+    // through dlsym, not the input library's PLT.
+    let printf_already_present = container.symbols.iter().any(|s| {
+        s.is_undefined
+            && s.name
+                .split_once('@')
+                .map(|(b, _)| b)
+                .unwrap_or(s.name.as_str())
+                == "printf"
+    });
+    assert!(
+        !printf_already_present,
+        "libgreet.so unexpectedly imports printf — the test's narrative \
+         (printf reachable via dlsym only) doesn't apply",
+    );
+
+    let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
+    let dlsym_id = editor
+        .symbol_by_name("dlsym@GLIBC_2.34")
+        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .expect("dlsym anchor");
+
+    let printf_name_id = editor
+        .add_data("greet_printf_name", b"printf\0", 1)
+        .expect("add_data printf_name");
+    let format_id = editor
+        .add_data(
+            "greet_printf_format",
+            b"appended printf says n=%d\n\0",
+            1,
+        )
+        .expect("add_data format");
+
+    let template = |word: u32| {
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
+        RewriteInstruction {
+            mnemonic: decoded.mnemonic,
+            operands: decoded
+                .operands
+                .into_iter()
+                .map(RewriteOperand::Decoded)
+                .collect(),
+            original_address: None,
+        }
+    };
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    let symbolic_bl = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::BranchTarget(_))))
+            .unwrap() = RewriteOperand::Branch(target);
+        t
+    };
+
+    let body = vec![
+        template(0xa9be7bfd),    // stp x29, x30, [sp, #-32]!
+        template(0xf9000bf3),    // str x19, [sp, #16]
+        template(0x910003fd),    // mov x29, sp
+        template(0xaa0003f3),    // mov x19, x0   — spill n
+        template(0xaa1f03e0),    // mov x0, xzr   — RTLD_DEFAULT
+        symbolic_adrp(0x90000001, Target::Symbol(printf_name_id)),
+        template(0x91000021),    // add  x1, x1, #0
+        symbolic_bl(0x94000000, Target::Symbol(dlsym_id)),
+        template(0xaa0003f0),    // mov x16, x0   — resolved printf
+        symbolic_adrp(0x90000000, Target::Symbol(format_id)),
+        template(0x91000000),    // add  x0, x0, #0
+        template(0x2a1303e1),    // mov w1, w19   — printf arg = n
+        template(0xd63f0200),    // blr x16        — printf(format, n)
+        template(0x2a1303e0),    // mov w0, w19    — restore n
+        template(0x531f7800),    // lsl w0, w0, #1 — n * 2
+        template(0xf9400bf3),    // ldr x19, [sp, #16]
+        template(0xa8c27bfd),    // ldp x29, x30, [sp], #32
+        template(0xd65f03c0),    // ret
+    ];
+    let log_id = editor
+        .add_function("greet_printf_double", body)
+        .expect("add_function");
+
+    let greet_double_addr = editor
+        .function_address("greet_double")
+        .expect("greet_double symbol");
+    editor
+        .replace_instruction_at(
+            greet_double_addr,
+            RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::B,
+                operands: vec![RewriteOperand::Branch(Target::Symbol(log_id))],
+                original_address: Some(greet_double_addr),
+            },
+        )
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.so");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout,
+        "appended printf says n=21\ndouble=42 offset=107\n",
+        "appended function should resolve printf via dlsym and call \
+         it, even though libgreet.so doesn't import printf directly",
     );
 }
 

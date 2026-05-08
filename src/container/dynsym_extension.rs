@@ -1,0 +1,212 @@
+//! Helpers for *extending* an ELF input's `.dynsym`, `.dynstr`,
+//! `.gnu.hash`, and `.gnu.version` sections to add a new dynamic
+//! export.
+//!
+//! ## Why this lives outside the writer
+//!
+//! The four sections form a tightly coupled group: `.dynsym` entries
+//! reference `.dynstr` byte offsets; `.gnu.hash` indexes into
+//! `.dynsym`; `.gnu.version`'s array length must match `.dynsym`'s
+//! entry count. Adding one symbol means rebuilding all four
+//! together. Doing that here keeps the writer's section-bytes
+//! override path simple — it just receives four pre-baked blobs
+//! and a list of `.dynamic` tag updates.
+//!
+//! ## Strategy: orphan the originals, place new copies in the
+//! appended segment
+//!
+//! The dynamic linker locates `.dynsym` / `.dynstr` / `.gnu.hash` /
+//! `.gnu.version` via the `DT_SYMTAB` / `DT_STRTAB` / `DT_GNU_HASH`
+//! / `DT_VERSYM` tags in `.dynamic` — by *virtual address*, not by
+//! section header. We exploit that:
+//!
+//! 1. Build extended copies of the four sections.
+//! 2. Place them at fresh virtual addresses in the appended PT_LOAD
+//!    segment (alongside the new function and its data).
+//! 3. Rewrite the captured `.dynamic` tag values so the loader
+//!    follows the new copies.
+//!
+//! The original copies stay in place in the file but become
+//! orphaned — the loader never reads them again. Tools that walk
+//! section headers (objdump, readelf) still see them; they're
+//! correct for the *original* set of dynsym entries even though
+//! they're now stale relative to the runtime view.
+//!
+//! ## Layout invariant: nbuckets = 1
+//!
+//! [`crate::container::gnu_hash::build_gnu_hash`] requires the
+//! hashable region of `.dynsym` to be sorted such that all entries
+//! sharing a hash bucket are contiguous. With `nbuckets = 1` this
+//! is trivially satisfied — every entry shares the one bucket. We
+//! emit the new dynsym in source order plus the new entry at the
+//! end, and `nbuckets = 1` gives a correct hash regardless of
+//! order. Lookup is O(n) within the (still small) export set;
+//! acceptable for the use cases this enables.
+
+/// One dynsym entry in the format the GNU linker emits for ELF64.
+///
+/// Fields map directly to `Elf64_Sym`. The neutral
+/// [`crate::container::Symbol`] type drops `st_name`/`st_other`
+/// at parse time; this struct preserves them so we can reproduce
+/// the original entries byte-for-byte.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DynsymEntry {
+    /// Byte offset into `.dynstr` for the symbol's name.
+    pub st_name: u32,
+    /// Combined binding (high 4 bits) and type (low 4 bits).
+    pub st_info: u8,
+    /// Visibility (low 2 bits) plus padding bits.
+    pub st_other: u8,
+    /// Section header index, or `SHN_UNDEF` (0) for externs,
+    /// `SHN_ABS` (0xfff1) for absolute, etc.
+    pub st_shndx: u16,
+    /// Symbol value — virtual address for defined entries, 0
+    /// for undefined.
+    pub st_value: u64,
+    /// Symbol size in bytes.
+    pub st_size: u64,
+}
+
+impl DynsymEntry {
+    /// Encode as 24 bytes of little-endian Elf64_Sym.
+    pub fn to_le_bytes(&self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&self.st_name.to_le_bytes());
+        out[4] = self.st_info;
+        out[5] = self.st_other;
+        out[6..8].copy_from_slice(&self.st_shndx.to_le_bytes());
+        out[8..16].copy_from_slice(&self.st_value.to_le_bytes());
+        out[16..24].copy_from_slice(&self.st_size.to_le_bytes());
+        out
+    }
+
+    /// Decode 24 bytes of Elf64_Sym (LE).
+    pub fn from_le_bytes(bytes: &[u8; 24]) -> Self {
+        Self {
+            st_name: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            st_info: bytes[4],
+            st_other: bytes[5],
+            st_shndx: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+            st_value: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            st_size: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        }
+    }
+}
+
+/// Parse `.dynsym` bytes into a list of [`DynsymEntry`]s. Caller
+/// is responsible for the byte length being a multiple of 24.
+pub fn parse_dynsym(bytes: &[u8]) -> Vec<DynsymEntry> {
+    assert!(bytes.len() % 24 == 0, ".dynsym byte length must be a multiple of 24");
+    let mut out = Vec::with_capacity(bytes.len() / 24);
+    for chunk in bytes.chunks_exact(24) {
+        let arr: [u8; 24] = chunk.try_into().unwrap();
+        out.push(DynsymEntry::from_le_bytes(&arr));
+    }
+    out
+}
+
+/// Encode a list of dynsym entries into bytes.
+pub fn encode_dynsym(entries: &[DynsymEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.len() * 24);
+    for entry in entries {
+        out.extend_from_slice(&entry.to_le_bytes());
+    }
+    out
+}
+
+/// Append a NUL-terminated string to a copy of the source
+/// `.dynstr` and return the byte offset of the new string plus
+/// the extended bytes.
+pub fn append_dynstr(source: &[u8], new_name: &str) -> (u32, Vec<u8>) {
+    let offset = source.len() as u32;
+    let mut bytes = source.to_vec();
+    bytes.extend_from_slice(new_name.as_bytes());
+    bytes.push(0);
+    (offset, bytes)
+}
+
+/// Build a fresh `.gnu.version` (versym) section by appending a
+/// versym entry for a new symbol. The new entry is `1` (the
+/// generic-base version), which the dynamic linker accepts for
+/// unversioned symbols defined in this object.
+///
+/// Versym's wire format is one little-endian u16 per dynsym entry,
+/// in dynsym index order.
+pub fn append_gnu_versym(source: &[u8], new_versym: u16) -> Vec<u8> {
+    let mut bytes = source.to_vec();
+    bytes.extend_from_slice(&new_versym.to_le_bytes());
+    bytes
+}
+
+/// Update `.dynamic` entries to point at new section locations.
+/// Takes the source dynamic tag list and a set of (tag, new_value)
+/// overrides; returns the rebuilt list. Tags not in the overrides
+/// pass through verbatim.
+pub fn update_dynamic_tags(
+    source: &[crate::container::DynamicEntry],
+    updates: &[(u64, u64)],
+) -> Vec<crate::container::DynamicEntry> {
+    use crate::container::DynamicEntry;
+    let updates: std::collections::HashMap<u64, u64> = updates.iter().copied().collect();
+    source
+        .iter()
+        .map(|entry| {
+            if let Some(&new_value) = updates.get(&entry.tag) {
+                DynamicEntry {
+                    tag: entry.tag,
+                    value: new_value,
+                }
+            } else {
+                *entry
+            }
+        })
+        .collect()
+}
+
+/// Encode a `.dynamic` tag list into bytes (Elf64_Dyn × N).
+/// Each entry is 16 bytes: u64 d_tag, u64 d_un.d_val.
+pub fn encode_dynamic(entries: &[crate::container::DynamicEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.len() * 16);
+    for entry in entries {
+        out.extend_from_slice(&entry.tag.to_le_bytes());
+        out.extend_from_slice(&entry.value.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynsym_entry_roundtrips_through_bytes() {
+        let entry = DynsymEntry {
+            st_name: 0x123,
+            st_info: 0x12,
+            st_other: 0x02,
+            st_shndx: 0x000a,
+            st_value: 0x6a8,
+            st_size: 24,
+        };
+        let bytes = entry.to_le_bytes();
+        let decoded = DynsymEntry::from_le_bytes(&bytes);
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn append_dynstr_appends_with_null_terminator() {
+        let source = b"\0first\0second\0";
+        let (offset, extended) = append_dynstr(source, "third");
+        assert_eq!(offset, source.len() as u32);
+        assert_eq!(&extended[offset as usize..], b"third\0");
+    }
+
+    #[test]
+    fn append_gnu_versym_appends_one_u16() {
+        // Two existing entries (4 bytes), append one (2 bytes).
+        let source = vec![0x00, 0x00, 0x01, 0x00];
+        let extended = append_gnu_versym(&source, 1);
+        assert_eq!(extended.len(), 6);
+        assert_eq!(&extended[4..6], &1u16.to_le_bytes());
+    }
+}

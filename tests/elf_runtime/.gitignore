@@ -3,3 +3,4 @@ fixtures/*.o
 fixtures/hello
 fixtures/lib_demo/*.so
 fixtures/lib_demo/host
+fixtures/lib_demo/host_dlopen

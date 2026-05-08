@@ -1,10 +1,12 @@
 //! End-to-end demonstration of:
 //!
-//!   1. Appending a *new* function to libgreet.so that calls
-//!      `puts` via the existing PLT stub.
-//!   2. Appending a *new* string blob alongside the function (in
-//!      the same R-X segment) and computing its address from the
-//!      new code via `adrp + add`.
+//!   1. Appending a *new* function to libgreet.so that resolves
+//!      `puts` at runtime via `dlsym(RTLD_DEFAULT, "puts")` and
+//!      calls it.
+//!   2. Appending two *new* string blobs alongside the function
+//!      (the symbol name to look up, plus the message to print)
+//!      and computing their addresses from the new code via
+//!      `adrp + add`.
 //!   3. Patching `greet_double` to delegate to the new function,
 //!      so each call to greet_double prints a line *and* returns
 //!      its usual `n * 2`.
@@ -15,30 +17,48 @@
 //!
 //! After this example runs, the rewritten library prints
 //!
-//!   greet_double called via appended decorator
+//!   greet_double called via appended decorator (dlsym)
 //!   double=42 offset=107
 //!
-//! The new function lives in a fresh PT_LOAD R-X segment past the
-//! input's mapped range. Its body looks like a normal ABI-respecting
-//! function:
+//! ## Why dlsym?
+//!
+//! Earlier iterations of this example called `puts` *directly*
+//! through the input library's PLT, which required `puts` itself
+//! to be anchored as an extern in `libgreet.c`. That worked but
+//! it didn't generalise — every extern we might want to call had
+//! to be anchored ahead of time.
+//!
+//! `libgreet.c` now anchors only one extern: `dlsym`. Appended
+//! code calls `dlsym(RTLD_DEFAULT, "name")` to resolve any
+//! function the process has loaded, then calls through the
+//! returned pointer. One anchor subsumes any number of future
+//! externs — `puts`, `printf`, `getenv`, anything libc exports.
+//!
+//! ## What the new function does (AArch64 pseudo-assembly)
 //!
 //!   stp  x29, x30, [sp, #-32]!  ; save fp + lr
+//!   str  x19, [sp, #16]         ; save callee-saved x19
 //!   mov  x29, sp
-//!   str  w0, [sp, #16]          ; spill the input n
-//!   adrp x0, msg_page           ; arg = &msg
+//!   mov  x19, x0                ; spill the input n into x19
+//!   mov  x0, xzr                ; arg 1 = RTLD_DEFAULT (= 0)
+//!   adrp x1, puts_name          ; arg 2 = "puts"
+//!   add  x1, x1, #lo12(puts_name)
+//!   bl   dlsym                  ; → folded to the existing PLT stub
+//!   mov  x16, x0                ; resolved puts function pointer
+//!   adrp x0, msg                ; arg = &msg
 //!   add  x0, x0, #lo12(msg)
-//!   bl   puts                   ; folded to the existing .plt stub
-//!   ldr  w0, [sp, #16]          ; reload n
-//!   lsl  w0, w0, #1             ; w0 = n * 2 (the original
-//!                               ;             greet_double behaviour)
-//!   ldp  x29, x30, [sp], #32   ; restore + dealloc
+//!   blr  x16                    ; call the resolved puts
+//!   mov  w0, w19                ; restore n
+//!   lsl  w0, w0, #1             ; w0 = n * 2
+//!   ldr  x19, [sp, #16]
+//!   ldp  x29, x30, [sp], #32
 //!   ret
 //!
 //! Build the lib_demo fixture first; then run with
 //! `cargo run --example decorate_so_with_log`.
 
 use armv8_encode::container::Container;
-use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic};
+use armv8_encode::isa::aarch64::{self, Aarch64Mnemonic, DecodedOperand};
 use armv8_encode::rewrite::{RewriteInstruction, RewriteOperand, Target, TextEditor};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -59,35 +79,45 @@ fn main() -> ExitCode {
     let container = Container::from_bytes(&bytes).expect("parse libgreet.so");
     let mut editor = TextEditor::for_section(&container, ".text").expect("open editor");
 
-    // Sanity: confirm libgreet.so already imports puts (the
-    // anchor in libgreet.c forces a .dynsym/.plt entry). If this
-    // assertion fails the fixture has drifted.
-    let puts_id = editor
-        .symbol_by_name("puts@GLIBC_2.17")
-        .or_else(|_| editor.symbol_by_name("puts"))
-        .expect("libgreet.so must import puts (see _greet_unused_puts_anchor)");
-    println!("found puts as SymbolId({})", puts_id.0);
+    // The one anchor we rely on. libgreet.c forces a PLT entry
+    // for dlsym via `_greet_unused_dlsym_anchor`; from there our
+    // appended code can resolve any symbol visible to the
+    // process at runtime.
+    let dlsym_id = editor
+        .symbol_by_name("dlsym@GLIBC_2.34")
+        .or_else(|_| editor.symbol_by_name("dlsym@GLIBC_2.17"))
+        .or_else(|_| editor.symbol_by_name("dlsym"))
+        .expect("libgreet.so should import dlsym (see _greet_unused_dlsym_anchor)");
+    println!("found dlsym anchor as SymbolId({})", dlsym_id.0);
 
-    // ---------------------------------------------------------------
-    // Step 1: append the message string. Returns a SymbolId we can
-    // use as Target::Symbol for adrp/add address computation.
-    // Trailing NUL because puts wants a C string.
-    // ---------------------------------------------------------------
-    let message = b"greet_double called via appended decorator\0";
+    // The two strings the new function references: the symbol
+    // name to resolve, plus the message to print.
+    let puts_name_id = editor
+        .add_data("greet_log_putsname", b"puts\0", /*align=*/ 1)
+        .expect("add_data puts_name");
     let msg_id = editor
-        .add_data("greet_log_msg", message, /*align=*/ 1)
-        .expect("add_data");
-    println!("added greet_log_msg as SymbolId({})", msg_id.0);
+        .add_data(
+            "greet_log_msg",
+            b"greet_double called via appended decorator (dlsym)\0",
+            /*align=*/ 1,
+        )
+        .expect("add_data msg");
+    println!(
+        "appended strings: putsname=SymbolId({}), msg=SymbolId({})",
+        puts_name_id.0, msg_id.0,
+    );
 
     // ---------------------------------------------------------------
-    // Step 2: build the new function. We construct each instruction
-    // via the decoder ("decode this 32-bit word") to avoid
-    // hand-rolling the operand structs. The decoded form already
-    // exposes the right operand shape; we just need to substitute
-    // symbolic targets for the adrp/add pair and the bl.
+    // Build the new function. Each instruction is constructed by
+    // decoding a known-good AArch64 word, then (where the
+    // instruction references a symbol) substituting a symbolic
+    // operand. The rewriter's macro-fusion pass then folds
+    // adrp+add pairs against `Target::Symbol` into a
+    // `LoadAddress` macro that resolves at the appended
+    // function's final virtual address.
     // ---------------------------------------------------------------
     let template = |word: u32| {
-        let decoded = aarch64::decode_instruction(0, word).expect("decode template word");
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
         RewriteInstruction {
             mnemonic: decoded.mnemonic,
             operands: decoded
@@ -98,84 +128,48 @@ fn main() -> ExitCode {
             original_address: None,
         }
     };
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    let symbolic_bl = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::BranchTarget(_))))
+            .unwrap() = RewriteOperand::Branch(target);
+        t
+    };
 
-    // Source of the template words: emit each via clang manually
-    // would be the gold standard, but for clarity we use known
-    // AArch64 encodings. Every word here re-encodes to itself
-    // (verified during development via the symbol_probe
-    // scratchpad).
-
-    // stp x29, x30, [sp, #-32]!
-    let stp_save = template(0xa9be7bfd);
-    // mov x29, sp
-    let mov_x29_sp = template(0x910003fd);
-    // str w0, [sp, #16]   (offset 16 → imm12=4 since size=2)
-    let str_w0 = template(0xb90013e0);
-    // ldr w0, [sp, #16]
-    let ldr_w0 = template(0xb94013e0);
-    // lsl w0, w0, #1
-    let lsl_w0 = template(0x531f7800);
-    // ldp x29, x30, [sp], #32
-    let ldp_restore = template(0xa8c27bfd);
-    // ret
-    let ret_insn = template(0xd65f03c0);
-
-    // adrp x0, &msg — the page operand is symbolic. Pair it
-    // with `add x0, x0, #0` and the rewriter's macro-fusion pass
-    // (run inside `add_function`) collapses the pair into a
-    // LoadAddress macro that resolves at the appended function's
-    // final vaddr.
-    let mut adrp_msg = template(0x90000000); // adrp x0, +0
-    *adrp_msg
-        .operands
-        .iter_mut()
-        .find(|op| {
-            matches!(op, RewriteOperand::Decoded(aarch64::DecodedOperand::PageTarget(_)))
-        })
-        .expect("adrp template missing PageTarget operand") =
-        RewriteOperand::Page(Target::Symbol(msg_id));
-
-    // add x0, x0, #0 — placeholder offset. The fusion pass takes
-    // this and the adrp above as a unit; emit computes the lo12
-    // from msg_id's vaddr.
-    let add_msg = template(0x91000000);
-
-    // bl puts (decoded as bl <some_target>; replace the
-    // BranchTarget with Target::Symbol(puts_id) so the rewriter
-    // folds the call to the existing .plt stub).
-    let mut bl_puts = template(0x94000000); // bl +0 placeholder
-    *bl_puts
-        .operands
-        .iter_mut()
-        .find(|op| {
-            matches!(op, RewriteOperand::Decoded(aarch64::DecodedOperand::BranchTarget(_)))
-        })
-        .expect("bl template missing BranchTarget operand") =
-        RewriteOperand::Branch(Target::Symbol(puts_id));
-
-    let new_function_body = vec![
-        stp_save,
-        mov_x29_sp,
-        str_w0,
-        adrp_msg,
-        add_msg,
-        bl_puts,
-        ldr_w0,
-        lsl_w0,
-        ldp_restore,
-        ret_insn,
+    let body = vec![
+        template(0xa9be7bfd),    // stp x29, x30, [sp, #-32]!
+        template(0xf9000bf3),    // str x19, [sp, #16]
+        template(0x910003fd),    // mov x29, sp
+        template(0xaa0003f3),    // mov x19, x0   — spill n
+        template(0xaa1f03e0),    // mov x0, xzr   — RTLD_DEFAULT
+        symbolic_adrp(0x90000001, Target::Symbol(puts_name_id)), // adrp x1, &"puts"
+        template(0x91000021),    // add  x1, x1, #lo12  (fused)
+        symbolic_bl(0x94000000, Target::Symbol(dlsym_id)),       // bl dlsym
+        template(0xaa0003f0),    // mov x16, x0   — resolved puts ptr
+        symbolic_adrp(0x90000000, Target::Symbol(msg_id)),       // adrp x0, &msg
+        template(0x91000000),    // add  x0, x0, #lo12  (fused)
+        template(0xd63f0200),    // blr x16        — call puts(msg)
+        template(0x2a1303e0),    // mov w0, w19    — restore n
+        template(0x531f7800),    // lsl w0, w0, #1 — n * 2
+        template(0xf9400bf3),    // ldr x19, [sp, #16]
+        template(0xa8c27bfd),    // ldp x29, x30, [sp], #32
+        template(0xd65f03c0),    // ret
     ];
-
     let log_id = editor
-        .add_function("greet_log_double", new_function_body)
-        .expect("add_function greet_log_double");
+        .add_function("greet_log_double", body)
+        .expect("add_function");
     println!("added greet_log_double as SymbolId({})", log_id.0);
 
-    // ---------------------------------------------------------------
-    // Step 3: patch greet_double's first instruction to be `b
-    // greet_log_double`. The new function does the print *and*
-    // computes n*2, so it's a tail-replacement.
-    // ---------------------------------------------------------------
+    // Patch greet_double to tail-call greet_log_double.
     let greet_double_addr = editor
         .function_address("greet_double")
         .expect("greet_double symbol");
@@ -189,9 +183,7 @@ fn main() -> ExitCode {
             },
         )
         .expect("replace_instruction_at");
-    println!(
-        "patched greet_double[0] (0x{greet_double_addr:x}) -> b greet_log_double",
-    );
+    println!("patched greet_double[0] (0x{greet_double_addr:x}) -> b greet_log_double");
 
     let rewritten = editor.commit_to_bytes().expect("commit_to_bytes");
     let out_path = PathBuf::from("/tmp/libgreet_with_log.so");
@@ -206,9 +198,8 @@ fn main() -> ExitCode {
     println!("    -v $PWD/tests/elf_runtime/fixtures/lib_demo:/work \\");
     println!("    -w /work armv8-encode-runtime ./host");
     println!("  # expected:");
-    println!("  #   greet_double called via appended decorator");
+    println!("  #   greet_double called via appended decorator (dlsym)");
     println!("  #   double=42 offset=107");
 
     ExitCode::SUCCESS
 }
-

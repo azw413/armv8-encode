@@ -14,15 +14,23 @@
 // `greet_base` is mutable so a rewriter can tweak the constant
 // directly via `with_section_bytes` and observe the change.
 //
-// `_greet_unused_puts_anchor` exists so the linker emits a .dynsym
-// entry and .plt stub for `puts`, even though no compiled-in code
-// path calls it. The Stage 8 demo uses that PLT entry to call
-// `puts` from a function it appends to the library at rewrite
-// time — without this anchor the linker would resolve `puts`
-// statically (or omit it entirely) and we'd have no PLT stub to
-// target.
+// `_greet_unused_dlsym_anchor` exists so the linker emits a
+// .dynsym entry and .plt stub for `dlsym`, even though no
+// compiled-in code path calls it. The Stage 8+ rewriter demos
+// use that one PLT entry as a universal extern resolver:
+// appended code calls `dlsym(RTLD_DEFAULT, "name")` to get a
+// function pointer for any symbol the process has loaded, then
+// calls through it. This generalises away from the
+// previous-iteration "anchor every extern we might want" pattern
+// — one anchor (`dlsym`) covers any future need.
+//
+// Why use `dlsym` rather than `puts` / `printf` / etc.: every
+// standard library function we'd plausibly want is reachable
+// through `dlsym` at runtime, but the inverse isn't true (we
+// can't get to `dlsym` itself except through its own PLT entry).
+// One anchor on `dlsym` therefore subsumes all other anchors.
+#include <dlfcn.h>
 #include <stdint.h>
-#include <stdio.h>
 
 int32_t greet_base = 100;
 
@@ -34,10 +42,10 @@ int32_t greet_offset(int32_t n) {
     return n + greet_base;
 }
 
-// Force `puts` into .dynsym/.plt by taking its address through a
-// volatile sink. The linker can't tell whether the sink will be
-// read at runtime, so it preserves the dynamic relocation. This
-// function is unreachable in normal use; it exists purely for its
-// side effect on link-time symbol resolution.
-typedef int (*puts_fn)(const char *);
-volatile puts_fn _greet_unused_puts_anchor = puts;
+// Force `dlsym` into .dynsym/.plt by taking its address through
+// a volatile sink. The linker can't tell whether the sink will
+// be read at runtime, so it preserves the dynamic relocation.
+// Unreachable in normal use; exists purely for its side effect
+// on link-time symbol resolution.
+typedef void *(*dlsym_fn)(void *, const char *);
+volatile dlsym_fn _greet_unused_dlsym_anchor = dlsym;

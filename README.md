@@ -7,8 +7,9 @@ The crate started as a decoder/encoder pair, then grew an analysis layer
 (basic blocks, control-flow graphs), then a symbolic rewriter, then full
 ELF read+write support including ET_DYN. Today it can take an unmodified
 aarch64 `.so`, edit its `.text` or `.data`, append new functions in a
-fresh PT_LOAD segment that call existing PLT-bound externs, and produce
-a runnable byte stream the dynamic linker accepts.
+fresh PT_LOAD segment that call existing PLT-bound externs (and, via a
+single `dlsym` anchor, any dynamic symbol the process can see), and
+produce a runnable byte stream the dynamic linker accepts.
 
 The primary architectural target is AArch64; the rest of the layering
 (`container`, `mc`, `rewrite`) stays format- and architecture-neutral
@@ -35,6 +36,16 @@ so other ISAs can plug in later.
 - **Append a new function** to an `.so` in a fresh executable
   segment, complete with new read-only data, and have the new code
   call existing extern functions through the PLT.
+- **Reach any libc symbol via a single `dlsym` anchor.** If the
+  source library imports `dlsym` (one PLT entry is enough), appended
+  code can call `dlsym(RTLD_DEFAULT, "name")` to resolve any symbol
+  the dynamic loader can find — `printf`, `strlen`, `getenv`,
+  anything — without needing it to be pre-anchored in the source.
+- **Export the new function** as a `.dynsym` entry resolvable via
+  `dlopen` + `dlsym` from any caller. The writer rebuilds
+  `.dynsym` / `.dynstr` / `.gnu.version` and regenerates
+  `.gnu.hash` from scratch, then points the `.dynamic` tags at the
+  new copies in the appended segment.
 
 End-to-end runtime tests confirm rewritten libraries load and run
 correctly under aarch64 Linux (via QEMU on macOS host).
@@ -220,6 +231,17 @@ The editor proxies the rewrite primitives:
   function in a fresh PT_LOAD R-X segment past the input's mapped
   range. Returns a `SymbolId` callers can pass back as
   `Target::Symbol` to redirect existing branches at the new code.
+  The function is registered in the static `.symtab` only — it
+  isn't visible to `dlsym` callers.
+- `add_function_exported(name, instructions) -> SymbolId` —
+  same as `add_function`, plus promotes the new symbol to
+  `.dynsym` so `dlopen`/`dlsym` callers can resolve it by name.
+  The writer rebuilds `.dynsym`, `.dynstr`, `.gnu.version`, and
+  regenerates `.gnu.hash` (with `nbuckets = 1` for layout
+  simplicity), then updates the captured `.dynamic` tags so the
+  loader follows the new copies (placed in the appended segment).
+  The original sections stay in the file but are ignored at
+  runtime.
 - `add_data(name, bytes, align) -> SymbolId` — append read-only
   data alongside the new functions in the same segment. The new
   function can compute the blob's address via the standard
@@ -291,15 +313,28 @@ capability:
   tail-call it. Demonstrates `add_function` + `replace_instruction_at`
   for the "decorator" pattern.
 - **`examples/decorate_so_with_log.rs`** — the most ambitious
-  example. Appends a new string blob via `add_data`, appends a
-  new function via `add_function` that:
-  - computes the string's address via fused `adrp + add` against
-    the appended symbol;
-  - calls `puts` via the existing PLT stub (folded by the
-    rewriter into a direct `bl <stub>`);
-  - returns the original `n*2` result.
+  static-decorator example. Appends two new strings via `add_data`
+  (the symbol name `"puts"` and the message), appends a new function
+  via `add_function` that:
+  - resolves `puts` at runtime via
+    `dlsym(RTLD_DEFAULT, "puts")` — the only PLT-bound extern the
+    appended code needs is `dlsym` itself;
+  - computes the message address via fused `adrp + add` against the
+    appended symbol;
+  - calls the resolved `puts` and returns the original `n*2` result.
   Patches `greet_double` to tail-call the new function so each
   call prints a line *and* returns its usual answer.
+- **`examples/call_printf_via_dlsym.rs`** — proves the dlsym anchor
+  is a *universal* resolver. libgreet.so does not import `printf`,
+  yet appended code calls `printf` by going through
+  `dlsym(RTLD_DEFAULT, "printf")` and invoking the resolved pointer.
+  One PLT anchor (`dlsym`) subsumes the need for any number of
+  imported externs.
+- **`examples/export_function.rs`** — appends a new function
+  `greet_quintuple` via `add_function_exported` so it appears in
+  `.dynsym` and is resolvable via `dlopen`/`dlsym`. Demonstrates
+  the `.gnu.hash` regeneration path; pair with the runtime
+  fixture's `host_dlopen` binary to verify the export end-to-end.
 
 Run any example with `cargo run --example NAME`. Examples that
 target `libgreet.so` need the runtime fixture built first; see
@@ -309,7 +344,7 @@ target `libgreet.so` need the runtime fixture built first; see
 
 ### Unit tests (no Docker)
 
-229 unit tests cover the decoder, encoder, sweep, recursive descent,
+236 unit tests cover the decoder, encoder, sweep, recursive descent,
 container reader/writer, rewrite IR, data IR, the editor API, and
 operand-kind coverage assertions. Fixtures live under
 `tests/fixtures/aarch64`. Each fixture contains source assembly plus
@@ -336,9 +371,9 @@ ARMV8_COMPARE_STRICT=1 cargo test --test otool_compare -- --ignored --nocapture
 ### ELF runtime harness (Docker, all platforms)
 
 The `tests/elf_runtime/` directory builds a small aarch64 Linux
-fixture (`libgreet.so` + `host`) inside a Docker image, exercises
-the full read → edit → write → load → run pipeline, and asserts on
-host stdout. Eight tests cover:
+fixture (`libgreet.so` + `host` + `host_dlopen`) inside a Docker
+image, exercises the full read → edit → write → load → run
+pipeline, and asserts on host stdout. Ten tests cover:
 
 - baseline (sanity: harness works, fixture runs).
 - identity round-trip — `Container::to_bytes()` produces a
@@ -352,9 +387,18 @@ host stdout. Eight tests cover:
   `TextEditor`, host observes new return value.
 - appended function — add `greet_quintuple` via `add_function`,
   redirect `greet_double` to it, host observes new return value.
-- appended function calling extern via PLT — add `greet_log_double`
-  that prints a string via `puts` and returns `n*2`, host observes
-  both behaviours.
+- appended function resolving extern via dlsym — add
+  `greet_log_double` that calls `dlsym(RTLD_DEFAULT, "puts")` then
+  invokes the resolved pointer to print a string before returning
+  `n*2`. Host observes both behaviours.
+- appended function calling unimported extern via dlsym — add
+  `greet_printf_double` that calls `printf` (which libgreet.so does
+  *not* import) by going through `dlsym(RTLD_DEFAULT, "printf")`.
+  Demonstrates that a single PLT anchor (`dlsym`) is enough to reach
+  any libc function from appended code.
+- exported appended function — add `greet_quintuple` via
+  `add_function_exported`, then `host_dlopen` resolves it by
+  name through the regenerated `.gnu.hash` and calls it.
 
 Setup (one-time):
 
@@ -506,10 +550,19 @@ What's deliberately not yet implemented:
   rewrite layer to relocate the function to a new vaddr and update
   PC-relative addressing. Workaround today: use `add_function` to
   put the new code in a fresh segment and tail-call into it.
-- **Adding new dynsym entries.** Appended code can call
-  *existing* PLT-bound externs but can't introduce a new one.
-  Adding `dlopen` to a library that doesn't already import it
-  needs `.gnu.hash` regeneration.
+- **Adding new dynsym *imports* via fresh PLT stubs.** We don't
+  synthesise new `.rela.plt` entries or PLT stubs for imports the
+  source library didn't already carry. In practice this rarely
+  matters: if the source imports `dlsym` (one PLT entry is enough),
+  appended code can resolve any other libc symbol at runtime via
+  `dlsym(RTLD_DEFAULT, "name")` — see
+  `examples/call_printf_via_dlsym.rs`. The "grow the import table"
+  path is still future work, but the dlsym pattern usually obviates
+  the need for it.
+- **Versioned exports.** `add_function_exported` emits the new
+  symbol with versym = 1 (unversioned/base). Producing a
+  versioned export with a `.gnu.version_d` definition isn't yet
+  supported.
 - **`.eh_frame_hdr` regeneration.** When existing functions
   move (Stage 6.3 grown-text path), the binary-search table inside
   `.eh_frame_hdr` becomes stale. Today we copy `.eh_frame_hdr`
@@ -536,7 +589,7 @@ What's deliberately not yet implemented:
 
 ```sh
 cargo check            # fast type-check
-cargo test             # 229 unit tests
+cargo test             # 236 unit tests
 cargo test -- --ignored # also runs the runtime harness (needs Docker)
 ```
 
