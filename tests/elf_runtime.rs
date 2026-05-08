@@ -1267,6 +1267,44 @@ fn et_dyn_add_library_dependency_forces_extra_load() {
     );
 }
 
+/// Inject a synthetic PT_PHDR program header into the
+/// container's elf_image. Used to simulate Android NDK
+/// output, which carries PT_PHDR by default. The synthesised
+/// header values match what lld emits for `.so` files that
+/// have one: PF_R, p_vaddr = 0x40 (just past the ELF
+/// header), sized to cover the input's program-header table.
+fn inject_synthetic_pt_phdr(container: &mut Container) {
+    let image = container
+        .elf_image
+        .as_mut()
+        .expect("container must have elf_image to inject PT_PHDR");
+    if image
+        .program_headers
+        .iter()
+        .any(|p| p.p_type == object::elf::PT_PHDR)
+    {
+        return;
+    }
+    // ELF64 program header is 56 bytes (0x38). Existing phdr
+    // count + 1 for the new PT_PHDR entry itself = the new
+    // table size.
+    let phdr_count = (image.program_headers.len() + 1) as u64;
+    let phdr_size = 0x38u64; // sizeof(Elf64_Phdr)
+    image.program_headers.insert(
+        0,
+        armv8_encode::container::ProgramHeader {
+            p_type: object::elf::PT_PHDR,
+            p_flags: object::elf::PF_R,
+            p_offset: 0x40,
+            p_vaddr: 0x40,
+            p_paddr: 0x40,
+            p_filesz: phdr_count * phdr_size,
+            p_memsz: phdr_count * phdr_size,
+            p_align: 0x8,
+        },
+    );
+}
+
 /// Construct an in-memory `Container` that simulates a
 /// one-DT_NULL `.dynamic` (matching real-world Android NDK
 /// output and the proposal at
@@ -1456,6 +1494,91 @@ fn et_dyn_add_library_dependency_handles_many_deps_via_relocation() {
          in relocated .dynamic; got {dt_needed_count}",
     );
     let _ = dynamic_idx; // not needed for this assertion
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_add_library_dependency_drops_pt_phdr_on_input_with_one() {
+    // Acceptance for the "drop PT_PHDR" path. Real-world ELF
+    // inputs (everything Android NDK emits) ship a PT_PHDR by
+    // default; the writer used to refuse them outright. Now
+    // it filters PT_PHDR out on the way through the
+    // append-segment path.
+    //
+    // We synthesise PT_PHDR on top of the libgreet container
+    // (the harness fixture itself doesn't carry one because
+    // lld emits .so files without it), then call
+    // `add_library_dependency` and verify the loader still
+    // honours the new dep at runtime — proving the rewritten
+    // file is structurally valid without PT_PHDR and the
+    // dynamic linker tolerates its absence.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let mut container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+    inject_synthetic_pt_phdr(&mut container);
+
+    // Confirm the synthesised PT_PHDR is present before
+    // committing — sanity that we're exercising the new
+    // filter path.
+    assert!(
+        container
+            .elf_image
+            .as_ref()
+            .unwrap()
+            .program_headers
+            .iter()
+            .any(|p| p.p_type == object::elf::PT_PHDR),
+        "test setup should have injected a PT_PHDR before commit",
+    );
+
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .add_library_dependency("libdep.so")
+        .expect("add_library_dependency");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+
+    // Re-parse and confirm PT_PHDR is gone from the output.
+    let rewritten = Container::from_bytes(&written).expect("re-parse");
+    let pt_phdr_count = rewritten
+        .elf_image
+        .as_ref()
+        .expect("elf_image")
+        .program_headers
+        .iter()
+        .filter(|p| p.p_type == object::elf::PT_PHDR)
+        .count();
+    assert_eq!(
+        pt_phdr_count, 0,
+        "writer should have dropped PT_PHDR; output still has {pt_phdr_count}",
+    );
+
+    // Swap the rewritten bytes in for libgreet.so and run
+    // host. libdep was forced via DT_NEEDED, so its
+    // constructor should set the marker — proving the loader
+    // accepted the file despite the PT_PHDR drop.
+    let dir = harness_dir().join("fixtures/lib_demo");
+    let backup = dir.join("libgreet.backup.so");
+    let original_lib = dir.join("libgreet.so");
+    std::fs::copy(&original_lib, &backup).expect("backup libgreet");
+    std::fs::write(&original_lib, &written).expect("install rewritten libgreet");
+    let result = std::panic::catch_unwind(|| {
+        run_in_lib_demo_with_args("host", &["libdep"])
+    });
+    std::fs::copy(&backup, &original_lib).expect("restore libgreet");
+    let _ = std::fs::remove_file(&backup);
+    let stdout = result.expect("host run panicked");
+    assert_eq!(
+        stdout, "libdep_marker=171\n",
+        "expected libdep_marker=171 (0xab) after \
+         add_library_dependency on a PT_PHDR-bearing input; \
+         got {stdout:?}",
+    );
 }
 
 // ---- ELF structural-equivalence checker --------------------------------

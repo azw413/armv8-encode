@@ -179,6 +179,101 @@ fn baseline_fixture_builds_signs_and_runs() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn et_dyn_inplace_text_edit_changes_observable_output() {
+    // Phase 2 acceptance: edit libgreet.dylib's `__text`
+    // section through the high-level BinaryEditor API and
+    // observe the change at runtime via the host program.
+    //
+    // Mirrors the ELF `et_dyn_inplace_text_edit_*` test:
+    // replaces greet_double's `lsl Wd, Wn, #1` (n*2) with
+    // `lsl Wd, Wn, #2` (n*4). After the rewrite, host prints
+    // `double=84 offset=107` instead of `double=42 offset=107`.
+    //
+    // Mach-O specifics:
+    //   - Symbol name is `_greet_double` (Mach-O underscoring),
+    //     not `greet_double`.
+    //   - Section name is `__text` (Mach-O segment.section
+    //     convention), not `.text`. The reader exposes it
+    //     under the bare section name.
+    //   - commit_to_bytes routes through macho_writer for
+    //     in-place edits: it applies the new section bytes at
+    //     the original file offset and re-signs the result
+    //     ad-hoc via `codesign`.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{Aarch64Mnemonic, DecodedOperand};
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+
+    // Open the editor on `__text`. The reader strips the
+    // segment prefix and exposes Mach-O sections under the
+    // bare section name (e.g. `__text`).
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+    let function_address = editor
+        .binary
+        .function_address("_greet_double")
+        .expect("_greet_double symbol present in __text");
+    let text = editor.text.as_ref().expect("text section lifted");
+    let lsl_index = text
+        .instructions()
+        .iter()
+        .position(|insn| {
+            insn.address >= function_address && insn.mnemonic == Aarch64Mnemonic::Lsl
+        })
+        .expect("greet_double should contain an lsl");
+    let lsl_address = text.instructions()[lsl_index].address;
+    let original_lsl = &text.instructions()[lsl_index];
+
+    let (rd, rn) = match (&original_lsl.operands[0], &original_lsl.operands[1]) {
+        (DecodedOperand::Register(rd), DecodedOperand::Register(rn)) => {
+            (rd.clone(), rn.clone())
+        }
+        other => panic!("unexpected lsl operand shape: {other:?}"),
+    };
+    let original_shift = match &original_lsl.operands[2] {
+        DecodedOperand::Immediate(n) => *n,
+        other => panic!("unexpected lsl shift operand: {other:?}"),
+    };
+    assert_eq!(
+        original_shift, 1,
+        "fixture greet_double should use `lsl Wd, Wn, #1`",
+    );
+
+    let new_instruction = RewriteInstruction {
+        mnemonic: Aarch64Mnemonic::Lsl,
+        operands: vec![
+            RewriteOperand::Decoded(DecodedOperand::Register(rd)),
+            RewriteOperand::Decoded(DecodedOperand::Register(rn)),
+            RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+        ],
+        original_address: Some(lsl_address),
+    };
+    editor
+        .text
+        .as_mut()
+        .unwrap()
+        .replace_instruction_at(lsl_address, new_instruction)
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=84 offset=107\n",
+        "in-place __text edit through BinaryEditor should make \
+         greet_double return n*4=84 instead of n*2=42",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_round_trip_through_container_loads_and_runs() {
     // Phase 1 acceptance: read libgreet.dylib, round-trip it
     // through Container::to_bytes (which routes through the

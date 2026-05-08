@@ -441,10 +441,14 @@ struct GrowingSection {
 /// Limitations of this first iteration (worth widening later):
 /// - Only the first growing section is handled. A rewrite that
 ///   grew two sections simultaneously would need richer planning.
-/// - No PT_PHDR update — if the input had one, the writer would
-///   need to either remove it or rewrite its `p_offset` /
-///   `p_filesz`. libgreet.so (the Stage 6 oracle) lacks PT_PHDR;
-///   inputs with one return `ContainerWriteError::PtPhdrNotSupported`.
+/// - PT_PHDR is dropped from the output rather than rewritten.
+///   The new program-header table lives at file end (after the
+///   appended segment) and the dynamic linker uses
+///   `e_phoff` for the canonical lookup; PT_PHDR is the
+///   runtime-introspection convenience copy and bionic / glibc
+///   handle its absence (`dl_iterate_phdr` falls back, libgcc
+///   unwinder copes). This is necessary for Android NDK inputs,
+///   which carry PT_PHDR by default.
 /// - Trampolines are unconditional 26-bit branches (`b imm`),
 ///   reaching ±128 MiB. If the new segment ends up further than
 ///   that, callers would silently misroute. This first version
@@ -493,17 +497,29 @@ pub(crate) fn write_with_appended_segment_inner(
     appended: AppendedSegment,
     section_byte_overrides: HashMap<usize, Vec<u8>>,
 ) -> Result<Vec<u8>, ContainerWriteError> {
-    // Refuse if any input program header is PT_PHDR — handling that
-    // correctly needs more bookkeeping than the first iteration
-    // covers. libgreet.so doesn't have one, so this only fires for
-    // future inputs.
-    if image
+    // Drop PT_PHDR if the input had one. The runtime program-
+    // header table for the rewritten file lives at file end
+    // (after the appended segment), at a fresh `e_phoff` —
+    // representing it via PT_PHDR would mean keeping
+    // PT_PHDR.p_vaddr/p_offset/p_filesz consistent with the
+    // new table's location, which requires extra bookkeeping
+    // and a writable mapping for the table. The dynamic
+    // linker uses `e_phoff` from the ELF header for the
+    // canonical lookup; PT_PHDR is the runtime-introspection
+    // convenience copy and bionic / glibc both handle its
+    // absence gracefully (`dl_iterate_phdr` falls back; the
+    // libgcc unwinder copes). Customer code doesn't rely on
+    // its own PT_PHDR.
+    //
+    // Real-world ELF inputs (everything Android NDK emits)
+    // ship a PT_PHDR by default, so refusing them outright
+    // — the prior behaviour — blocked the rewriter on real
+    // binaries. Dropping it is the pragmatic v1.
+    let phdrs_to_emit: Vec<&crate::container::ProgramHeader> = image
         .program_headers
         .iter()
-        .any(|p| p.p_type == elf::PT_PHDR)
-    {
-        return Err(ContainerWriteError::PtPhdrNotSupported);
-    }
+        .filter(|p| p.p_type != elf::PT_PHDR)
+        .collect();
 
     let new_seg_vaddr = appended.vaddr;
     let new_seg_filesz = appended.bytes.len() as u64;
@@ -605,7 +621,9 @@ pub(crate) fn write_with_appended_segment_inner(
     // Finally reserve the program header table at the end. We
     // reserve_program_headers *late* so its offset reflects the
     // post-content position; Writer reads `e_phoff` from this.
-    writer.reserve_program_headers((image.program_headers.len() + 1) as u32);
+    // Count: filtered phdrs (no PT_PHDR) + 1 for the new
+    // appended-segment PT_LOAD.
+    writer.reserve_program_headers((phdrs_to_emit.len() + 1) as u32);
 
     // ---------------------------------------------------------------
     // Write phase
@@ -678,7 +696,7 @@ pub(crate) fn write_with_appended_segment_inner(
     // strict loaders find the on-disk content where the phdr
     // says it should be.
     writer.write_align_program_headers();
-    for phdr in &image.program_headers {
+    for phdr in &phdrs_to_emit {
         let p_offset = if phdr.p_vaddr >= new_seg_vaddr
             && phdr.p_vaddr + phdr.p_filesz <= new_seg_vaddr + new_seg_filesz
         {

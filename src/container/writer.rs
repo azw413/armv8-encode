@@ -63,22 +63,22 @@ pub enum ContainerWriteError {
     ElfImageMissing,
     /// A rewrite grew an ELF section past its source extent. The
     /// in-place writer can't accommodate this; an
-    /// append-PT_LOAD-with-trampolines layout is needed. The first
-    /// iteration of that path (Stage 6.3) handles only inputs
-    /// without a PT_PHDR program header — see
-    /// [`PtPhdrNotSupported`] for that limit. This variant
-    /// preserved for the case where the grow-detection logic
-    /// itself rejects an input.
+    /// append-PT_LOAD-with-trampolines layout is needed. This
+    /// variant is preserved for the case where the
+    /// grow-detection logic itself rejects an input.
     ElfTextGrewBeyondExtent {
         section_name: String,
         original_extent: u64,
         new_size: u64,
     },
-    /// The append-PT_LOAD path doesn't yet handle inputs with a
-    /// PT_PHDR program header, because relocating the program
-    /// header table to file end requires either removing or
-    /// rewriting that segment. Inputs without PT_PHDR (most
-    /// shared libraries) work fine.
+    /// Historically raised when the append-PT_LOAD path was
+    /// asked to handle an input carrying a PT_PHDR program
+    /// header. Now unreachable: the writer drops PT_PHDR on
+    /// the way out (the new program-header table lives at
+    /// file end, and bionic/glibc tolerate the absence of
+    /// PT_PHDR — they fall back to the canonical `e_phoff`
+    /// in the ELF header). Kept as a variant for API
+    /// stability.
     PtPhdrNotSupported,
 }
 

@@ -464,7 +464,7 @@ ARMV8_COMPARE_STRICT=1 cargo test --test otool_compare -- --ignored --nocapture
 The `tests/elf_runtime/` directory builds a small aarch64 Linux
 fixture (`libgreet.so` + `libdep.so` + `host` + `host_dlopen`) inside a Docker
 image, exercises the full read → edit → write → load → run
-pipeline, and asserts on host stdout. Sixteen tests cover:
+pipeline, and asserts on host stdout. Seventeen tests cover:
 
 - baseline (sanity: harness works, fixture runs).
 - identity round-trip — `Container::to_bytes()` produces a
@@ -523,6 +523,12 @@ pipeline, and asserts on host stdout. Sixteen tests cover:
   calls on the same one-DT_NULL fixture, verifying that the
   relocated `.dynamic`'s DT_NULL headroom reserve absorbs all
   of them without re-relocating.
+- PT_PHDR-bearing input — synthesises a PT_PHDR program
+  header on libgreet's container (matching Android NDK
+  output, which ships PT_PHDR by default), calls
+  `add_library_dependency`, and verifies the writer drops
+  PT_PHDR cleanly and the loader still accepts the file at
+  runtime.
 
 Setup (one-time):
 
@@ -544,17 +550,22 @@ cargo test --test elf_runtime -- --ignored --nocapture
 The `tests/macho_runtime/` directory mirrors the ELF harness but
 runs natively on Apple Silicon — no Docker/QEMU. Build script
 uses `clang -dynamiclib` plus `codesign -s -` (ad-hoc) so dyld
-loads the rewritten dylib. Two tests cover:
+loads the rewritten dylib. Three tests cover:
 
 - baseline (sanity: fixture builds, signs, loads, runs).
 - ET_DYN-shaped round-trip — read `libgreet.dylib`, write it
   back through `Container::to_bytes` (Phase 1 passthrough
   writer + ad-hoc re-sign), host loads and runs the rewritten
   copy with identical stdout.
+- in-place __text edit — patch `_greet_double`'s `lsl Wd, Wn,
+  #1` to `#2` via `BinaryEditor::replace_instruction_at`,
+  commit through `commit_to_bytes`, host observes
+  `double=84` instead of `double=42`. Validates that
+  BinaryEditor composes with the Mach-O writer end-to-end.
 
-Subsequent phases will add in-place edit, append, export,
-initialiser, and library-dependency tests as the Mach-O writer
-reaches parity with the ELF one.
+Subsequent phases will add append, export, initialiser, and
+library-dependency tests as the Mach-O writer reaches parity
+with the ELF one.
 
 ```sh
 cargo test --test macho_runtime -- --ignored --nocapture
@@ -723,10 +734,17 @@ What's deliberately not yet implemented:
   `.eh_frame_hdr` becomes stale. Today we copy `.eh_frame_hdr`
   verbatim — fine for in-place edits and for appending new code
   (the new code has no FDEs).
-- **PT_PHDR-bearing inputs.** The append-PT_LOAD writer relocates
-  the program header table to file end, which is awkward when the
-  input has a PT_PHDR segment describing the table's location.
-  libgreet.so doesn't have one; many Linux binaries don't.
+- **PT_PHDR rewriting** isn't done. The append-PT_LOAD writer
+  relocates the program header table to file end and *drops*
+  any input PT_PHDR rather than rewriting it. The dynamic
+  linker uses `e_phoff` for the canonical lookup; PT_PHDR is
+  the runtime-introspection convenience copy and bionic /
+  glibc tolerate its absence (`dl_iterate_phdr` falls back,
+  the libgcc unwinder copes). Required for Android NDK
+  inputs, which carry PT_PHDR by default. Rewriting PT_PHDR
+  to point at the relocated phdr table (Option 2 in the
+  proposal) is the proper fix for completeness but isn't
+  needed in practice today.
 - **Mach-O ET_DYN rewriting.** `object::write::macho` is much
   weaker than `object::write::elf::Writer`; the Mach-O dylib
   writer is its own substantial project. Mach-O `.o` round-trip
