@@ -550,7 +550,7 @@ cargo test --test elf_runtime -- --ignored --nocapture
 The `tests/macho_runtime/` directory mirrors the ELF harness but
 runs natively on Apple Silicon — no Docker/QEMU. Build script
 uses `clang -dynamiclib` plus `codesign -s -` (ad-hoc) so dyld
-loads the rewritten dylib. Three tests cover:
+loads the rewritten dylib. Four tests cover:
 
 - baseline (sanity: fixture builds, signs, loads, runs).
 - ET_DYN-shaped round-trip — read `libgreet.dylib`, write it
@@ -562,8 +562,17 @@ loads the rewritten dylib. Three tests cover:
   commit through `commit_to_bytes`, host observes
   `double=84` instead of `double=42`. Validates that
   BinaryEditor composes with the Mach-O writer end-to-end.
+- appended function — add `_greet_quintuple` via
+  `BinaryEditor::add_function`, redirect `_greet_double`'s
+  first instruction to tail-call it. The new function lands
+  in a fresh R-X `LC_SEGMENT_64` placed before `__LINKEDIT`
+  in the file (so codesign's signature extension doesn't
+  swallow it) and at vmaddr past `__LINKEDIT`'s mapped
+  range. Host observes `double=105` (21*5) confirming dyld
+  loaded the new segment and PC-relative branches in/out
+  of it resolve.
 
-Subsequent phases will add append, export, initialiser, and
+Subsequent phases will add export, initialiser, and
 library-dependency tests as the Mach-O writer reaches parity
 with the ELF one.
 

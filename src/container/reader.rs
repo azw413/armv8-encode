@@ -64,7 +64,15 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         (
             BinaryFormat::Macho,
             ContainerKind::SharedObject | ContainerKind::Executable,
-        ) => Some(crate::container::macho_image::MachOImage::new(bytes.to_vec())),
+        ) => {
+            // Best-effort parse: a load-command parse failure
+            // doesn't fail the whole read since the rest of the
+            // container (sections, symbols) is still useful.
+            // The writer paths that need parsed metadata
+            // explicitly check for `Some(layout)` and fall back
+            // appropriately.
+            crate::container::macho_image::MachOImage::parse(bytes.to_vec()).ok()
+        }
         _ => None,
     };
 

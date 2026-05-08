@@ -2,3 +2,7 @@
 .idea/
 .DS_Store
 Cargo.lock
+tests/macho_runtime/fixtures/lib_demo/host
+tests/macho_runtime/fixtures/lib_demo/host.dSYM/Contents/Resources/DWARF/host
+tests/macho_runtime/fixtures/lib_demo/libgreet.dylib
+tests/macho_runtime/fixtures/lib_demo/libgreet.dylib.dSYM/Contents/Resources/DWARF/libgreet.dylib

@@ -539,6 +539,20 @@ pub(crate) fn write_with_appended_segment_inner(
     let _null_index = writer.reserve_null_section_index();
     let mut planned: Vec<PlannedSection> = Vec::with_capacity(container.sections.len());
 
+    // Pass 1 (source order): allocate section names + indices.
+    // This MUST iterate in container.sections order so the
+    // resulting section indices match the source — sh_link /
+    // sh_info references and any caller code that uses
+    // SectionId.0 as the section index keep working.
+    struct SectionPrep {
+        name_id: Option<object::write::StringId>,
+        section_index: u32,
+        layout: crate::container::SectionLayout,
+        is_nobits: bool,
+        effective_bytes_len: u64,
+        in_place_extent: u64,
+    }
+    let mut prepped: Vec<SectionPrep> = Vec::with_capacity(container.sections.len());
     for (i, section) in container.sections.iter().enumerate() {
         let layout = image
             .section_layout
@@ -551,18 +565,13 @@ pub(crate) fn write_with_appended_segment_inner(
                 sh_info: 0,
                 sh_entsize: 0,
             });
-
         let name_id = if section.name.is_empty() {
             None
         } else {
             Some(writer.add_section_name(section.name.as_bytes().to_vec().leak()))
         };
-        let _section_index = writer.reserve_section_index();
-
+        let section_index = writer.reserve_section_index();
         let is_nobits = matches!(section.kind, SectionKind::Bss);
-        // The override determines effective size when present;
-        // otherwise the source extent is preserved (so trailing
-        // padding fills any shrink).
         let effective_bytes_len = section_byte_overrides
             .get(&i)
             .map(|v| v.len() as u64)
@@ -574,29 +583,79 @@ pub(crate) fn write_with_appended_segment_inner(
         } else {
             effective_bytes_len
         };
+        prepped.push(SectionPrep {
+            name_id,
+            section_index: section_index.0,
+            layout,
+            is_nobits,
+            effective_bytes_len,
+            in_place_extent,
+        });
+    }
 
-        let file_offset = if is_nobits {
-            layout.sh_offset
-        } else if effective_bytes_len == 0 {
-            layout.sh_offset
-        } else if layout.sh_offset > 0 {
-            writer.reserve_until(layout.sh_offset as usize);
-            writer.reserve(in_place_extent as usize, 1) as u64
-        } else {
-            writer.reserve(in_place_extent as usize, section.align.max(1) as usize) as u64
-        };
+    // Pass 2 (sh_offset order): reserve file space.
+    // `Writer::reserve_until` advances the cursor monotonically
+    // and asserts cursor ≤ target, so sections with content
+    // (`sh_offset > 0`, non-NOBITS, non-empty bytes) must be
+    // placed in ascending sh_offset order even when that
+    // differs from source-index order. Real-world ELFs that
+    // round-trip through `object::build::elf::Builder` can have
+    // section header entries whose indices don't match file
+    // offset order — a perfectly legal layout the previous
+    // single-pass writer panicked on.
+    //
+    // Sections that don't reserve file space (NOBITS, empty
+    // bytes, sh_offset == 0) are accumulated in source order
+    // after the placement pass with `file_offset = sh_offset`.
+    let mut placement_order: Vec<usize> = (0..container.sections.len())
+        .filter(|&i| {
+            !prepped[i].is_nobits
+                && prepped[i].effective_bytes_len != 0
+                && prepped[i].layout.sh_offset > 0
+        })
+        .collect();
+    placement_order.sort_by_key(|&i| prepped[i].layout.sh_offset);
 
+    let mut file_offsets: Vec<u64> = vec![0; container.sections.len()];
+    for &i in &placement_order {
+        let layout = &prepped[i].layout;
+        writer.reserve_until(layout.sh_offset as usize);
+        let off = writer.reserve(prepped[i].in_place_extent as usize, 1) as u64;
+        file_offsets[i] = off;
+    }
+    // Sections with sh_offset = 0 but non-empty bytes get
+    // appended at the current cursor in source order
+    // (rare — typically synthetic relocatable sections).
+    for (i, section) in container.sections.iter().enumerate() {
+        if prepped[i].is_nobits || prepped[i].effective_bytes_len == 0 {
+            file_offsets[i] = prepped[i].layout.sh_offset;
+            continue;
+        }
+        if prepped[i].layout.sh_offset > 0 {
+            // Already placed in pass 2.
+            continue;
+        }
+        let off = writer.reserve(
+            prepped[i].in_place_extent as usize,
+            section.align.max(1) as usize,
+        ) as u64;
+        file_offsets[i] = off;
+    }
+
+    // Pass 3 (source order): build the `planned` vec so
+    // subsequent emission code keeps using source indices.
+    for (i, section) in container.sections.iter().enumerate() {
         planned.push(PlannedSection {
             section_id: section.id,
-            section_index: _section_index.0,
-            name_id,
-            file_offset,
-            sh_offset: layout.sh_offset,
-            sh_link: layout.sh_link,
-            sh_info: layout.sh_info,
-            sh_entsize: layout.sh_entsize,
-            in_place_extent,
-            is_nobits,
+            section_index: prepped[i].section_index,
+            name_id: prepped[i].name_id,
+            file_offset: file_offsets[i],
+            sh_offset: prepped[i].layout.sh_offset,
+            sh_link: prepped[i].layout.sh_link,
+            sh_info: prepped[i].layout.sh_info,
+            sh_entsize: prepped[i].layout.sh_entsize,
+            in_place_extent: prepped[i].in_place_extent,
+            is_nobits: prepped[i].is_nobits,
         });
     }
 
@@ -634,15 +693,49 @@ pub(crate) fn write_with_appended_segment_inner(
         .map_err(|err| ContainerWriteError::ObjectWrite(err.to_string()))?;
 
     // Original sections, with per-section byte overrides where
-    // requested.
-    for (i, (plan, section)) in planned.iter().zip(container.sections.iter()).enumerate() {
+    // requested. Iteration order MUST match the sh_offset order
+    // we used in the reserve phase — `Writer::pad_until` /
+    // `write` advance the buffer cursor monotonically and
+    // assert against backwards moves. Source-index order is
+    // preserved by the section header table separately
+    // (planned[i].section_index is set during reserve), so it's
+    // safe to write content out of source order.
+    let mut write_order: Vec<usize> = (0..container.sections.len())
+        .filter(|&i| {
+            !planned[i].is_nobits
+                && {
+                    let bytes = section_byte_overrides
+                        .get(&i)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&container.sections[i].bytes);
+                    !bytes.is_empty()
+                }
+                && planned[i].sh_offset > 0
+        })
+        .collect();
+    write_order.sort_by_key(|&i| planned[i].sh_offset);
+    let mut tail: Vec<usize> = (0..container.sections.len())
+        .filter(|&i| {
+            !planned[i].is_nobits
+                && {
+                    let bytes = section_byte_overrides
+                        .get(&i)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&container.sections[i].bytes);
+                    !bytes.is_empty()
+                }
+                && planned[i].sh_offset == 0
+        })
+        .collect();
+    write_order.append(&mut tail);
+
+    for &i in &write_order {
+        let plan = &planned[i];
+        let section = &container.sections[i];
         let bytes_to_write: &[u8] = section_byte_overrides
             .get(&i)
             .map(|v| v.as_slice())
             .unwrap_or(&section.bytes);
-        if plan.is_nobits || bytes_to_write.is_empty() {
-            continue;
-        }
         if plan.sh_offset > 0 {
             writer.pad_until(plan.sh_offset as usize);
         } else {

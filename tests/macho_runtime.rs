@@ -274,6 +274,109 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn et_dyn_appended_function_changes_observable_output() {
+    // Phase 3 acceptance: append a new function to
+    // libgreet.dylib via BinaryEditor::add_function (lands in a
+    // fresh LC_SEGMENT_64 past the input's mapped range), then
+    // patch _greet_double's first instruction to be
+    // `b _greet_quintuple` so the host's existing call lands in
+    // the new code.
+    //
+    // _greet_quintuple(n) = n * 5, so host's
+    // greet_double(21) returns 21*5 = 105. Acceptance proves:
+    //   1. the writer's load-command splice produced a valid
+    //      Mach-O dyld accepts;
+    //   2. the new segment is loaded at the chosen vaddr;
+    //   3. the appended function's bytes execute correctly;
+    //   4. PC-relative branches in/out of the new segment
+    //      resolve correctly through the rewriter pipeline.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{
+        Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
+        ShiftedRegister,
+    };
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+
+    // greet_quintuple(n) = n * 5: lsl w8,w0,#2; add w0,w8,w0; ret.
+    let w0 = Register { class: RegisterClass::W, index: 0 };
+    let w8 = Register { class: RegisterClass::W, index: 8 };
+    let x30 = Register { class: RegisterClass::X, index: 30 };
+    let new_function = vec![
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Lsl,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w8.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Add,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w8)),
+                RewriteOperand::Decoded(DecodedOperand::ShiftedRegister(ShiftedRegister {
+                    register: w0,
+                    shift: Shift { kind: ShiftKind::Lsl, amount: 0 },
+                })),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Ret,
+            operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+            original_address: None,
+        },
+    ];
+
+    let quintuple_id = editor
+        .binary
+        .add_function("_greet_quintuple", new_function)
+        .expect("add_function");
+
+    // Patch _greet_double's first instruction to tail-call
+    // _greet_quintuple.
+    let greet_double_addr = editor
+        .binary
+        .function_address("_greet_double")
+        .expect("_greet_double symbol");
+    editor
+        .text
+        .as_mut()
+        .unwrap()
+        .replace_instruction_at(
+            greet_double_addr,
+            RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::B,
+                operands: vec![RewriteOperand::Branch(Target::Symbol(quintuple_id))],
+                original_address: Some(greet_double_addr),
+            },
+        )
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=105 offset=107\n",
+        "appended _greet_quintuple should make greet_double() \
+         tail-call into it, returning 21*5=105",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_round_trip_through_container_loads_and_runs() {
     // Phase 1 acceptance: read libgreet.dylib, round-trip it
     // through Container::to_bytes (which routes through the

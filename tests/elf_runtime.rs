@@ -1581,6 +1581,96 @@ fn et_dyn_add_library_dependency_drops_pt_phdr_on_input_with_one() {
     );
 }
 
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_writer_handles_out_of_order_sh_offsets() {
+    // Regression for the Builder-normalised-input bug: real
+    // ELFs that round-trip through `object::build::elf::Builder`
+    // sometimes emit the section header table with entries
+    // whose `sh_offset` values aren't in ascending order
+    // (e.g. `.shstrtab` precedes `.strtab` in the section
+    // table even though it lives later in the file).
+    //
+    // The single-pass writer assumed source-index order
+    // matched file-offset order and used `Writer::reserve_until`
+    // / `pad_until` (both monotonic). Out-of-order inputs
+    // panicked in dev builds (`assertion failed: self.len <=
+    // offset`) and silently corrupted output in release.
+    //
+    // We synthesise the failure mode by swapping two
+    // consecutive section_layout entries on libgreet so their
+    // sh_offset values appear in the wrong section-index
+    // order. The two-pass writer should still produce a
+    // loadable ELF.
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let mut container = Container::from_bytes(&lib_bytes).expect("parse libgreet.so");
+
+    // Mimic Builder-normalised section ordering: pick two
+    // non-bss adjacent sections and swap their *layouts*
+    // (sh_offset and sh_size together) AND their on-disk
+    // byte content. The result is a Container where
+    // section_index N+1 has a smaller sh_offset than section
+    // N — the same out-of-order shape Builder produces for
+    // .strtab/.shstrtab on stripped Android binaries.
+    let image = container.elf_image.as_mut().expect("elf_image");
+    let mut swapped = false;
+    for i in 0..image.section_layout.len() - 1 {
+        let l1 = image.section_layout[i];
+        let l2 = image.section_layout[i + 1];
+        let s1_kind = container.sections[i].kind;
+        let s2_kind = container.sections[i + 1].kind;
+        let s1_ok = !matches!(
+            s1_kind,
+            armv8_encode::container::SectionKind::Bss,
+        ) && l1.sh_size > 0
+            && l1.sh_offset > 0;
+        let s2_ok = !matches!(
+            s2_kind,
+            armv8_encode::container::SectionKind::Bss,
+        ) && l2.sh_size > 0
+            && l2.sh_offset > 0;
+        if s1_ok && s2_ok && l1.sh_offset < l2.sh_offset {
+            // Swap entire layout entries.
+            image.section_layout.swap(i, i + 1);
+            // Swap section content (bytes, address, kind, …) so
+            // the file is internally consistent: the section
+            // originally at l1 is now mapped at l2, and vice
+            // versa.
+            container.sections.swap(i, i + 1);
+            // SectionId.0 is canonically the section's index;
+            // the swap makes the IDs disagree with positions.
+            // Restore by reassigning IDs.
+            container.sections[i].id = armv8_encode::container::SectionId(i);
+            container.sections[i + 1].id =
+                armv8_encode::container::SectionId(i + 1);
+            swapped = true;
+            break;
+        }
+    }
+    assert!(swapped, "couldn't find two adjacent sections to swap");
+
+    // Add a library dependency to trigger the appended-segment
+    // path (which is where the bug originally surfaced).
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .add_library_dependency("libdep.so")
+        .expect("add_library_dependency");
+    // commit_to_bytes used to panic with `assertion failed:
+    // self.len <= offset` here in dev builds. We don't run the
+    // host since the swap leaves on-disk section bytes in the
+    // wrong place — we're verifying the writer doesn't panic
+    // and produces re-parseable output.
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet");
+}
+
 // ---- ELF structural-equivalence checker --------------------------------
 //
 // Used by Stage 5 round-trip tests as a stronger oracle than "did

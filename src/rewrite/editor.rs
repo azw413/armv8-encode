@@ -648,6 +648,61 @@ impl LiftedTextSection {
 }
 
 impl BinaryState {
+    /// Pick a virtual address for a fresh appended segment.
+    /// Page-aligned past the highest existing mapped vaddr.
+    /// Format-aware: ELF reads PT_LOAD entries from the
+    /// captured `elf_image`; Mach-O reads `LC_SEGMENT_64`
+    /// entries from `macho_image.layout`.
+    fn pick_append_vaddr(&self) -> Result<u64, TextEditorError> {
+        match self.container.format {
+            crate::container::BinaryFormat::Elf => {
+                let image = self
+                    .container
+                    .elf_image
+                    .as_ref()
+                    .ok_or(TextEditorError::AppendMissingElfImage)?;
+                let max_input_vaddr = image
+                    .program_headers
+                    .iter()
+                    .filter(|p| p.p_type == object::elf::PT_LOAD)
+                    .map(|p| p.p_vaddr.saturating_add(p.p_memsz))
+                    .max()
+                    .unwrap_or(0);
+                const PAGE: u64 = 0x10000;
+                let aligned = (max_input_vaddr + PAGE - 1) & !(PAGE - 1);
+                Ok(aligned.max(PAGE))
+            }
+            crate::container::BinaryFormat::Macho => {
+                let image = self
+                    .container
+                    .macho_image
+                    .as_ref()
+                    .ok_or(TextEditorError::AppendMissingElfImage)?;
+                let max_input_vaddr = image.layout.max_vaddr_end();
+                const PAGE: u64 = 0x4000; // arm64 macOS page size
+                // Place the appended segment well past
+                // `__LINKEDIT`'s vmaddr range. Specifically:
+                // codesign's re-sign step extends
+                // `__LINKEDIT.vmsize` (page-aligned) to cover
+                // the new signature blob, which sits at
+                // file end past our appended bytes. Any
+                // appended.vmaddr that falls inside the
+                // post-extension __LINKEDIT range trips dyld's
+                // "vm range of __LINKEDIT overlaps X" check at
+                // load.
+                //
+                // Add a generous gap (16 pages = 64 KB) past
+                // max_vaddr_end so codesign's extension can't
+                // reach the appended segment. This is overkill
+                // for ad-hoc signatures (which are <20 KB)
+                // but cheap and simple.
+                const GAP: u64 = 16 * PAGE;
+                let aligned = (max_input_vaddr + GAP + PAGE - 1) & !(PAGE - 1);
+                Ok(aligned.max(PAGE))
+            }
+        }
+    }
+
     /// Append a new function to the binary in a fresh executable
     /// segment.
     ///
@@ -712,27 +767,7 @@ impl BinaryState {
         // calls pack into the same segment in order.
         let segment_vaddr = match &self.appended {
             Some(state) => state.segment_vaddr,
-            None => {
-                // Re-implement `pick_append_vaddr` locally so we
-                // don't take a private dependency on the writer
-                // module's helpers. This is just "max p_vaddr +
-                // p_memsz, page-aligned up."
-                let image = self
-                    .container
-                    .elf_image
-                    .as_ref()
-                    .ok_or(TextEditorError::AppendMissingElfImage)?;
-                let max_input_vaddr = image
-                    .program_headers
-                    .iter()
-                    .filter(|p| p.p_type == object::elf::PT_LOAD)
-                    .map(|p| p.p_vaddr.saturating_add(p.p_memsz))
-                    .max()
-                    .unwrap_or(0);
-                const PAGE: u64 = 0x10000;
-                let aligned = (max_input_vaddr + PAGE - 1) & !(PAGE - 1);
-                aligned.max(PAGE)
-            }
+            None => self.pick_append_vaddr()?,
         };
         // Function bodies must be 4-byte aligned so PC-relative
         // branches inside them encode without a non-multiple-of-4
@@ -1184,23 +1219,7 @@ impl BinaryState {
         // add_function.
         let segment_vaddr = match &self.appended {
             Some(state) => state.segment_vaddr,
-            None => {
-                let image = self
-                    .container
-                    .elf_image
-                    .as_ref()
-                    .ok_or(TextEditorError::AppendMissingElfImage)?;
-                let max_input_vaddr = image
-                    .program_headers
-                    .iter()
-                    .filter(|p| p.p_type == object::elf::PT_LOAD)
-                    .map(|p| p.p_vaddr.saturating_add(p.p_memsz))
-                    .max()
-                    .unwrap_or(0);
-                const PAGE: u64 = 0x10000;
-                let aligned = (max_input_vaddr + PAGE - 1) & !(PAGE - 1);
-                aligned.max(PAGE)
-            }
+            None => self.pick_append_vaddr()?,
         };
 
         // Pad cumulative bytes up to the requested alignment.
@@ -1955,6 +1974,15 @@ impl BinaryEditor {
     /// text section can call this directly — the in-section
     /// rewrite phase is skipped when no text section is present.
     pub fn commit_to_bytes(mut self) -> Result<Vec<u8>, TextEditorError> {
+        // Dispatch on container format up-front for the
+        // appended-segment case. ELF and Mach-O have separate
+        // append-segment writers; only ELF uses the
+        // dynsym/init/dynamic finalizers below.
+        let is_macho = matches!(
+            self.binary.container.format,
+            crate::container::BinaryFormat::Macho,
+        );
+
         // Library-dep additions need to land in the appended
         // segment (they grow `.dynstr`, which can't grow in
         // place). If a caller used only `add_library_dependency`
@@ -2025,6 +2053,29 @@ impl BinaryEditor {
                     }
                     None => binary.container.clone(),
                 };
+
+                if is_macho {
+                    // Phase 3 Mach-O append-segment path.
+                    // Caller-staged section_overrides (e.g. from
+                    // text-edit commits above) are merged with
+                    // the editor's queue so the writer applies
+                    // them at original file offsets before
+                    // splicing in the new segment.
+                    let mut all_overrides: Vec<(usize, Vec<u8>)> = overrides
+                        .into_iter()
+                        .collect();
+                    for (idx, bytes) in &binary.section_overrides {
+                        all_overrides.push((*idx, bytes.clone()));
+                    }
+                    let segment = crate::container::macho_writer::AppendedSegment::new(
+                        appended.segment_vaddr,
+                        appended.bytes,
+                    );
+                    return crate::container::macho_writer::write_with_appended_segment(
+                        &updated, segment, &all_overrides,
+                    )
+                    .map_err(TextEditorError::from);
+                }
 
                 let mut image = updated
                     .elf_image
