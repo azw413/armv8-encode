@@ -71,14 +71,29 @@ pub(crate) struct AppendedSegment {
     /// header table. Defaults to `.text.armv8_encode_appended` when
     /// constructed via [`AppendedSegment::new`].
     pub section_name: String,
-    /// PT_LOAD `p_flags` for the appended segment. Defaults to
-    /// `PF_R | PF_W | PF_X` for back-compat with the add_function
-    /// / add_initialiser paths. Android (post-API 26 strict, fully
-    /// enforced on Android 10+) refuses to load shared objects
-    /// with W+X PT_LOADs (`has load segments that are both writable
-    /// and executable`), so callers that don't append executable
-    /// content (e.g. add_library_dependency) should drop PF_X.
+    /// PT_LOAD `p_flags` for the appended segment when emitted as a
+    /// single PT_LOAD (i.e. when [`Self::code_len`] is zero or
+    /// covers the whole segment). Android refuses W+X PT_LOADs;
+    /// callers that mix code and data set `code_len` and let the
+    /// writer split into two PT_LOADs (R+X for code, R+W for
+    /// data) instead of relying on this field.
     pub p_flags: u32,
+    /// Number of leading bytes in [`Self::bytes`] that contain
+    /// executable code (function bodies). Bytes from `code_len`
+    /// onward are data (rebuilt dynsym/dynstr, init slots,
+    /// relocated `.dynamic`, etc.). When non-zero AND less than
+    /// `bytes.len()`, the writer emits two PT_LOADs spanning the
+    /// segment: R+X over the code prefix (rounded up to a page
+    /// boundary), R+W over the data suffix. When `0`, the entire
+    /// segment is treated as data and emitted under
+    /// [`Self::p_flags`]. When equal to `bytes.len()`, the entire
+    /// segment is treated as code and emitted under
+    /// [`Self::p_flags`].
+    ///
+    /// Page padding is inserted between the two halves so the
+    /// data region starts on a page-aligned vaddr; readable bytes
+    /// in the gap are zeroes.
+    pub code_len: u64,
 }
 
 impl AppendedSegment {
@@ -88,7 +103,41 @@ impl AppendedSegment {
             bytes,
             section_name: ".text.armv8_encode_appended".to_string(),
             p_flags: elf::PF_R | elf::PF_W | elf::PF_X,
+            code_len: 0,
         }
+    }
+}
+
+/// Layout decision for an appended segment that mixes code
+/// and data. `code_split` is the file/vaddr offset (relative
+/// to the segment start) at which code ends and data begins —
+/// rounded up to a page boundary so the two halves get distinct
+/// PT_LOADs. `code_padding` is the number of bytes we have to
+/// inject after the code prefix to reach `code_split`.
+///
+/// `Single` means no split — caller emits one PT_LOAD as before.
+struct CodeDataSplit {
+    /// `0` means single-segment (no split). Non-zero is the
+    /// page-aligned boundary between code and data within the
+    /// segment.
+    code_split: u64,
+    /// Bytes of padding inserted between
+    /// `appended.bytes[..code_len]` and
+    /// `appended.bytes[code_len..]` to reach `code_split`.
+    code_padding: u64,
+}
+
+fn compute_code_data_split(appended: &AppendedSegment) -> CodeDataSplit {
+    let total = appended.bytes.len() as u64;
+    let code_len = appended.code_len;
+    if code_len == 0 || code_len >= total {
+        // All-data, all-code, or empty — no split needed.
+        return CodeDataSplit { code_split: 0, code_padding: 0 };
+    }
+    let aligned = align_up(code_len, APPEND_PAGE_ALIGN);
+    CodeDataSplit {
+        code_split: aligned,
+        code_padding: aligned - code_len,
     }
 }
 
@@ -527,7 +576,43 @@ pub(crate) fn write_with_appended_segment_inner(
         .collect();
 
     let new_seg_vaddr = appended.vaddr;
-    let new_seg_filesz = appended.bytes.len() as u64;
+
+    // If the segment mixes code (leading bytes) and data, pad
+    // the code prefix up to a page boundary so the two halves
+    // can be mapped under separate PT_LOAD entries with
+    // different permissions. Android refuses W+X PT_LOADs, and
+    // a single PT_LOAD covering both code (X) and data (W)
+    // would require exactly that.
+    //
+    // `code_padding` = bytes of NOPs we'll inject between the
+    // last code instruction and the first data byte. `0` when
+    // the segment is single-class (all code, all data, or
+    // empty code_len).
+    let split = compute_code_data_split(&appended);
+    let appended_bytes_padded: std::borrow::Cow<[u8]> = if split.code_padding == 0 {
+        std::borrow::Cow::Borrowed(&appended.bytes)
+    } else {
+        let mut padded =
+            Vec::with_capacity(appended.bytes.len() + split.code_padding as usize);
+        padded.extend_from_slice(&appended.bytes[..appended.code_len as usize]);
+        // NOP-pad the code-end-to-page gap so a runaway PC
+        // hits NOPs and falls into the data PT_LOAD's
+        // ungated permissions only after walking through
+        // them; reduces the surprise of executing zero bytes
+        // (which decode to UDF on aarch64).
+        for _ in 0..(split.code_padding / 4) {
+            padded.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        }
+        // Tail (less than 4 bytes) — shouldn't happen because
+        // page sizes and code lengths are 4-aligned, but be
+        // defensive.
+        for _ in 0..(split.code_padding % 4) {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&appended.bytes[appended.code_len as usize..]);
+        std::borrow::Cow::Owned(padded)
+    };
+    let new_seg_filesz = appended_bytes_padded.len() as u64;
     let new_seg_memsz = new_seg_filesz;
 
     // ---------------------------------------------------------------
@@ -686,9 +771,14 @@ pub(crate) fn write_with_appended_segment_inner(
     // reserve_program_headers *late* so its offset reflects the
     // post-content position; Writer reads `e_phoff` from this.
     // Count: filtered phdrs (no PT_PHDR) + 1 fresh PT_PHDR
-    // pointing at the new PHT location + 1 for the appended-
-    // segment PT_LOAD.
-    writer.reserve_program_headers((phdrs_to_emit.len() + 2) as u32);
+    // pointing at the new PHT location + 1 or 2 PT_LOAD
+    // entries for the appended segment (one segment, or one
+    // each for the code prefix + data suffix when the segment
+    // mixes both — see `compute_code_data_split`).
+    let appended_pt_load_count: u32 = if split.code_split == 0 { 1 } else { 2 };
+    writer.reserve_program_headers(
+        (phdrs_to_emit.len() as u32) + 1 + appended_pt_load_count,
+    );
 
     // ---------------------------------------------------------------
     // Write phase
@@ -786,7 +876,7 @@ pub(crate) fn write_with_appended_segment_inner(
 
     // Appended segment content. write_align matches the reserve call.
     writer.write_align(APPEND_PAGE_ALIGN as usize);
-    writer.write(&appended.bytes);
+    writer.write(&appended_bytes_padded);
 
     // Program header table at end. If a phdr's p_vaddr falls
     // inside the appended segment (e.g. PT_DYNAMIC after a
@@ -809,7 +899,8 @@ pub(crate) fn write_with_appended_segment_inner(
     // (and SysV uses it for AT_PHDR). Counted in
     // `reserve_program_headers((N + 2) as u32)` above.
     let phdr_entry_size: u64 = 56; // sizeof(Elf64_Phdr)
-    let phdr_count: u64 = (phdrs_to_emit.len() + 2) as u64;
+    let phdr_count: u64 =
+        (phdrs_to_emit.len() as u64) + 1 + appended_pt_load_count as u64;
     let elf_align: u64 = 8;
     let pht_file_offset =
         (appended_file_offset + new_seg_filesz + elf_align - 1) & !(elf_align - 1);
@@ -844,33 +935,56 @@ pub(crate) fn write_with_appended_segment_inner(
             p_align: phdr.p_align,
         });
     }
-    // Permissions on the appended segment come from
-    // `appended.p_flags`. Default is RWX (back-compat with
-    // add_function + add_initialiser, which need both X for
-    // appended code and W for `R_AARCH64_RELATIVE` writes
-    // into appended `.init_array`). Android refuses W+X
-    // PT_LOADs, so callers that append only data
-    // (add_library_dependency) drop PF_X.
-    //
-    // Extend filesz/memsz to include the program-header table
-    // that we just wrote at the file's end. Bionic's loader
-    // verifies the runtime PHT address lies within some
-    // PT_LOAD; otherwise it rejects with `loaded phdr ... not
-    // in loadable segment`. `pht_file_offset`/`phdr_count`
-    // were computed above (where PT_PHDR was emitted).
+    // Cover the program-header table — bionic verifies the
+    // runtime PHT address lies within some PT_LOAD; otherwise
+    // it rejects with `loaded phdr ... not in loadable segment`.
     let pht_end = pht_file_offset + phdr_count * phdr_entry_size;
-    let cover_filesz = pht_end - appended_file_offset;
-    let cover_memsz = cover_filesz;
-    writer.write_program_header(&ProgramHeader {
-        p_type: elf::PT_LOAD,
-        p_flags: appended.p_flags,
-        p_offset: appended_file_offset,
-        p_vaddr: new_seg_vaddr,
-        p_paddr: new_seg_vaddr,
-        p_filesz: cover_filesz,
-        p_memsz: cover_memsz,
-        p_align: APPEND_PAGE_ALIGN,
-    });
+    let total_cover = pht_end - appended_file_offset;
+
+    // One PT_LOAD or two:
+    // - One: caller didn't request a code/data split, so
+    //   the entire appended region (including the trailing
+    //   PHT) gets `appended.p_flags`. Single-class appends
+    //   use this — pure data (library_inject) under R+W,
+    //   pure code under R+X, or back-compat RWX.
+    // - Two: caller set `code_len` and the writer split.
+    //   PT_LOAD #1 covers the code prefix at R+X (page-
+    //   aligned via `code_split`). PT_LOAD #2 covers the
+    //   data suffix + the PHT at R+W. Android refuses W+X
+    //   so this is mandatory whenever an append needs both.
+    if split.code_split == 0 {
+        writer.write_program_header(&ProgramHeader {
+            p_type: elf::PT_LOAD,
+            p_flags: appended.p_flags,
+            p_offset: appended_file_offset,
+            p_vaddr: new_seg_vaddr,
+            p_paddr: new_seg_vaddr,
+            p_filesz: total_cover,
+            p_memsz: total_cover,
+            p_align: APPEND_PAGE_ALIGN,
+        });
+    } else {
+        writer.write_program_header(&ProgramHeader {
+            p_type: elf::PT_LOAD,
+            p_flags: elf::PF_R | elf::PF_X,
+            p_offset: appended_file_offset,
+            p_vaddr: new_seg_vaddr,
+            p_paddr: new_seg_vaddr,
+            p_filesz: split.code_split,
+            p_memsz: split.code_split,
+            p_align: APPEND_PAGE_ALIGN,
+        });
+        writer.write_program_header(&ProgramHeader {
+            p_type: elf::PT_LOAD,
+            p_flags: elf::PF_R | elf::PF_W,
+            p_offset: appended_file_offset + split.code_split,
+            p_vaddr: new_seg_vaddr + split.code_split,
+            p_paddr: new_seg_vaddr + split.code_split,
+            p_filesz: total_cover - split.code_split,
+            p_memsz: total_cover - split.code_split,
+            p_align: APPEND_PAGE_ALIGN,
+        });
+    }
     let _ = new_seg_memsz;
 
     drop(writer);

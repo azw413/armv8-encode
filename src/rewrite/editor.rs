@@ -547,6 +547,15 @@ impl BinaryState {
             .ok_or_else(|| TextEditorError::SymbolNotFound(name.to_string()))
     }
 
+    /// Address of `id`'s symbol after any layout the editor
+    /// has performed up to this point. Used by callers that
+    /// `add_function` / `add_initialiser` and need to know
+    /// where the new code landed (e.g. to record a runtime
+    /// trap address derived from the body's vaddr).
+    pub fn symbol_address(&self, id: SymbolId) -> u64 {
+        self.container.symbol(id).address
+    }
+
     /// Look up a function symbol by name. Stricter than
     /// [`Self::symbol_by_name`]: only matches `STT_FUNC`-kind
     /// symbols. Useful when redirecting calls to disambiguate
@@ -2582,14 +2591,18 @@ impl BinaryEditor {
                     &updated,
                     &mut overrides,
                 )?;
-                // No executable content was appended when there
-                // are no exports, no raw add_function bytes, and
-                // no appended init slots — only library deps and
-                // any relocated `.dynamic`/`.dynstr`/`.dynsym`.
-                // Drop PF_X so the segment is R+W rather than
-                // RWX; Android refuses W+X PT_LOADs (`has load
-                // segments that are both writable and
-                // executable`).
+                // The first `appended.bytes.len()` bytes of the
+                // segment are executable code (function bodies
+                // packed by `extend_segment_for_exports`'s prefix
+                // copy and any `add_function` payload). Everything
+                // after is data — rebuilt dynsym/dynstr, init
+                // slots, relocated `.dynamic`/`.dynstr`/`.dynsym`.
+                // The writer uses `code_len` to choose between a
+                // single PT_LOAD (all-code or all-data) and a
+                // split (R+X over the code prefix, R+W over the
+                // data suffix). Android refuses W+X PT_LOADs, so
+                // any append that mixes both must split.
+                let original_code_len = appended.bytes.len() as u64;
                 let no_executable_append = appended.exports.is_empty()
                     && appended.bytes.is_empty()
                     && binary.pending_appended_init_slots.is_empty();
@@ -2600,6 +2613,15 @@ impl BinaryEditor {
                 if no_executable_append {
                     use object::elf;
                     segment.p_flags = elf::PF_R | elf::PF_W;
+                } else if original_code_len > 0
+                    && (original_code_len as usize) < segment.bytes.len()
+                {
+                    // Mixed code + data — request a writer split.
+                    segment.code_len = original_code_len;
+                } else {
+                    // Pure-code append (no exports/dyn rebuild).
+                    use object::elf;
+                    segment.p_flags = elf::PF_R | elf::PF_X;
                 }
                 crate::container::elf_writer::write_with_appended_segment_inner(
                     &updated, &image, segment, overrides,
