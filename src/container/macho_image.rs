@@ -112,6 +112,138 @@ pub struct MachODysymtab {
     pub nundefsym: u32,
 }
 
+/// One contiguous range of bytes inside an existing segment
+/// that isn't claimed by any section's declared range. Used
+/// by the intra-segment placement strategy: callers can put
+/// new content into these gaps without adding a fresh
+/// `LC_SEGMENT_64`, which is required for App Store
+/// submissions (rejected if more than one R-X segment is
+/// present).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MachOFreeRegion {
+    /// Start vmaddr of the free region.
+    pub vaddr: u64,
+    /// Start file offset of the free region.
+    pub file_offset: u64,
+    /// Size in bytes of the free region.
+    pub size: u64,
+    /// Name of the segment this region lives inside (e.g.
+    /// `__TEXT`). Determines what permissions content placed
+    /// here will have at runtime.
+    pub segment_name: String,
+}
+
+impl MachOLayout {
+    /// Compute free regions inside `__TEXT` — the gaps
+    /// between consecutive sections (sorted by file offset)
+    /// plus the gap from the last section's end to the
+    /// segment's file end. Section alignment + segment-end
+    /// padding routinely leaves several KB of free space in
+    /// most dylibs, which fits an initialiser wrapper or
+    /// small payload comfortably.
+    pub fn text_free_regions(&self) -> Vec<MachOFreeRegion> {
+        let Some(text_seg) = self.segments.iter().find(|s| s.name == "__TEXT") else {
+            return Vec::new();
+        };
+        // Sections inside __TEXT, sorted by file offset.
+        let mut text_sections: Vec<&MachOSection> = self
+            .sections
+            .iter()
+            .filter(|s| s.segname == "__TEXT" && s.file_offset > 0)
+            .collect();
+        text_sections.sort_by_key(|s| s.file_offset);
+
+        let mut out = Vec::new();
+        // Cursor walks file offsets; we record any gap
+        // between the cursor and the next section's
+        // file_offset.
+        let mut cursor_file = text_seg.fileoff;
+        let mut cursor_vaddr = text_seg.vmaddr;
+        // Skip past the mach_header and load commands at the
+        // start of __TEXT — that region is reserved.
+        if cursor_file == 0 {
+            // mach_header_64 is 32 bytes; load commands
+            // follow. The first section's file_offset already
+            // accounts for them. Just leave the cursor where
+            // the segment starts and let the loop skip ahead
+            // to the first section's offset (which is
+            // typically 0x40 + sizeofcmds).
+        }
+        for section in &text_sections {
+            if section.file_offset > cursor_file {
+                let gap = section.file_offset - cursor_file;
+                let gap_vaddr = section.vaddr - (section.file_offset - cursor_file);
+                // The first gap is the mach_header + load
+                // commands area; skip it (we don't want
+                // callers to overwrite headers).
+                if cursor_file > text_seg.fileoff {
+                    out.push(MachOFreeRegion {
+                        vaddr: cursor_vaddr,
+                        file_offset: cursor_file,
+                        size: gap,
+                        segment_name: "__TEXT".to_string(),
+                    });
+                }
+                let _ = gap_vaddr;
+            }
+            cursor_file = section.file_offset + section.size;
+            cursor_vaddr = section.vaddr + section.size;
+        }
+        // Tail gap from the last section's end to the
+        // segment's file end.
+        let seg_file_end = text_seg.fileoff + text_seg.filesize;
+        let seg_vmaddr_end = text_seg.vmaddr + text_seg.vmsize;
+        if cursor_file < seg_file_end {
+            out.push(MachOFreeRegion {
+                vaddr: cursor_vaddr,
+                file_offset: cursor_file,
+                size: seg_file_end - cursor_file,
+                segment_name: "__TEXT".to_string(),
+            });
+        }
+        let _ = seg_vmaddr_end;
+        out
+    }
+
+    /// Best-fit allocate `bytes_needed` (aligned to
+    /// `align_to`) inside `__TEXT`'s free regions. Returns
+    /// the chosen `(vaddr, file_offset)`, or `None` if no
+    /// single region is large enough.
+    pub fn allocate_in_text(
+        &self,
+        bytes_needed: u64,
+        align_to: u64,
+    ) -> Option<(u64, u64)> {
+        let regions = self.text_free_regions();
+        // Best-fit: pick the smallest region that has enough
+        // post-alignment room.
+        let mut best: Option<(u64, u64, u64)> = None; // (size_after_align, vaddr, file_offset)
+        for region in &regions {
+            let aligned_vaddr = align_up(region.vaddr, align_to);
+            let aligned_off = aligned_vaddr - region.vaddr + region.file_offset;
+            let alignment_padding = aligned_vaddr - region.vaddr;
+            if region.size < alignment_padding + bytes_needed {
+                continue;
+            }
+            let usable = region.size - alignment_padding;
+            if let Some((best_size, _, _)) = best {
+                if usable >= best_size {
+                    continue;
+                }
+            }
+            best = Some((usable, aligned_vaddr, aligned_off));
+        }
+        best.map(|(_, vaddr, off)| (vaddr, off))
+    }
+}
+
+fn align_up(value: u64, align: u64) -> u64 {
+    if align <= 1 {
+        return value;
+    }
+    (value + align - 1) & !(align - 1)
+}
+
 /// One `LC_SEGMENT_64` entry's interesting fields.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MachOSegment {
@@ -748,5 +880,71 @@ mod tests {
         let bytes = synth_macho(&[bad]);
         let err = MachOLayout::parse(&bytes).expect_err("too-small segment");
         assert!(format!("{err}").contains("LC_SEGMENT_64"));
+    }
+
+    #[test]
+    fn text_free_regions_finds_tail_gap() {
+        // __TEXT segment 0x4000 long, one section at the
+        // start with size 0x100. Expected tail gap is the
+        // remaining 0x4000 - 0x100 - section_offset bytes.
+        let bytes = synth_macho(&[segment_64_with_section(
+            "__TEXT", 0x0, 0x4000, 0x0, 0x4000, "__text", 0x1000, 0x100, 0x1000,
+        )]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let regions = layout.text_free_regions();
+        // One tail gap from end-of-__text (file 0x1100) to
+        // end-of-__TEXT (file 0x4000) = 0x2f00 bytes.
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].file_offset, 0x1100);
+        assert_eq!(regions[0].size, 0x4000 - 0x1100);
+        assert_eq!(regions[0].vaddr, 0x1100);
+        assert_eq!(regions[0].segment_name, "__TEXT");
+    }
+
+    #[test]
+    fn allocate_in_text_returns_aligned_offset_when_fits() {
+        let bytes = synth_macho(&[segment_64_with_section(
+            "__TEXT", 0x0, 0x4000, 0x0, 0x4000, "__text", 0x1000, 0x100, 0x1000,
+        )]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        // Request 0x100 bytes aligned to 4. The tail gap
+        // starts at file 0x1100 (already 4-aligned), so the
+        // returned (vaddr, file_offset) should be (0x1100,
+        // 0x1100).
+        let (vaddr, file_offset) = layout
+            .allocate_in_text(0x100, 4)
+            .expect("should fit");
+        assert_eq!(vaddr, 0x1100);
+        assert_eq!(file_offset, 0x1100);
+    }
+
+    #[test]
+    fn allocate_in_text_returns_none_when_no_region_fits() {
+        let bytes = synth_macho(&[segment_64_with_section(
+            "__TEXT", 0x0, 0x4000, 0x0, 0x4000, "__text", 0x1000, 0x100, 0x1000,
+        )]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        // Request 1 GB — won't fit anywhere.
+        assert!(layout.allocate_in_text(0x4000_0000, 4).is_none());
+    }
+
+    #[test]
+    fn text_free_regions_skips_header_gap() {
+        // The mach_header + load commands sit at the start
+        // of __TEXT before the first section. We don't want
+        // callers placing content there because that would
+        // overwrite the header.
+        let bytes = synth_macho(&[segment_64_with_section(
+            "__TEXT", 0x0, 0x4000, 0x0, 0x4000, "__text", 0x1000, 0x100, 0x1000,
+        )]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let regions = layout.text_free_regions();
+        for region in &regions {
+            assert!(
+                region.file_offset >= 0x1000,
+                "free region at file {} shouldn't include the header area",
+                region.file_offset,
+            );
+        }
     }
 }

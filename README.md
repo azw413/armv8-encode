@@ -605,7 +605,34 @@ loads the rewritten dylib. Eight tests cover:
   section's first slot (4-byte image-base offset) is
   overridden to point at the wrapper. Host observes
   `ctor_marker=17` (= 0x10 from appended | 0x1 from
-  chained), proving both ran in order.
+  chained), proving both ran in order. Test also asserts
+  the output has no `__APPENDED` segment — the wrapper
+  lands in `__TEXT` free-region padding via Phase 6.5's
+  intra-segment placement, which is required for App Store
+  submissions.
+
+By default the Mach-O writer prefers intra-`__TEXT`
+placement: appended functions / data land in free space
+inside the existing `__TEXT` segment (typically a few KB of
+padding between sections + at the segment's tail). This
+keeps the output compatible with App Store review (which
+rejects dylibs with multiple R-X segments). Operations that
+need the `__APPENDED`-segment fallback —
+`add_function_exported` (rebuilds export trie + symtab,
+needs `__LINKEDIT` shifting) and `add_library_dependency`
+(splices a new load command and shifts content) — flag this
+explicitly and produce output that loads correctly on macOS
+but won't pass App Store review.
+
+For App Store builds you can call
+`editor.binary.prohibit_new_segments()` to enforce the
+constraint statically: any subsequent operation that would
+require an `__APPENDED` segment (incompatible exports,
+library deps, or an oversized payload) errors at queue time
+with `TextEditorError::WouldCreateNewSegment` instead of
+silently producing an output that won't pass review. The
+flag is Mach-O-only; ELF treats it as a no-op since
+appended PT_LOAD is the standard pattern there.
 
 `add_data` writes read-only bytes into the same R-X segment
 as `add_function`. Writable appended data is future work —

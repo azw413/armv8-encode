@@ -363,7 +363,25 @@ fn et_dyn_appended_function_changes_observable_output() {
         .expect("replace_instruction_at");
 
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
-    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+    let rewritten = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    // Phase 6.5: this flow uses no exports / library deps,
+    // so intra-`__TEXT` placement should activate and no
+    // `__APPENDED` segment should appear in the output.
+    let segment_names: Vec<&str> = rewritten
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .layout
+        .segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !segment_names.iter().any(|n| *n == "__APPENDED"),
+        "intra-text placement should keep the rewritten dylib free of \
+         `__APPENDED`; got segments {segment_names:?}",
+    );
 
     std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
     let stdout = run_in_lib_demo("host");
@@ -472,7 +490,24 @@ fn et_dyn_appended_data_referenced_by_appended_function() {
         .expect("replace_instruction_at");
 
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
-    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+    let rewritten = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    // Phase 6.5: this flow uses no exports / library deps,
+    // so intra-`__TEXT` placement should activate.
+    let segment_names: Vec<&str> = rewritten
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .layout
+        .segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !segment_names.iter().any(|n| *n == "__APPENDED"),
+        "intra-text placement should keep the rewritten dylib free of \
+         `__APPENDED`; got segments {segment_names:?}",
+    );
 
     std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
     let stdout = run_in_lib_demo("host");
@@ -706,7 +741,28 @@ fn et_dyn_add_initialiser_hijacks_init_offsets_slot() {
         .expect("add_initialiser");
 
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
-    let _ = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+    let rewritten = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    // iOS / App Store invariant: no extra `__APPENDED` R-X
+    // segment in the output. The intra-`__TEXT` placement
+    // strategy puts the wrapper inside the existing `__TEXT`
+    // free region, so the rewritten dylib still has exactly
+    // the original three segments (`__TEXT`, `__DATA`,
+    // `__LINKEDIT`).
+    let segment_names: Vec<&str> = rewritten
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .layout
+        .segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !segment_names.iter().any(|n| *n == "__APPENDED"),
+        "intra-text placement should keep the rewritten dylib free of \
+         `__APPENDED`; got segments {segment_names:?}",
+    );
 
     std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
 
@@ -725,6 +781,178 @@ fn et_dyn_add_initialiser_hijacks_init_offsets_slot() {
         stdout_ctor, "ctor_marker=17\n",
         "expected ctor_marker=17 (= 0x10 from appended | 0x1 \
          from chained _greet_ctor); got {stdout_ctor:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
+fn prohibit_new_segments_rejects_add_function_exported() {
+    // Strict-mode acceptance: `add_function_exported` always
+    // requires the `__APPENDED`-segment writer (rebuild
+    // export trie + symtab + shift `__LINKEDIT`). When the
+    // caller has set `prohibit_new_segments()` the call must
+    // fail at queue time with `WouldCreateNewSegment`.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{
+        Aarch64Mnemonic, DecodedOperand, Register, RegisterClass,
+    };
+    use armv8_encode::rewrite::{
+        BinaryEditor, RewriteInstruction, RewriteOperand, TextEditorError,
+    };
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+    editor.binary.prohibit_new_segments();
+
+    let w0 = Register { class: RegisterClass::W, index: 0 };
+    let x30 = Register { class: RegisterClass::X, index: 30 };
+    let body = vec![
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Lsl,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w0)),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+            ],
+            original_address: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Ret,
+            operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+            original_address: None,
+        },
+    ];
+    let result = editor
+        .binary
+        .add_function_exported("_greet_quintuple", body);
+    match result {
+        Err(TextEditorError::WouldCreateNewSegment { reason }) => {
+            assert!(
+                reason.contains("add_function_exported"),
+                "error reason should name the offending call; got {reason:?}",
+            );
+        }
+        other => panic!("expected WouldCreateNewSegment, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
+fn prohibit_new_segments_rejects_add_library_dependency() {
+    // Same shape as above but for LC_LOAD_DYLIB injection.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::{BinaryEditor, TextEditorError};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor.binary.prohibit_new_segments();
+
+    let result = editor
+        .binary
+        .add_library_dependency("@rpath/libdep.dylib");
+    match result {
+        Err(TextEditorError::WouldCreateNewSegment { reason }) => {
+            assert!(
+                reason.contains("add_library_dependency"),
+                "error reason should name the offending call; got {reason:?}",
+            );
+        }
+        other => panic!("expected WouldCreateNewSegment, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
+fn prohibit_new_segments_allows_initialiser_that_fits() {
+    // Strict-mode positive case: `add_initialiser` with a
+    // small body fits in `__TEXT` free region padding, so
+    // the commit succeeds and produces a dylib without
+    // `__APPENDED`. Same observable behaviour as the
+    // permissive path's `add_initialiser` test, but here
+    // the fit is enforced (any future regression that
+    // forces segment placement would be caught here).
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{self, DecodedOperand};
+    use armv8_encode::rewrite::{
+        BinaryEditor, InitialiserPosition, RewriteInstruction, RewriteOperand, Target,
+    };
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+    editor.binary.prohibit_new_segments();
+    let marker_id = editor
+        .binary
+        .symbol_by_name("_greet_ctor_marker")
+        .expect("_greet_ctor_marker should be defined");
+
+    let template = |word: u32| {
+        let decoded = aarch64::decode_instruction(0, word).expect("decode template");
+        RewriteInstruction {
+            mnemonic: decoded.mnemonic,
+            operands: decoded
+                .operands
+                .into_iter()
+                .map(RewriteOperand::Decoded)
+                .collect(),
+            original_address: None,
+        }
+    };
+    let symbolic_adrp = |word: u32, target: Target| {
+        let mut t = template(word);
+        *t.operands
+            .iter_mut()
+            .find(|op| matches!(op, RewriteOperand::Decoded(DecodedOperand::PageTarget(_))))
+            .unwrap() = RewriteOperand::Page(target);
+        t
+    };
+    let body = vec![
+        symbolic_adrp(0x90000000, Target::Symbol(marker_id)),
+        template(0x91000000),
+        template(0x52800201),
+        template(0xb9000001),
+        template(0xd65f03c0),
+    ];
+    editor
+        .binary
+        .add_initialiser("greet_strict_init", body, InitialiserPosition::Last)
+        .expect("add_initialiser under prohibit_new_segments should succeed");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let rewritten = Container::from_bytes(&written).expect("re-parse");
+    let segment_names: Vec<&str> = rewritten
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .layout
+        .segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !segment_names.iter().any(|n| *n == "__APPENDED"),
+        "strict-mode add_initialiser should produce a dylib with no \
+         `__APPENDED` segment; got {segment_names:?}",
+    );
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+    let stdout_ctor = run_in_lib_demo_with_args("host", &["ctor"]);
+    assert_eq!(
+        stdout_ctor, "ctor_marker=17\n",
+        "strict-mode initialiser should still chain back to _greet_ctor; got {stdout_ctor:?}",
     );
 }
 

@@ -117,6 +117,15 @@ pub enum TextEditorError {
     /// reloc. Synthesising `.rela.dyn` from scratch is future
     /// work.
     NoExistingRelaDyn,
+    /// The caller set [`BinaryState::prohibit_new_segments`]
+    /// (typically because they're targeting iOS / App Store,
+    /// which rejects dylibs / executables with multiple R-X
+    /// segments) and the requested operation would require
+    /// adding an `__APPENDED`-style segment. The `reason`
+    /// field names the specific call that triggered the
+    /// rejection so callers can identify which add_*
+    /// invocation crossed the line.
+    WouldCreateNewSegment { reason: String },
 }
 
 impl std::fmt::Display for TextEditorError {
@@ -168,6 +177,11 @@ impl std::fmt::Display for TextEditorError {
                 "add_initialiser(Append) requires the input to have a \
                  .rela.dyn section; synthesising .rela.dyn from scratch \
                  is not yet supported",
+            ),
+            Self::WouldCreateNewSegment { reason } => write!(
+                f,
+                "operation would create a new segment but \
+                 prohibit_new_segments() is set: {reason}",
             ),
         }
     }
@@ -302,6 +316,24 @@ pub struct BinaryState {
     /// appended segment (via the same machinery the export path
     /// uses).
     pending_library_deps: Vec<String>,
+    /// When true, the Mach-O writer's intra-`__TEXT`
+    /// placement strategy is bypassed and the
+    /// appended-segment fallback is used instead. Set by
+    /// methods that require an `__APPENDED` segment for
+    /// their format-specific bookkeeping
+    /// (`add_function_exported` needs `__LINKEDIT` shifting
+    /// for the rebuilt symtab/trie; `add_library_dependency`
+    /// just needs the segment writer's path active).
+    force_segment_placement: bool,
+    /// When true, any operation that would require creating
+    /// a new segment fails immediately with
+    /// [`TextEditorError::WouldCreateNewSegment`]. Set by
+    /// callers via [`Self::prohibit_new_segments`] to enforce
+    /// iOS / App Store compatibility (which rejects dylibs
+    /// with multiple R-X segments). Affects Mach-O only —
+    /// for ELF, where appended PT_LOAD is the standard
+    /// pattern, the flag is silently ignored.
+    no_new_segments: bool,
 }
 
 /// A text section lifted into editable IR form.
@@ -422,6 +454,8 @@ impl BinaryEditor {
                 section_overrides: Vec::new(),
                 pending_appended_init_slots: Vec::new(),
                 pending_library_deps: Vec::new(),
+                force_segment_placement: false,
+                no_new_segments: false,
             },
             text: None,
         })
@@ -648,6 +682,95 @@ impl LiftedTextSection {
 }
 
 impl BinaryState {
+    /// Promise that no operation in this commit will create
+    /// a new segment. Once set, any call that would require
+    /// adding (or expanding into) a fresh `__APPENDED`-style
+    /// segment fails immediately with
+    /// [`TextEditorError::WouldCreateNewSegment`].
+    ///
+    /// Required for iOS / App Store submissions: dylibs with
+    /// more than one R-X segment are rejected during review.
+    /// On Mach-O, calling this enforces:
+    ///
+    /// - `add_function` / `add_data` / `add_initialiser`
+    ///   payloads must fit in `__TEXT` free regions (gaps
+    ///   between sections + segment-tail padding).
+    /// - `add_function_exported` errors at queue time —
+    ///   rebuilding the export trie / symtab / strtab needs
+    ///   `__LINKEDIT`-shifting which only the
+    ///   `__APPENDED`-segment writer provides.
+    /// - `add_library_dependency` errors at queue time —
+    ///   LC_LOAD_DYLIB injection uses the same writer path.
+    ///
+    /// On ELF the flag is silently ignored. ELF's
+    /// append-PT_LOAD is the standard pattern for runtime
+    /// rewriting and there's no analogue of App Store gating.
+    ///
+    /// The flag is one-way: once set, it stays set for the
+    /// lifetime of the editor. Callers who want a permissive
+    /// editor should construct a fresh one.
+    pub fn prohibit_new_segments(&mut self) {
+        self.no_new_segments = true;
+    }
+
+    /// Check whether placing `additional_bytes` in the
+    /// existing intra-`__TEXT` free region (the one already
+    /// chosen via [`Self::pick_append_vaddr`]) would still
+    /// fit. Used by `add_function` / `add_data` /
+    /// `add_initialiser` in strict mode to fail fast when a
+    /// payload outgrows the available padding instead of
+    /// silently overflowing into adjacent sections.
+    ///
+    /// No-op when not in strict mode, when format isn't
+    /// Mach-O, or when the appended segment isn't intra-text
+    /// (i.e. a segment fallback is already in play).
+    fn check_intra_text_capacity(
+        &self,
+        additional_bytes: u64,
+        op_name: &str,
+    ) -> Result<(), TextEditorError> {
+        if !self.no_new_segments {
+            return Ok(());
+        }
+        if !matches!(self.container.format, crate::container::BinaryFormat::Macho) {
+            return Ok(());
+        }
+        let Some(appended) = &self.appended else {
+            return Ok(());
+        };
+        let Some(image) = self.container.macho_image.as_ref() else {
+            return Ok(());
+        };
+        let regions = image.layout.text_free_regions();
+        // Find the region the segment_vaddr lives in.
+        let Some(region) = regions
+            .iter()
+            .find(|r| {
+                appended.segment_vaddr >= r.vaddr
+                    && appended.segment_vaddr < r.vaddr + r.size
+            })
+        else {
+            // Not intra-text — segment fallback already
+            // active; that's an internal inconsistency in
+            // strict mode but we don't error here (caller
+            // will hit it elsewhere).
+            return Ok(());
+        };
+        let used = appended.segment_vaddr - region.vaddr + appended.bytes.len() as u64;
+        if used + additional_bytes > region.size {
+            return Err(TextEditorError::WouldCreateNewSegment {
+                reason: format!(
+                    "{op_name} ({additional_bytes} bytes) exceeds the \
+                     available __TEXT free region (used {used} of {} \
+                     bytes); growing into a new segment is forbidden \
+                     by prohibit_new_segments()",
+                    region.size,
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Pick a virtual address for a fresh appended segment.
     /// Page-aligned past the highest existing mapped vaddr.
     /// Format-aware: ELF reads PT_LOAD entries from the
@@ -678,24 +801,50 @@ impl BinaryState {
                     .macho_image
                     .as_ref()
                     .ok_or(TextEditorError::AppendMissingElfImage)?;
+                // Prefer placing into a free region inside the
+                // existing `__TEXT` segment so the output
+                // doesn't grow a new R-X segment (App Store
+                // submissions reject dylibs / executables with
+                // more than one R-X segment).
+                //
+                // Bypass when `force_segment_placement` is
+                // set: callers that need `__LINKEDIT`-shifting
+                // metadata writes (`add_function_exported`,
+                // `add_library_dependency`) flag this before
+                // any byte placement so the layout matches
+                // what the segment writer expects.
+                //
+                // We don't know the eventual payload size at
+                // `pick_append_vaddr` time — `add_function` /
+                // `add_data` are called incrementally. Pick
+                // the start of the largest free region as a
+                // hint; the commit-time path validates the
+                // accumulated size still fits.
+                if !self.force_segment_placement {
+                    if let Some((vaddr, _file_offset)) =
+                        image.layout.allocate_in_text(4, 4)
+                    {
+                        return Ok(vaddr);
+                    }
+                }
+                // Strict mode: bail rather than fall through
+                // to the segment fallback, which would create
+                // an `__APPENDED` segment.
+                if self.no_new_segments {
+                    return Err(TextEditorError::WouldCreateNewSegment {
+                        reason: "Mach-O `__TEXT` has no free region big \
+                                 enough for the requested append, and \
+                                 prohibit_new_segments() forbids creating \
+                                 a new `__APPENDED` segment"
+                            .into(),
+                    });
+                }
+                // No __TEXT free region — fall back to the
+                // appended-segment path. Output will have an
+                // extra R-X `__APPENDED` segment, which works
+                // for macOS but won't pass App Store review.
                 let max_input_vaddr = image.layout.max_vaddr_end();
                 const PAGE: u64 = 0x4000; // arm64 macOS page size
-                // Place the appended segment well past
-                // `__LINKEDIT`'s vmaddr range. Specifically:
-                // codesign's re-sign step extends
-                // `__LINKEDIT.vmsize` (page-aligned) to cover
-                // the new signature blob, which sits at
-                // file end past our appended bytes. Any
-                // appended.vmaddr that falls inside the
-                // post-extension __LINKEDIT range trips dyld's
-                // "vm range of __LINKEDIT overlaps X" check at
-                // load.
-                //
-                // Add a generous gap (16 pages = 64 KB) past
-                // max_vaddr_end so codesign's extension can't
-                // reach the appended segment. This is overkill
-                // for ad-hoc signatures (which are <20 KB)
-                // but cheap and simple.
                 const GAP: u64 = 16 * PAGE;
                 let aligned = (max_input_vaddr + GAP + PAGE - 1) & !(PAGE - 1);
                 Ok(aligned.max(PAGE))
@@ -761,6 +910,14 @@ impl BinaryState {
         ) {
             return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
         }
+
+        // Strict mode: bound the cumulative payload to the
+        // chosen intra-`__TEXT` free region. Each instruction
+        // is 4 bytes; up-rounding 3 covers the alignment pad
+        // we may insert for non-multiple-of-4 cumulative
+        // offsets.
+        let new_size = (instructions.len() * 4 + 3) as u64;
+        self.check_intra_text_capacity(new_size, &format!("add_function({name:?})"))?;
 
         // Allocate vaddr for this function. First call picks the
         // segment vaddr from the input's PT_LOAD extents; later
@@ -866,6 +1023,30 @@ impl BinaryState {
         name: &str,
         instructions: Vec<RewriteInstruction>,
     ) -> Result<SymbolId, TextEditorError> {
+        // Strict mode: `add_function_exported` always needs
+        // the `__APPENDED`-segment writer (rebuild export
+        // trie + symtab + shift __LINKEDIT). Reject up front
+        // when the caller has promised no new segments.
+        if self.no_new_segments
+            && matches!(self.container.format, crate::container::BinaryFormat::Macho)
+        {
+            return Err(TextEditorError::WouldCreateNewSegment {
+                reason: format!(
+                    "add_function_exported({name:?}) requires the \
+                     __APPENDED-segment writer to rebuild the export \
+                     trie and symtab — incompatible with \
+                     prohibit_new_segments()"
+                ),
+            });
+        }
+        // Mach-O export plumbing rebuilds the symtab/trie
+        // and shifts __LINKEDIT — that flow only fits the
+        // `__APPENDED`-segment writer path, not the
+        // intra-`__TEXT` placement strategy. Mark
+        // `force_segment_placement` before laying out the
+        // function so its bytes land at a vaddr the segment
+        // writer can accept.
+        self.force_segment_placement = true;
         let symbol_id = self.add_function(name, instructions)?;
         // The function symbol's vaddr/size were populated by
         // add_function. Capture them for the dynsym promotion.
@@ -1381,6 +1562,11 @@ impl BinaryState {
             return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
         }
 
+        // Strict mode: bound the cumulative payload to the
+        // chosen intra-`__TEXT` free region.
+        let new_size = bytes.len() as u64 + align.saturating_sub(1);
+        self.check_intra_text_capacity(new_size, &format!("add_data({name:?})"))?;
+
         // Initialise the appended state lazily — same pattern as
         // add_function.
         let segment_vaddr = match &self.appended {
@@ -1472,6 +1658,21 @@ impl BinaryState {
         ) {
             return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
         }
+        // Strict mode: LC_LOAD_DYLIB injection on Mach-O
+        // routes through the `__APPENDED`-segment writer
+        // (load-command splice plus __LINKEDIT shift). Reject
+        // when the caller has promised no new segments.
+        if self.no_new_segments
+            && matches!(self.container.format, crate::container::BinaryFormat::Macho)
+        {
+            return Err(TextEditorError::WouldCreateNewSegment {
+                reason: format!(
+                    "add_library_dependency({library_name:?}) requires the \
+                     __APPENDED-segment writer for LC_LOAD_DYLIB injection — \
+                     incompatible with prohibit_new_segments()"
+                ),
+            });
+        }
         // We need format-specific image data at commit time:
         // ELF requires elf_image (for `.dynamic` editing /
         // .dynstr extension); Mach-O requires macho_image
@@ -1492,6 +1693,13 @@ impl BinaryState {
             _ => {}
         }
         self.pending_library_deps.push(library_name.to_string());
+        // Mach-O LC_LOAD_DYLIB injection uses the
+        // appended-segment writer's load-command splice
+        // pattern; force segment placement so any
+        // accompanying `add_function` / `add_data` calls
+        // also land in `__APPENDED` (the intra-`__TEXT`
+        // path doesn't grow load commands).
+        self.force_segment_placement = true;
         Ok(())
     }
 
@@ -2220,7 +2428,6 @@ impl BinaryEditor {
                 };
 
                 if is_macho {
-                    // Phase 3+ Mach-O append-segment path.
                     // Caller-staged section_overrides (e.g. from
                     // text-edit commits above) are merged with
                     // the editor's queue so the writer applies
@@ -2232,6 +2439,62 @@ impl BinaryEditor {
                     for (idx, bytes) in &binary.section_overrides {
                         all_overrides.push((*idx, bytes.clone()));
                     }
+
+                    // Intra-`__TEXT` placement (Phase 6.5):
+                    // when the appended bytes fit in a
+                    // `__TEXT` free region, place them there
+                    // without growing the load-command list.
+                    // Required for App Store submissions
+                    // (which reject dylibs with multiple R-X
+                    // segments). Only available when no
+                    // exports / library deps are queued —
+                    // those need `__LINKEDIT`-shifting flows
+                    // that the appended-segment path
+                    // provides.
+                    let macho_image = updated
+                        .macho_image
+                        .as_ref()
+                        .ok_or(TextEditorError::AppendMissingElfImage)?;
+                    let intra_text_eligible = appended.exports.is_empty()
+                        && binary.pending_library_deps.is_empty()
+                        && macho_image
+                            .layout
+                            .text_free_regions()
+                            .iter()
+                            .any(|r| {
+                                appended.segment_vaddr >= r.vaddr
+                                    && appended.segment_vaddr + appended.bytes.len() as u64
+                                        <= r.vaddr + r.size
+                            });
+                    if intra_text_eligible {
+                        let region = macho_image
+                            .layout
+                            .text_free_regions()
+                            .into_iter()
+                            .find(|r| {
+                                appended.segment_vaddr >= r.vaddr
+                                    && appended.segment_vaddr + appended.bytes.len() as u64
+                                        <= r.vaddr + r.size
+                            })
+                            .unwrap();
+                        let file_offset = region.file_offset
+                            + (appended.segment_vaddr - region.vaddr);
+                        let intra = crate::container::macho_writer::IntraTextAppend {
+                            vaddr: appended.segment_vaddr,
+                            file_offset,
+                            bytes: appended.bytes,
+                        };
+                        return crate::container::macho_writer::write_with_intra_text_append(
+                            &updated, intra, &all_overrides,
+                        )
+                        .map_err(TextEditorError::from);
+                    }
+
+                    // Phase 3+ append-segment fallback. Output
+                    // will have an extra `__APPENDED` R-X
+                    // segment, which works on macOS but won't
+                    // pass App Store review.
+                    //
                     // Phase 5: registered exports become
                     // MachOExportRequest entries the writer
                     // splices into LC_DYLD_EXPORTS_TRIE +
@@ -2319,10 +2582,25 @@ impl BinaryEditor {
                     &updated,
                     &mut overrides,
                 )?;
-                let segment = crate::container::elf_writer::AppendedSegment::new(
+                // No executable content was appended when there
+                // are no exports, no raw add_function bytes, and
+                // no appended init slots — only library deps and
+                // any relocated `.dynamic`/`.dynstr`/`.dynsym`.
+                // Drop PF_X so the segment is R+W rather than
+                // RWX; Android refuses W+X PT_LOADs (`has load
+                // segments that are both writable and
+                // executable`).
+                let no_executable_append = appended.exports.is_empty()
+                    && appended.bytes.is_empty()
+                    && binary.pending_appended_init_slots.is_empty();
+                let mut segment = crate::container::elf_writer::AppendedSegment::new(
                     appended.segment_vaddr,
                     segment_bytes,
                 );
+                if no_executable_append {
+                    use object::elf;
+                    segment.p_flags = elf::PF_R | elf::PF_W;
+                }
                 crate::container::elf_writer::write_with_appended_segment_inner(
                     &updated, &image, segment, overrides,
                 )

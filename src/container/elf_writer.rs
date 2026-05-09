@@ -71,6 +71,14 @@ pub(crate) struct AppendedSegment {
     /// header table. Defaults to `.text.armv8_encode_appended` when
     /// constructed via [`AppendedSegment::new`].
     pub section_name: String,
+    /// PT_LOAD `p_flags` for the appended segment. Defaults to
+    /// `PF_R | PF_W | PF_X` for back-compat with the add_function
+    /// / add_initialiser paths. Android (post-API 26 strict, fully
+    /// enforced on Android 10+) refuses to load shared objects
+    /// with W+X PT_LOADs (`has load segments that are both writable
+    /// and executable`), so callers that don't append executable
+    /// content (e.g. add_library_dependency) should drop PF_X.
+    pub p_flags: u32,
 }
 
 impl AppendedSegment {
@@ -79,6 +87,7 @@ impl AppendedSegment {
             vaddr,
             bytes,
             section_name: ".text.armv8_encode_appended".to_string(),
+            p_flags: elf::PF_R | elf::PF_W | elf::PF_X,
         }
     }
 }
@@ -808,18 +817,16 @@ pub(crate) fn write_with_appended_segment_inner(
             p_align: phdr.p_align,
         });
     }
-    // RWX permissions on the appended segment. The R-X subset
-    // covers appended functions and read-only data; the W bit
-    // is required when callers (e.g. add_initialiser(Append))
-    // place `.init_array` slots in this segment that the
-    // dynamic loader needs to write `R_AARCH64_RELATIVE`
-    // results into. Callers who only append code/data and
-    // never need the W bit pay no runtime cost — the W bit
-    // only affects behaviour for relocations targeting the
-    // segment's pages.
+    // Permissions on the appended segment come from
+    // `appended.p_flags`. Default is RWX (back-compat with
+    // add_function + add_initialiser, which need both X for
+    // appended code and W for `R_AARCH64_RELATIVE` writes
+    // into appended `.init_array`). Android refuses W+X
+    // PT_LOADs, so callers that append only data
+    // (add_library_dependency) drop PF_X.
     writer.write_program_header(&ProgramHeader {
         p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R | elf::PF_W | elf::PF_X,
+        p_flags: appended.p_flags,
         p_offset: appended_file_offset,
         p_vaddr: new_seg_vaddr,
         p_paddr: new_seg_vaddr,

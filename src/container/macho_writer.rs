@@ -715,6 +715,128 @@ fn build_dylib_command(path: &str) -> Vec<u8> {
     out
 }
 
+/// Inputs to the Mach-O intra-`__TEXT` append writer.
+pub struct IntraTextAppend {
+    /// vmaddr inside an existing `__TEXT` free region where
+    /// the bytes will be placed. Must come from
+    /// [`MachOLayout::allocate_in_text`].
+    pub vaddr: u64,
+    /// File offset matching `vaddr` (also from
+    /// `allocate_in_text`).
+    pub file_offset: u64,
+    /// Bytes to write. Must fit within the free region's
+    /// remaining space.
+    pub bytes: Vec<u8>,
+}
+
+/// Build a Mach-O byte stream that writes `appended.bytes`
+/// into a free region inside the existing `__TEXT` segment,
+/// applies any pending section-byte overrides, then re-signs
+/// the result ad-hoc via `codesign`. Crucially does NOT add
+/// a new `LC_SEGMENT_64` — App Store submissions reject
+/// dylibs / executables with more than one R-X segment, so
+/// this path is the iOS-compatible one.
+///
+/// Caller responsibilities:
+///
+/// - `appended.vaddr` and `appended.file_offset` must come
+///   from a successful
+///   [`MachOLayout::allocate_in_text`] call; otherwise the
+///   bytes may overlap existing section content.
+/// - `appended.bytes` is laid out at the given vmaddr — the
+///   caller's rewriter pipeline must have resolved
+///   PC-relative operands against that address.
+pub fn write_with_intra_text_append(
+    container: &Container,
+    appended: IntraTextAppend,
+    section_overrides: &[(usize, Vec<u8>)],
+) -> Result<Vec<u8>, ContainerWriteError> {
+    let image = container
+        .macho_image
+        .as_ref()
+        .ok_or(ContainerWriteError::ElfImageMissing)?;
+    let layout = &image.layout;
+
+    // Validate the placement against the free regions to
+    // catch misuse (`vaddr/file_offset` not from
+    // `allocate_in_text`).
+    let region = layout
+        .text_free_regions()
+        .into_iter()
+        .find(|r| {
+            appended.vaddr >= r.vaddr
+                && appended.vaddr + appended.bytes.len() as u64 <= r.vaddr + r.size
+        })
+        .ok_or_else(|| {
+            ContainerWriteError::ObjectWrite(format!(
+                "Mach-O intra-text: vaddr 0x{:x} + size {} doesn't fit any \
+                 __TEXT free region",
+                appended.vaddr,
+                appended.bytes.len(),
+            ))
+        })?;
+    // Sanity: file_offset is consistent with vaddr.
+    let expected_file_offset = region.file_offset + (appended.vaddr - region.vaddr);
+    if expected_file_offset != appended.file_offset {
+        return Err(ContainerWriteError::ObjectWrite(format!(
+            "Mach-O intra-text: file_offset 0x{:x} doesn't match expected \
+             0x{expected_file_offset:x} for vaddr 0x{:x}",
+            appended.file_offset, appended.vaddr,
+        )));
+    }
+
+    let mut bytes = image.raw_bytes.clone();
+
+    // Apply section-byte overrides at original offsets
+    // (same constraint as the round-trip and append-segment
+    // paths: same length only).
+    for (idx, override_bytes) in section_overrides {
+        let section = &container.sections[*idx];
+        let Some(entry) = layout
+            .sections
+            .iter()
+            .find(|s| s.vaddr == section.address && s.file_offset > 0)
+        else {
+            continue;
+        };
+        if override_bytes.len() as u64 != entry.size {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "Mach-O intra-text: override for {:?} ({} bytes) doesn't \
+                 match captured size ({} bytes); length-changing in-place \
+                 edits aren't supported",
+                section.name,
+                override_bytes.len(),
+                entry.size,
+            )));
+        }
+        let start = entry.file_offset as usize;
+        let end = start + override_bytes.len();
+        bytes[start..end].copy_from_slice(override_bytes);
+    }
+
+    // Write the appended bytes at the chosen file offset.
+    // The bytes are inside the existing __TEXT region; no
+    // load commands change.
+    let off = appended.file_offset as usize;
+    if off + appended.bytes.len() > bytes.len() {
+        return Err(ContainerWriteError::ObjectWrite(format!(
+            "Mach-O intra-text: write at file offset 0x{:x} extends past \
+             end of file ({} bytes)",
+            appended.file_offset,
+            bytes.len(),
+        )));
+    }
+    bytes[off..off + appended.bytes.len()].copy_from_slice(&appended.bytes);
+
+    // Re-sign in place. codesign --force overwrites the
+    // existing signature blob; segment offsets and __LINKEDIT
+    // are unchanged, so it's the simple case (same as the
+    // round-trip path).
+    sign_ad_hoc(&mut bytes)?;
+
+    Ok(bytes)
+}
+
 /// Append a rebuilt export trie + extended symtab/strtab to
 /// the file and patch the relevant load commands to point at
 /// the new copies. The new blobs go past the (already-shifted)
