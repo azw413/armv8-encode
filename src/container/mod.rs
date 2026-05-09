@@ -31,6 +31,7 @@
 //! ```
 
 mod dwarf;
+pub mod dynamic_relocs;
 pub mod dynsym_extension;
 mod elf_image;
 pub(crate) mod elf_writer;
