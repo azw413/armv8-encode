@@ -506,24 +506,20 @@ pub(crate) fn write_with_appended_segment_inner(
     appended: AppendedSegment,
     section_byte_overrides: HashMap<usize, Vec<u8>>,
 ) -> Result<Vec<u8>, ContainerWriteError> {
-    // Drop PT_PHDR if the input had one. The runtime program-
-    // header table for the rewritten file lives at file end
-    // (after the appended segment), at a fresh `e_phoff` —
-    // representing it via PT_PHDR would mean keeping
-    // PT_PHDR.p_vaddr/p_offset/p_filesz consistent with the
-    // new table's location, which requires extra bookkeeping
-    // and a writable mapping for the table. The dynamic
-    // linker uses `e_phoff` from the ELF header for the
-    // canonical lookup; PT_PHDR is the runtime-introspection
-    // convenience copy and bionic / glibc both handle its
-    // absence gracefully (`dl_iterate_phdr` falls back; the
-    // libgcc unwinder copes). Customer code doesn't rely on
-    // its own PT_PHDR.
+    // Drop the input's PT_PHDR (file_offset/vaddr point at the
+    // input's old PHT location, not the new one we'll emit at
+    // file end) and emit a fresh PT_PHDR below pointing at the
+    // new PHT.
     //
-    // Real-world ELF inputs (everything Android NDK emits)
-    // ship a PT_PHDR by default, so refusing them outright
-    // — the prior behaviour — blocked the rewriter on real
-    // binaries. Dropping it is the pragmatic v1.
+    // Earlier this path simply omitted PT_PHDR, on the assumption
+    // bionic falls back to `e_phoff`. It does — but the fallback
+    // anchors off the PT_LOAD with `p_offset == 0` and computes
+    // `loaded = load_bias + e_phoff`. That implicitly assumes
+    // file_offset == vaddr, which is false for our appended
+    // segment (vaddr=new_seg_vaddr, file_offset >> vaddr after
+    // page alignment). Result on Android: `loaded phdr ... not
+    // in loadable segment`. A correct PT_PHDR avoids the
+    // fallback entirely.
     let phdrs_to_emit: Vec<&crate::container::ProgramHeader> = image
         .program_headers
         .iter()
@@ -689,9 +685,10 @@ pub(crate) fn write_with_appended_segment_inner(
     // Finally reserve the program header table at the end. We
     // reserve_program_headers *late* so its offset reflects the
     // post-content position; Writer reads `e_phoff` from this.
-    // Count: filtered phdrs (no PT_PHDR) + 1 for the new
-    // appended-segment PT_LOAD.
-    writer.reserve_program_headers((phdrs_to_emit.len() + 1) as u32);
+    // Count: filtered phdrs (no PT_PHDR) + 1 fresh PT_PHDR
+    // pointing at the new PHT location + 1 for the appended-
+    // segment PT_LOAD.
+    writer.reserve_program_headers((phdrs_to_emit.len() + 2) as u32);
 
     // ---------------------------------------------------------------
     // Write phase
@@ -798,6 +795,36 @@ pub(crate) fn write_with_appended_segment_inner(
     // strict loaders find the on-disk content where the phdr
     // says it should be.
     writer.write_align_program_headers();
+    // Emit a fresh PT_PHDR pointing at the new PHT location.
+    // Without it, bionic's FindPhdr falls back to anchoring
+    // off the PT_LOAD with `p_offset == 0` and computes
+    // `loaded = load_bias + e_phoff`, which assumes
+    // file_offset == vaddr — false for our appended segment
+    // (vaddr=new_seg_vaddr, file_offset=appended_file_offset).
+    // Result: bionic computes a phdr address inside the first
+    // PT_LOAD's vaddr range, then CheckPhdr fails because the
+    // address is past that segment's `p_filesz`.
+    //
+    // PT_PHDR must precede the first PT_LOAD per ELF spec
+    // (and SysV uses it for AT_PHDR). Counted in
+    // `reserve_program_headers((N + 2) as u32)` above.
+    let phdr_entry_size: u64 = 56; // sizeof(Elf64_Phdr)
+    let phdr_count: u64 = (phdrs_to_emit.len() + 2) as u64;
+    let elf_align: u64 = 8;
+    let pht_file_offset =
+        (appended_file_offset + new_seg_filesz + elf_align - 1) & !(elf_align - 1);
+    let pht_size = phdr_count * phdr_entry_size;
+    let pht_vaddr = new_seg_vaddr + (pht_file_offset - appended_file_offset);
+    writer.write_program_header(&ProgramHeader {
+        p_type: elf::PT_PHDR,
+        p_flags: elf::PF_R,
+        p_offset: pht_file_offset,
+        p_vaddr: pht_vaddr,
+        p_paddr: pht_vaddr,
+        p_filesz: pht_size,
+        p_memsz: pht_size,
+        p_align: 8,
+    });
     for phdr in &phdrs_to_emit {
         let p_offset = if phdr.p_vaddr >= new_seg_vaddr
             && phdr.p_vaddr + phdr.p_filesz <= new_seg_vaddr + new_seg_filesz
@@ -824,16 +851,27 @@ pub(crate) fn write_with_appended_segment_inner(
     // into appended `.init_array`). Android refuses W+X
     // PT_LOADs, so callers that append only data
     // (add_library_dependency) drop PF_X.
+    //
+    // Extend filesz/memsz to include the program-header table
+    // that we just wrote at the file's end. Bionic's loader
+    // verifies the runtime PHT address lies within some
+    // PT_LOAD; otherwise it rejects with `loaded phdr ... not
+    // in loadable segment`. `pht_file_offset`/`phdr_count`
+    // were computed above (where PT_PHDR was emitted).
+    let pht_end = pht_file_offset + phdr_count * phdr_entry_size;
+    let cover_filesz = pht_end - appended_file_offset;
+    let cover_memsz = cover_filesz;
     writer.write_program_header(&ProgramHeader {
         p_type: elf::PT_LOAD,
         p_flags: appended.p_flags,
         p_offset: appended_file_offset,
         p_vaddr: new_seg_vaddr,
         p_paddr: new_seg_vaddr,
-        p_filesz: new_seg_filesz,
-        p_memsz: new_seg_memsz,
+        p_filesz: cover_filesz,
+        p_memsz: cover_memsz,
         p_align: APPEND_PAGE_ALIGN,
     });
+    let _ = new_seg_memsz;
 
     drop(writer);
     Ok(buffer)
