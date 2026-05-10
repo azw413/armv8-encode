@@ -5,3 +5,4 @@
 //! rather than matching raw opcode tables directly.
 
 pub mod aarch64;
+pub mod armv7;
