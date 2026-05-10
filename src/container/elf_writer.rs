@@ -39,7 +39,8 @@
 
 use crate::container::elf_image::ElfImage;
 use crate::container::{
-    Container, ContainerKind, ContainerWriteError, FileFlags, Section, SectionId, SectionKind,
+    Architecture, Container, ContainerKind, ContainerWriteError, FileFlags, Section, SectionId,
+    SectionKind,
 };
 use object::elf;
 use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, Writer};
@@ -192,8 +193,13 @@ pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
         return write_with_appended_segment(container, image, grew);
     }
 
+    // ELF bitness: aarch64 → 64-bit, ARMv7 → 32-bit. Set
+    // by container.architecture; the existing aarch64 paths
+    // continue to use 64-bit unchanged.
+    let is_64 = matches!(container.architecture, Architecture::Aarch64);
+
     let mut buffer = Vec::new();
-    let mut writer = Writer::new(Endianness::Little, /*is_64=*/ true, &mut buffer);
+    let mut writer = Writer::new(Endianness::Little, is_64, &mut buffer);
 
     // ---------------------------------------------------------------
     // RESERVE PHASE
@@ -361,7 +367,7 @@ pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
         let trailing = plan.in_place_extent.saturating_sub(section.bytes.len() as u64);
         if trailing > 0 {
             if section_is_executable(section) {
-                emit_nop_padding(&mut writer, trailing as usize);
+                emit_nop_padding(&mut writer, trailing as usize, container.architecture);
             } else {
                 writer.write(&vec![0u8; trailing as usize]);
             }
@@ -420,11 +426,17 @@ fn build_file_header(container: &Container, image: &ElfImage) -> FileHeader {
         _ => elf::ET_DYN,
     };
 
+    let e_machine = match container.architecture {
+        Architecture::Aarch64 => elf::EM_AARCH64,
+        Architecture::Arm => elf::EM_ARM,
+        Architecture::Other => elf::EM_AARCH64, // best-effort default
+    };
+
     FileHeader {
         os_abi,
         abi_version,
         e_type,
-        e_machine: elf::EM_AARCH64,
+        e_machine,
         e_entry: image.e_entry,
         e_flags,
     }
@@ -600,8 +612,9 @@ pub(crate) fn write_with_appended_segment_inner(
     // the appended segment's bytes follow the section header table.
     // ---------------------------------------------------------------
 
+    let is_64 = matches!(container.architecture, Architecture::Aarch64);
     let mut buffer = Vec::new();
-    let mut writer = Writer::new(Endianness::Little, true, &mut buffer);
+    let mut writer = Writer::new(Endianness::Little, is_64, &mut buffer);
 
     writer.reserve_file_header();
 
@@ -823,7 +836,7 @@ pub(crate) fn write_with_appended_segment_inner(
             .saturating_sub(bytes_to_write.len() as u64);
         if trailing > 0 {
             if section_is_executable(section) {
-                emit_nop_padding(&mut writer, trailing as usize);
+                emit_nop_padding(&mut writer, trailing as usize, container.architecture);
             } else {
                 writer.write(&vec![0u8; trailing as usize]);
             }
@@ -987,8 +1000,24 @@ fn build_original_extent_stub(
     new_seg_vaddr: u64,
     container: &Container,
 ) -> Result<Vec<u8>, ContainerWriteError> {
+    match container.architecture {
+        Architecture::Aarch64 => {
+            build_original_extent_stub_aarch64(section, original_extent, new_seg_vaddr, container)
+        }
+        Architecture::Arm => {
+            build_original_extent_stub_arm(section, original_extent, new_seg_vaddr, container)
+        }
+        Architecture::Other => Err(ContainerWriteError::UnsupportedArchitecture),
+    }
+}
+
+fn build_original_extent_stub_aarch64(
+    section: &Section,
+    original_extent: u64,
+    new_seg_vaddr: u64,
+    container: &Container,
+) -> Result<Vec<u8>, ContainerWriteError> {
     let mut bytes = vec![0u8; original_extent as usize];
-    // Fill with NOPs first.
     for chunk in bytes.chunks_exact_mut(4) {
         chunk.copy_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
     }
@@ -1026,8 +1055,6 @@ fn build_original_extent_stub(
                 symbol.name, displacement_words,
             )));
         }
-        // `b imm26`: opcode 0b000101, then sign-extended 26-bit
-        // word displacement.
         let imm26 = (displacement_words as u32) & 0x3ff_ffff;
         let word: u32 = 0x14000000 | imm26;
         let dst = symbol_offset as usize;
@@ -1038,6 +1065,119 @@ fn build_original_extent_stub(
             )));
         }
         bytes[dst..dst + 4].copy_from_slice(&word.to_le_bytes());
+    }
+
+    Ok(bytes)
+}
+
+/// ARMv7 trampoline builder. Functions in ARM-mode (symbol
+/// address low-bit clear) get an ARM `B` (4 bytes, ±32 MiB
+/// range, encoding `0xea000000 | imm24`). Functions in
+/// Thumb-mode (low-bit set) get a Thumb-2 32-bit `B.W` (4
+/// bytes encoded as two halfwords, ±16 MiB range,
+/// encoding-T4).
+fn build_original_extent_stub_arm(
+    section: &Section,
+    original_extent: u64,
+    new_seg_vaddr: u64,
+    container: &Container,
+) -> Result<Vec<u8>, ContainerWriteError> {
+    let mut bytes = vec![0u8; original_extent as usize];
+    // Fill with Thumb NOPs (0xbf00 = nop.n) — works for both
+    // ARM-mode (decodes as a harmless data word at worst,
+    // but section is Thumb-dominant on Android `.so`) and
+    // gaps between Thumb functions.
+    for chunk in bytes.chunks_exact_mut(2) {
+        chunk.copy_from_slice(&[0x00, 0xbf]);
+    }
+
+    for symbol in &container.symbols {
+        use crate::container::SymbolKind;
+        if symbol.kind != SymbolKind::Function {
+            continue;
+        }
+        if symbol.section != Some(section.id) {
+            continue;
+        }
+        // Strip the Thumb low-bit before range checks.
+        let entry_addr = symbol.address & !1u64;
+        let is_thumb = symbol.address & 1 == 1;
+        if entry_addr < section.address
+            || entry_addr >= section.address + original_extent
+        {
+            continue;
+        }
+        let symbol_offset = entry_addr - section.address;
+        let trampoline_address = section.address + symbol_offset;
+        let target_address = new_seg_vaddr + symbol_offset;
+
+        let displacement_bytes = target_address as i64 - trampoline_address as i64;
+        let dst = symbol_offset as usize;
+
+        if is_thumb {
+            // Thumb-2 B.W (encoding T4): 32-bit branch with
+            // ±16 MiB reach. PC reads as `instr_addr + 4`.
+            let off = displacement_bytes - 4;
+            if off % 2 != 0 {
+                return Err(ContainerWriteError::ObjectWrite(format!(
+                    "Thumb trampoline target {target_address:#x} for {} not 2-aligned",
+                    symbol.name,
+                )));
+            }
+            if !(-(1 << 24)..(1 << 24)).contains(&off) {
+                return Err(ContainerWriteError::ObjectWrite(format!(
+                    "Thumb trampoline displacement for {} ({} bytes) exceeds B.W range",
+                    symbol.name, off,
+                )));
+            }
+            // Encoding T4 of B (unconditional Thumb-2):
+            //   hw1 = 11110 S imm10
+            //   hw2 = 10 J1 1 J2 imm11
+            //   I1 = NOT(J1 XOR S), I2 = NOT(J2 XOR S)
+            //   offset = sign_ext(S:I1:I2:imm10:imm11:0)
+            let off_u = off as u32 & 0x01ff_fffe; // mask to 25 bits incl bit 0
+            let imm11 = (off_u >> 1) & 0x7ff;
+            let imm10 = (off_u >> 12) & 0x3ff;
+            let s = ((off >> 24) & 0x1) as u32;
+            let i1 = ((off >> 23) & 0x1) as u32;
+            let i2 = ((off >> 22) & 0x1) as u32;
+            let j1 = (!i1 ^ s) & 0x1;
+            let j2 = (!i2 ^ s) & 0x1;
+            let hw1: u16 = (0xf000 | (s << 10) | imm10 as u32) as u16;
+            let hw2: u16 = (0x9000 | (j1 << 13) | (j2 << 11) | imm11 as u32) as u16;
+            if dst + 4 > bytes.len() {
+                return Err(ContainerWriteError::ObjectWrite(format!(
+                    "function {} at offset {dst:#x} doesn't fit in original extent {original_extent}",
+                    symbol.name,
+                )));
+            }
+            bytes[dst..dst + 2].copy_from_slice(&hw1.to_le_bytes());
+            bytes[dst + 2..dst + 4].copy_from_slice(&hw2.to_le_bytes());
+        } else {
+            // ARM-mode B (24-bit imm × 4, ±32 MiB). PC reads
+            // as `instr_addr + 8`.
+            if displacement_bytes % 4 != 0 {
+                return Err(ContainerWriteError::ObjectWrite(format!(
+                    "ARM trampoline target {target_address:#x} for {} not 4-aligned",
+                    symbol.name,
+                )));
+            }
+            let imm24 = (displacement_bytes - 8) / 4;
+            if !(-(1 << 23)..(1 << 23)).contains(&imm24) {
+                return Err(ContainerWriteError::ObjectWrite(format!(
+                    "ARM trampoline displacement for {} ({} words) exceeds B imm24 range",
+                    symbol.name, imm24,
+                )));
+            }
+            let word: u32 = 0xea00_0000 | ((imm24 as u32) & 0x00ff_ffff);
+            if dst + 4 > bytes.len() {
+                return Err(ContainerWriteError::ObjectWrite(format!(
+                    "function {} at offset {dst:#x} doesn't fit in original extent {original_extent}",
+                    symbol.name,
+                )));
+            }
+            bytes[dst..dst + 4].copy_from_slice(&word.to_le_bytes());
+        }
     }
 
     Ok(bytes)
@@ -1086,12 +1226,21 @@ fn section_is_executable(section: &Section) -> bool {
 /// guarantees `count` is a multiple of 4 — true for any source ELF
 /// where text starts/ends aligned, which is the only case the
 /// shrink path applies to.
-fn emit_nop_padding(writer: &mut Writer<'_>, count: usize) {
-    debug_assert!(count.is_multiple_of(4), "NOP padding must be 4-aligned");
-    const NOP: [u8; 4] = [0x1f, 0x20, 0x03, 0xd5];
+fn emit_nop_padding(writer: &mut Writer<'_>, count: usize, arch: Architecture) {
+    let pattern: &[u8] = match arch {
+        // AArch64 NOP: 0xd503201f little-endian.
+        Architecture::Aarch64 => &[0x1f, 0x20, 0x03, 0xd5],
+        // ARMv7: pad with Thumb NOPs (0xbf00) since most
+        // Android `.so` text is Thumb-dominant. For pure
+        // ARM-mode sections this still decodes safely
+        // (0xbf00bf00 = nop;nop in either mode if the
+        // section gets reinterpreted).
+        Architecture::Arm => &[0x00, 0xbf, 0x00, 0xbf],
+        Architecture::Other => &[0; 4],
+    };
     let mut padding = Vec::with_capacity(count);
     while padding.len() < count {
-        padding.extend_from_slice(&NOP);
+        padding.extend_from_slice(pattern);
     }
     writer.write(&padding[..count]);
 }

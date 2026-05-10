@@ -100,43 +100,57 @@ fn lift_elf_image(
     sections: &[Section],
     symbols: &[Symbol],
 ) -> Option<crate::container::elf_image::ElfImage> {
+    use object::read::elf::{ElfFile32, ElfFile64};
+    use object::Endianness;
+
+    // Try ELF64; fall back to ELF32. The body is generic
+    // over the FileHeader trait so the same routine
+    // populates the full image for either width.
+    if let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) {
+        return lift_elf_image_typed(bytes, sections, symbols, &elf);
+    }
+    if let Ok(elf) = ElfFile32::<Endianness>::parse(bytes) {
+        return lift_elf_image_typed(bytes, sections, symbols, &elf);
+    }
+    None
+}
+
+fn lift_elf_image_typed<'data, Elf>(
+    bytes: &'data [u8],
+    sections: &[Section],
+    symbols: &[Symbol],
+    elf: &object::read::elf::ElfFile<'data, Elf, &'data [u8]>,
+) -> Option<crate::container::elf_image::ElfImage>
+where
+    Elf: object::read::elf::FileHeader<Endian = object::Endianness>,
+{
     use crate::container::elf_image::{
         DynamicEntry, ElfImage, ProgramHeader, RawNoteSection, SectionLayout,
     };
     use object::elf;
     use object::read::elf::{
-        Dyn, ElfFile64, FileHeader, NoteIterator, ProgramHeader as _, SectionHeader,
+        Dyn, FileHeader, NoteIterator, ProgramHeader as _, SectionHeader,
     };
     use object::Endianness;
 
-    // Try ELF64 first. If that fails, the file is likely
-    // 32-bit (ARMv7 / x86 / RISC-V32). Return a minimal
-    // image populated only with `plt_stubs` for those —
-    // full image lift requires polymorphism over the ELF
-    // header size which is a larger refactor.
-    let elf = match ElfFile64::<Endianness>::parse(bytes) {
-        Ok(f) => f,
-        Err(_) => {
-            return lift_minimal_elf32_image(bytes, sections, symbols);
-        }
-    };
     let endian = elf.endian();
     let mut image = ElfImage::new();
 
     // 0. File-header fields the neutral types don't carry.
-    image.e_entry = elf.elf_header().e_entry(endian);
+    image.e_entry = elf.elf_header().e_entry(endian).into();
 
     // 1. Program headers — verbatim copy of every entry.
+    // ELF32 fields widen to u64 via the Word: Into<u64> bound.
     for phdr in elf.elf_program_headers() {
         image.program_headers.push(ProgramHeader {
             p_type: phdr.p_type(endian),
             p_flags: phdr.p_flags(endian),
-            p_offset: phdr.p_offset(endian),
-            p_vaddr: phdr.p_vaddr(endian),
-            p_paddr: phdr.p_paddr(endian),
-            p_filesz: phdr.p_filesz(endian),
-            p_memsz: phdr.p_memsz(endian),
-            p_align: phdr.p_align(endian),
+            p_offset: phdr.p_offset(endian).into(),
+            p_vaddr: phdr.p_vaddr(endian).into(),
+            p_paddr: phdr.p_paddr(endian).into(),
+            p_filesz: phdr.p_filesz(endian).into(),
+            p_memsz: phdr.p_memsz(endian).into(),
+            p_align: phdr.p_align(endian).into(),
         });
     }
 
@@ -153,11 +167,11 @@ fn lift_elf_image(
         .iter()
         .skip(1) // null section excluded from neutral model
         .map(|hdr| SectionLayout {
-            sh_offset: hdr.sh_offset(endian),
-            sh_size: hdr.sh_size(endian),
+            sh_offset: hdr.sh_offset(endian).into(),
+            sh_size: hdr.sh_size(endian).into(),
             sh_link: hdr.sh_link(endian),
             sh_info: hdr.sh_info(endian),
-            sh_entsize: hdr.sh_entsize(endian),
+            sh_entsize: hdr.sh_entsize(endian).into(),
         })
         .collect();
 
@@ -171,14 +185,15 @@ fn lift_elf_image(
         .elf_program_headers()
         .iter()
         .map(|phdr| {
-            let p_offset = phdr.p_offset(endian);
-            let p_end = p_offset + phdr.p_filesz(endian);
+            let p_offset: u64 = phdr.p_offset(endian).into();
+            let p_filesz: u64 = phdr.p_filesz(endian).into();
+            let p_end = p_offset + p_filesz;
             sections
                 .iter()
                 .zip(section_table.iter().skip(1)) // skip null section
                 .filter_map(|(neutral, raw)| {
-                    let sh_offset = raw.sh_offset(endian);
-                    let sh_size = raw.sh_size(endian);
+                    let sh_offset: u64 = raw.sh_offset(endian).into();
+                    let sh_size: u64 = raw.sh_size(endian).into();
                     if sh_size == 0 {
                         return None;
                     }
@@ -197,8 +212,8 @@ fn lift_elf_image(
     if let Ok(Some((entries, _link))) = section_table.dynamic(endian, bytes) {
         for entry in entries {
             image.dynamic.push(DynamicEntry {
-                tag: entry.d_tag(endian),
-                value: entry.d_val(endian),
+                tag: entry.d_tag(endian).into(),
+                value: entry.d_val(endian).into(),
             });
         }
         // The .dynamic section's neutral id, located by name.
@@ -219,7 +234,25 @@ fn lift_elf_image(
     // undefined ones to disambiguate name collisions). This is
     // load-bearing for the appended-code-calls-extern path: the
     // emit pass folds Target::Symbol(extern) to bl <stub_addr>.
-    image.plt_stubs = build_plt_stub_map(&elf, sections, symbols);
+    // PLT stub layout differs between AArch64 and ARM. Both
+    // walk `.rela.plt` (or `.rel.plt` on ARM ELF32) in source
+    // order, but the header / entry sizes and the
+    // SymbolIndex extraction from `r_info` are different.
+    // Dispatch via the generic ELF type's 64-bitness: 64-bit
+    // = AArch64 layout, 32-bit = ARM layout.
+    image.plt_stubs = if Elf::is_type_64_sized() {
+        // SAFETY-equivalent: re-parse as ELF64 since the
+        // existing helper expects that concrete type.
+        if let Ok(elf64) = object::read::elf::ElfFile64::<Endianness>::parse(bytes) {
+            build_plt_stub_map(&elf64, sections, symbols)
+        } else {
+            std::collections::HashMap::new()
+        }
+    } else if let Ok(elf32) = object::read::elf::ElfFile32::<Endianness>::parse(bytes) {
+        build_arm_plt_stub_map(&elf32, sections, symbols)
+    } else {
+        std::collections::HashMap::new()
+    };
 
     image.gnu_hash = raw_section_bytes(sections, ".gnu.hash");
     image.sysv_hash = raw_section_bytes(sections, ".hash");
@@ -265,7 +298,7 @@ fn lift_elf_image(
         let Some(neutral) = sections.iter().find(|s| s.name == section_name) else {
             continue;
         };
-        let Ok(mut iter) = NoteIterator::<elf::FileHeader64<Endianness>>::new(
+        let Ok(mut iter) = NoteIterator::<Elf>::new(
             endian,
             header.sh_addralign(endian),
             data,
@@ -323,30 +356,6 @@ fn raw_section_bytes(
 /// standard layout; non-conforming inputs (e.g. PLT variants used
 /// by some GNU IFUNC schemes) get an empty map and the rewriter
 /// falls back to its existing relocation paths.
-/// 32-bit ELF (ARMv7) minimal image lift. Populates only
-/// the `plt_stubs` field so the rewriter's "fold call to
-/// stub" path works. Other ElfImage fields stay empty.
-fn lift_minimal_elf32_image(
-    bytes: &[u8],
-    sections: &[Section],
-    symbols: &[Symbol],
-) -> Option<crate::container::elf_image::ElfImage> {
-    use crate::container::elf_image::ElfImage;
-    use object::read::elf::{ElfFile32, FileHeader as _};
-    use object::Endianness;
-    let elf = ElfFile32::<Endianness>::parse(bytes).ok()?;
-    let endian = elf.endian();
-    // Only ARM ELF32 is interesting today.
-    let machine = elf.elf_header().e_machine(endian);
-    const EM_ARM: u16 = 40;
-    if machine != EM_ARM {
-        return None;
-    }
-    let mut image = ElfImage::new();
-    image.plt_stubs = build_arm_plt_stub_map(&elf, sections, symbols);
-    Some(image)
-}
-
 /// ARMv7 PLT stub layout: 20-byte header followed by 12-byte
 /// entries. The Nth `.rel.plt` entry corresponds to the Nth
 /// stub at `.plt + 20 + N*12`. Each `.rel.plt` entry is 8
@@ -586,15 +595,26 @@ fn classify_macho(bytes: &[u8]) -> crate::container::ContainerKind {
 /// `SectionKind::Other` — for stock kinds (Text/Data/Rodata/etc.)
 /// `object::write` already picks the right `sh_type`.
 fn populate_elf_raw_sh_type(bytes: &[u8], sections: &mut [Section]) {
-    use object::read::elf::{ElfFile64, SectionHeader};
+    use object::read::elf::{ElfFile32, ElfFile64};
     use object::Endianness;
 
-    let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) else {
+    if let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) {
+        populate_elf_raw_sh_type_typed(&elf, sections);
         return;
-    };
+    }
+    if let Ok(elf) = ElfFile32::<Endianness>::parse(bytes) {
+        populate_elf_raw_sh_type_typed(&elf, sections);
+    }
+}
+
+fn populate_elf_raw_sh_type_typed<'data, Elf>(
+    elf: &object::read::elf::ElfFile<'data, Elf, &'data [u8]>,
+    sections: &mut [Section],
+) where
+    Elf: object::read::elf::FileHeader<Endian = object::Endianness>,
+{
+    use object::read::elf::SectionHeader;
     let endian = elf.endian();
-    // `elf_section_table().iter()` includes the null section at index 0,
-    // which the neutral lift skips. Drop it so positional zip lines up.
     let table = elf.elf_section_table();
     for (section, header) in sections.iter_mut().zip(table.iter().skip(1)) {
         if matches!(section.kind, SectionKind::Other) {
