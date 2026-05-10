@@ -55,10 +55,32 @@ pub use editor::{
 pub use editor::TextEditor;
 pub use emit::{emit, EmitError, EmitOutput, EmittedRelocation};
 pub use ir::{
-    ConstantId, MacroKind, MacroOp, RewriteBlock, RewriteInstruction, RewriteOp, RewriteOperand,
-    SymbolId, Target,
+    ConstantId, MacroOp as MacroOpGeneric, RewriteBlock as RewriteBlockGeneric,
+    RewriteInstruction as RewriteInstructionGeneric, RewriteOp as RewriteOpGeneric,
+    RewriteOperand as RewriteOperandGeneric, SymbolId, Target,
 };
+pub use crate::isa::aarch64::AarchMacroKind as MacroKind;
+
+// AArch64-typed aliases — back-compat for code written before
+// the rewrite layer was made generic. Use these for aarch64
+// rewriting; for other ISAs, use the `Generic` variants
+// directly with the appropriate `Isa` parameter.
+use crate::isa::aarch64::Aarch64Isa;
+pub type RewritePlanAArch64 = plan::RewritePlan<Aarch64Isa>;
+pub type RewriteInstructionAArch64 = ir::RewriteInstruction<Aarch64Isa>;
+pub type RewriteOperandAArch64 = ir::RewriteOperand<Aarch64Isa>;
+pub type RewriteOpAArch64 = ir::RewriteOp<Aarch64Isa>;
+pub type RewriteBlockAArch64 = ir::RewriteBlock<Aarch64Isa>;
+pub type MacroOpAArch64 = ir::MacroOp<Aarch64Isa>;
+// Default exports for back-compat — these were aarch64-specific
+// before the refactor.
+pub use RewriteBlockAArch64 as RewriteBlock;
+pub use RewriteInstructionAArch64 as RewriteInstruction;
+pub use RewriteOpAArch64 as RewriteOp;
+pub use RewriteOperandAArch64 as RewriteOperand;
+pub use RewritePlanAArch64 as RewritePlan;
+pub use MacroOpAArch64 as MacroOp;
 pub use layout::{lay_out, EmitStrategy, InstructionLayout, Layout, LayoutError};
-pub use plan::{EditError, RewritePlan};
+pub use plan::EditError;
 
 pub use crate::mc::ControlFlowGraph;

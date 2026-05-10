@@ -43,14 +43,22 @@
 use crate::container::{
     Container, ContainerWriteError, SectionId, Symbol, SymbolId, SymbolKind,
 };
-use crate::isa::aarch64::{self, DecodedInstruction, DisassembleError, EncodeError};
+use crate::isa::aarch64::{self, Aarch64Isa, DecodedInstruction, DisassembleError, EncodeError};
 use crate::mc::{build_cfg, ControlFlowGraph};
 use crate::rewrite::commit::commit_to_container;
 use crate::rewrite::emit::{emit, EmitError};
-use crate::rewrite::ir::{RewriteInstruction, Target};
+use crate::rewrite::ir::{
+    RewriteInstruction as RewriteInstructionGeneric, Target,
+};
 use crate::rewrite::layout::{lay_out, LayoutError};
-use crate::rewrite::plan::{EditError, RewritePlan};
+use crate::rewrite::plan::{EditError, RewritePlan as RewritePlanGeneric};
 use crate::rewrite::EmitOutput;
+
+// Editor.rs is aarch64-only. Expose convenient aliases so the
+// existing function signatures keep their old shape without
+// the `<Aarch64Isa>` suffix sprinkled everywhere.
+type RewritePlan = RewritePlanGeneric<Aarch64Isa>;
+type RewriteInstruction = RewriteInstructionGeneric<Aarch64Isa>;
 
 /// Errors surfaced by the [`TextEditor`] convenience layer.
 #[derive(Debug, Clone, Eq, PartialEq)]

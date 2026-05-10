@@ -5,10 +5,15 @@
 //! foundation while the typed instruction and operand model is built out.
 
 mod control_flow;
+mod fusion;
+mod isa_impl;
+mod macro_emit;
 mod operand;
 mod recursive;
 mod sweep;
 pub(crate) mod table;
+
+pub use isa_impl::{Aarch64Isa, AarchMacroKind};
 
 pub use control_flow::{invert_conditional_branch, pcrel_range_bytes};
 pub use recursive::{

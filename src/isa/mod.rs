@@ -6,3 +6,8 @@
 
 pub mod aarch64;
 pub mod armv7;
+
+mod isa_trait;
+pub use isa_trait::{
+    FusionRelocationInfo, Isa, IsaEncodeOutput, MacroEmitError, MacroEmittedRelocation, PcRelKind,
+};

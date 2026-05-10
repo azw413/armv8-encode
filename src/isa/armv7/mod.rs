@@ -32,10 +32,18 @@
 //! offset N you read the high halfword first, then N+2 reads
 //! the low halfword).
 
-pub(crate) mod format_decode;
-pub(crate) mod operand;
-pub(crate) mod table;
-pub(crate) mod table_generated;
+pub mod arm;
+pub mod control_flow;
+pub mod encode;
+pub mod format_decode;
+pub mod isa_impl;
+pub mod neon_table_generated;
+pub mod operand;
+pub mod sweep;
+pub mod table;
+pub mod table_generated;
+
+pub use isa_impl::{ThumbIsa, ThumbMacroKind};
 
 pub use operand::{DecodeError, EncodeError, Register, RegisterClass};
 pub use table::{ThumbMnemonic, ThumbOpcode, ThumbWidth};

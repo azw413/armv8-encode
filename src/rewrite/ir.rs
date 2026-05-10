@@ -1,36 +1,28 @@
-//! Rewrite-IR types.
+//! Rewrite-IR types — generic over an [`Isa`] implementation.
 //!
-//! At the rewrite layer, branch operands are *symbolic*: they reference a
-//! block, a symbol, or a constant rather than a hard-coded address. This is
-//! what lets the layout pass move things around freely — addresses aren't
-//! recomputed until lowering, when each label gets resolved against the
-//! chosen layout.
+//! At the rewrite layer, branch operands are *symbolic*: they
+//! reference a block, a symbol, or a constant rather than a
+//! hard-coded address. This is what lets the layout pass move
+//! things around freely — addresses aren't recomputed until
+//! lowering, when each label gets resolved against the chosen
+//! layout.
 //!
-//! See the module-level docs in `rewrite::mod` for the full lift → edit →
-//! lay-out → emit flow.
+//! The IR types are parameterised over `I: Isa` so the same
+//! pipeline accepts both AArch64 and ARMv7 (Thumb / ARM mode).
+//! The `MacroOp` type carries the per-ISA `MacroKind` because
+//! fusion patterns differ.
 
-use crate::isa::aarch64::{Aarch64Mnemonic, DecodedOperand, Register};
+use crate::isa::Isa;
 use crate::mc::BasicBlockId;
+use std::fmt::{self, Debug};
 
-/// Identifier for an extern symbol — function entry, global, GOT slot.
-///
-/// Re-exported from the container layer so a single ID space spans
-/// "what the binary file says" and "what the rewriter is editing."
 pub use crate::container::SymbolId;
 
 /// Identifier for a constant — literal-pool entry, jump-table base, …
-///
-/// Like `SymbolId`, defined now so the surface is stable; resolution
-/// (literal-pool layout, etc.) lands later.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct ConstantId(pub usize);
 
 /// Where an address-shaped operand points after lifting.
-///
-/// `Block` is the common case for code already inside the rewrite plan.
-/// `Absolute` is the "the source binary had a literal address here" case
-/// — rare in well-formed code, but real for stripped binaries and hand-rolled
-/// boot stubs.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum Target {
     Block(BasicBlockId),
@@ -40,146 +32,222 @@ pub enum Target {
 }
 
 /// An operand at the rewrite-IR level.
-///
-/// Most operands pass through unchanged via `Decoded`. Only PC-relative ones
-/// get the symbolic treatment, since they're the ones whose meaning depends
-/// on layout.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum RewriteOperand {
-    /// Pass-through. Must not contain `BranchTarget` or `PageTarget` —
-    /// those are lifted to `Branch` / `Page`.
-    Decoded(DecodedOperand),
-    /// PC-relative branch target.
+pub enum RewriteOperand<I: Isa> {
+    Decoded(I::Operand),
     Branch(Target),
-    /// Page-relative target (e.g. `adrp`).
     Page(Target),
 }
 
+impl<I: Isa> Clone for RewriteOperand<I> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Decoded(o) => Self::Decoded(o.clone()),
+            Self::Branch(t) => Self::Branch(*t),
+            Self::Page(t) => Self::Page(*t),
+        }
+    }
+}
+
+impl<I: Isa> PartialEq for RewriteOperand<I> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Decoded(a), Self::Decoded(b)) => a == b,
+            (Self::Branch(a), Self::Branch(b)) => a == b,
+            (Self::Page(a), Self::Page(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<I: Isa> Eq for RewriteOperand<I> {}
+
+impl<I: Isa> Debug for RewriteOperand<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decoded(o) => f.debug_tuple("Decoded").field(o).finish(),
+            Self::Branch(t) => f.debug_tuple("Branch").field(t).finish(),
+            Self::Page(t) => f.debug_tuple("Page").field(t).finish(),
+        }
+    }
+}
+
 /// A single instruction at the rewrite-IR level.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RewriteInstruction {
-    pub mnemonic: Aarch64Mnemonic,
-    pub operands: Vec<RewriteOperand>,
-    /// Address this instruction had in the source binary, if any. Diagnostic
-    /// only; useful for round-tripping unmodified regions and for error
-    /// messages that point at the original source.
+pub struct RewriteInstruction<I: Isa> {
+    pub mnemonic: I::Mnemonic,
+    pub operands: Vec<RewriteOperand<I>>,
     pub original_address: Option<u64>,
 }
 
+impl<I: Isa> Clone for RewriteInstruction<I> {
+    fn clone(&self) -> Self {
+        Self {
+            mnemonic: self.mnemonic,
+            operands: self.operands.clone(),
+            original_address: self.original_address,
+        }
+    }
+}
+
+impl<I: Isa> PartialEq for RewriteInstruction<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.mnemonic == other.mnemonic
+            && self.operands == other.operands
+            && self.original_address == other.original_address
+    }
+}
+
+impl<I: Isa> Eq for RewriteInstruction<I> {}
+
+impl<I: Isa> Debug for RewriteInstruction<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RewriteInstruction")
+            .field("mnemonic", &self.mnemonic)
+            .field("operands", &self.operands)
+            .field("original_address", &self.original_address)
+            .finish()
+    }
+}
+
 /// A basic block at the rewrite-IR level.
-///
-/// Blocks here track the `BasicBlockId` from the analysis CFG so callers can
-/// cross-reference between the two. Internal control flow within a block
-/// stays implicit: op order is the source-order from the CFG, and the
-/// terminator is the last op.
-///
-/// `ops` may contain [`RewriteOp::Instruction`] (single AArch64 instruction,
-/// the common case) or [`RewriteOp::Macro`] (a fused multi-instruction
-/// idiom like `adrp+add` representing a single logical operation).
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RewriteBlock {
+pub struct RewriteBlock<I: Isa> {
     pub id: BasicBlockId,
-    pub ops: Vec<RewriteOp>,
+    pub ops: Vec<RewriteOp<I>>,
 }
 
-/// One unit of code within a [`RewriteBlock`]. Either a single AArch64
-/// instruction or a fused macro that expands to several instructions on
-/// emit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum RewriteOp {
-    Instruction(RewriteInstruction),
-    Macro(MacroOp),
+impl<I: Isa> Clone for RewriteBlock<I> {
+    fn clone(&self) -> Self {
+        Self { id: self.id, ops: self.ops.clone() }
+    }
 }
 
-/// A multi-instruction AArch64 idiom recognized at lift time and treated
-/// as a single logical operation by the rest of the pipeline.
-///
-/// The most common case is the `adrp Rd, page; add Rd, Rd, #lo12` pair
-/// that compilers emit to compute the absolute address of a symbol —
-/// editing the *symbol* shouldn't require coordinating two separate
-/// instruction edits, so we represent the pair as one
-/// `MacroKind::LoadAddress` macro.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct MacroOp {
-    pub kind: MacroKind,
-    /// Destination register the macro writes its result into. For
-    /// `LoadAddress`, this is the `Rd` shared by the adrp and add.
-    pub register: Register,
-    /// Symbolic target the macro computes / loads / stores. Replaces both
-    /// the adrp's page operand and the add/ldr/str's lo-12 immediate.
+impl<I: Isa> PartialEq for RewriteBlock<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.ops == other.ops
+    }
+}
+
+impl<I: Isa> Eq for RewriteBlock<I> {}
+
+impl<I: Isa> Debug for RewriteBlock<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RewriteBlock")
+            .field("id", &self.id)
+            .field("ops", &self.ops)
+            .finish()
+    }
+}
+
+/// One unit of code within a [`RewriteBlock`].
+pub enum RewriteOp<I: Isa> {
+    Instruction(RewriteInstruction<I>),
+    Macro(MacroOp<I>),
+}
+
+impl<I: Isa> Clone for RewriteOp<I> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Instruction(i) => Self::Instruction(i.clone()),
+            Self::Macro(m) => Self::Macro(m.clone()),
+        }
+    }
+}
+
+impl<I: Isa> PartialEq for RewriteOp<I> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Instruction(a), Self::Instruction(b)) => a == b,
+            (Self::Macro(a), Self::Macro(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<I: Isa> Eq for RewriteOp<I> {}
+
+impl<I: Isa> Debug for RewriteOp<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Instruction(i) => f.debug_tuple("Instruction").field(i).finish(),
+            Self::Macro(m) => f.debug_tuple("Macro").field(m).finish(),
+        }
+    }
+}
+
+/// A multi-instruction idiom recognised at lift time.
+pub struct MacroOp<I: Isa> {
+    pub kind: I::MacroKind,
+    pub register: I::Register,
     pub target: Target,
-    /// The original instructions that fused into this macro, in
-    /// source order. Kept so emit can reproduce the source bytes
-    /// verbatim when no edits touch the macro, and so diagnostics can
-    /// point at the original bytes.
-    pub original_instructions: Vec<RewriteInstruction>,
-    /// Original addresses of the fused instructions. Used by edit-by-
-    /// address lookups: a redirect targeting either of these addresses
-    /// finds this macro.
+    pub original_instructions: Vec<RewriteInstruction<I>>,
     pub original_addresses: Vec<u64>,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum MacroKind {
-    /// `adrp Rd, page; add Rd, Rd, #lo12` — compute the absolute address
-    /// of `target`.
-    LoadAddress,
-    /// `adrp Rd, page; ldr/str Rd', [Rn, #lo12]` — load from or store to
-    /// `target`. Covers all `LDST*_ABS_LO12_NC` variants (8/16/32/64/128
-    /// bit, signed/unsigned, integer/SIMD). The companion instruction's
-    /// memory operand is preserved verbatim from the source via
-    /// [`MacroOp::original_instructions`]; the rewriter only needs to
-    /// know that it depends on the page address from the adrp and pairs
-    /// with a `PageOffset12` relocation against the same symbol.
-    AccessValue,
+impl<I: Isa> Clone for MacroOp<I> {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind,
+            register: self.register.clone(),
+            target: self.target,
+            original_instructions: self.original_instructions.clone(),
+            original_addresses: self.original_addresses.clone(),
+        }
+    }
 }
 
-impl RewriteOp {
-    /// Number of source bytes this op corresponds to, before any
-    /// rewriting. `4` for an instruction, `4 * original_instructions.len()`
-    /// for a macro.
+impl<I: Isa> PartialEq for MacroOp<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.register == other.register
+            && self.target == other.target
+            && self.original_instructions == other.original_instructions
+            && self.original_addresses == other.original_addresses
+    }
+}
+
+impl<I: Isa> Eq for MacroOp<I> {}
+
+impl<I: Isa> Debug for MacroOp<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MacroOp")
+            .field("kind", &self.kind)
+            .field("register", &self.register)
+            .field("target", &self.target)
+            .field("original_instructions", &self.original_instructions)
+            .field("original_addresses", &self.original_addresses)
+            .finish()
+    }
+}
+
+impl<I: Isa> RewriteOp<I> {
     pub fn source_byte_size(&self) -> u64 {
         match self {
-            RewriteOp::Instruction(_) => 4,
-            RewriteOp::Macro(macro_op) => 4 * macro_op.original_instructions.len() as u64,
+            Self::Instruction(insn) => I::instruction_source_size(insn.mnemonic),
+            Self::Macro(macro_op) => I::macro_source_size(&macro_op.original_instructions),
         }
     }
 
-    /// First original address of this op, if any. For an instruction
-    /// that's its `original_address`; for a macro it's the first entry
-    /// of `original_addresses`.
     pub fn first_original_address(&self) -> Option<u64> {
         match self {
-            RewriteOp::Instruction(insn) => insn.original_address,
-            RewriteOp::Macro(macro_op) => macro_op.original_addresses.first().copied(),
+            Self::Instruction(insn) => insn.original_address,
+            Self::Macro(macro_op) => macro_op.original_addresses.first().copied(),
         }
     }
 
-    /// True when `address` matches one of this op's source addresses.
     pub fn matches_source_address(&self, address: u64) -> bool {
         match self {
-            RewriteOp::Instruction(insn) => insn.original_address == Some(address),
-            RewriteOp::Macro(macro_op) => macro_op.original_addresses.contains(&address),
+            Self::Instruction(insn) => insn.original_address == Some(address),
+            Self::Macro(macro_op) => macro_op.original_addresses.contains(&address),
         }
     }
 }
 
-impl RewriteInstruction {
-    /// True when this instruction has at least one symbolic branch / page
-    /// target. Used by the layout pass to decide whether displacement
-    /// checks are needed.
+impl<I: Isa> RewriteInstruction<I> {
     pub fn has_pc_relative_operand(&self) -> bool {
         self.operands.iter().any(|operand| {
-            matches!(
-                operand,
-                RewriteOperand::Branch(_) | RewriteOperand::Page(_)
-            )
+            matches!(operand, RewriteOperand::Branch(_) | RewriteOperand::Page(_))
         })
     }
 
-    /// First branch / page target on this instruction, if any. AArch64
-    /// branches have at most one PC-relative operand, so this is enough for
-    /// range checks and target resolution.
     pub fn pc_relative_target(&self) -> Option<Target> {
         self.operands.iter().find_map(|operand| match operand {
             RewriteOperand::Branch(t) | RewriteOperand::Page(t) => Some(*t),

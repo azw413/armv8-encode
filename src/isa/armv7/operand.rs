@@ -105,10 +105,55 @@ impl std::error::Error for DecodeError {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EncodeError {
+    /// The supplied mnemonic doesn't appear in the table.
     UnknownMnemonic { mnemonic: &'static str },
-    NoMatchingForm { mnemonic: &'static str },
-    InvalidOperand { kind: &'static str },
-    Unimplemented { kind: &'static str },
+    /// No row matches the given (mnemonic, operand-shape).
+    /// `operand_count` is the number of operands the caller
+    /// supplied; useful for diagnosing "wrong arity" errors.
+    NoMatchingForm {
+        mnemonic: &'static str,
+        operand_count: usize,
+    },
+    /// The operand at `slot` doesn't fit the format-code's
+    /// expected shape (e.g. an Immediate where the slot
+    /// expected a Register, or a register from the wrong
+    /// class).
+    OperandShapeMismatch {
+        slot: usize,
+        format_code: &'static str,
+        got: &'static str,
+    },
+    /// Immediate value won't fit into the field's width.
+    ImmediateOutOfRange {
+        slot: usize,
+        value: i64,
+        bits: u8,
+    },
+    /// Register index outside the field's encoded range
+    /// (e.g. r9 in a 3-bit low-register slot).
+    RegisterOutOfRange {
+        slot: usize,
+        index: u8,
+        max: u8,
+    },
+    /// Branch displacement exceeds the encoding's reach.
+    /// `displacement` is in bytes from the source PC.
+    BranchOutOfRange {
+        slot: usize,
+        displacement: i64,
+        bits: u8,
+    },
+    /// Format code recognized at decode time but not yet
+    /// invertible. Caller should use a different row or wait
+    /// for encoder coverage to grow.
+    UnsupportedFormatCode { format_code: String },
+    /// Operand count doesn't match the format string's slot
+    /// count. Distinct from NoMatchingForm: this is "right
+    /// row, wrong number of args."
+    ArityMismatch {
+        format_slots: usize,
+        operands: usize,
+    },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -117,15 +162,48 @@ impl std::fmt::Display for EncodeError {
             Self::UnknownMnemonic { mnemonic } => {
                 write!(f, "Thumb encoder: unknown mnemonic {mnemonic:?}")
             }
-            Self::NoMatchingForm { mnemonic } => {
-                write!(f, "Thumb encoder: no matching form for {mnemonic:?}")
-            }
-            Self::InvalidOperand { kind } => {
-                write!(f, "Thumb encoder: invalid operand kind {kind}")
-            }
-            Self::Unimplemented { kind } => {
-                write!(f, "Thumb encoder: unimplemented operand kind {kind}")
-            }
+            Self::NoMatchingForm {
+                mnemonic,
+                operand_count,
+            } => write!(
+                f,
+                "Thumb encoder: no matching form for {mnemonic:?} with {operand_count} operands",
+            ),
+            Self::OperandShapeMismatch {
+                slot,
+                format_code,
+                got,
+            } => write!(
+                f,
+                "Thumb encoder: slot {slot} ({format_code}) wants different operand shape, got {got}",
+            ),
+            Self::ImmediateOutOfRange { slot, value, bits } => write!(
+                f,
+                "Thumb encoder: slot {slot} immediate {value} doesn't fit in {bits} bits",
+            ),
+            Self::RegisterOutOfRange { slot, index, max } => write!(
+                f,
+                "Thumb encoder: slot {slot} register r{index} exceeds max r{max}",
+            ),
+            Self::BranchOutOfRange {
+                slot,
+                displacement,
+                bits,
+            } => write!(
+                f,
+                "Thumb encoder: slot {slot} branch displacement {displacement} exceeds {bits}-bit range",
+            ),
+            Self::UnsupportedFormatCode { format_code } => write!(
+                f,
+                "Thumb encoder: format code {format_code} not yet invertible",
+            ),
+            Self::ArityMismatch {
+                format_slots,
+                operands,
+            } => write!(
+                f,
+                "Thumb encoder: format expects {format_slots} operands, got {operands}",
+            ),
         }
     }
 }
