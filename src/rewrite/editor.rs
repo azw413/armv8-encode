@@ -2410,7 +2410,7 @@ impl BinaryEditor {
                 let edited = commit_to_container(&binary.container, text.section_id, output);
                 edited.to_bytes().map_err(TextEditorError::from)
             }
-            Some(appended) => {
+            Some(mut appended) => {
                 // Run the in-place layout/emit for the lifted
                 // section (if any) so branch redirects to new
                 // functions get folded against the
@@ -2547,6 +2547,50 @@ impl BinaryEditor {
                     overrides.insert(*idx, bytes.clone());
                 }
 
+                // If the segment will mix code (function bodies
+                // already in `appended.bytes`) with data (rebuilt
+                // dynsym/dynstr or relocated `.dynamic`), pad the
+                // code prefix up to APPEND_PAGE_ALIGN here, BEFORE
+                // any extension routine assigns vaddrs to data.
+                // Reason: the writer emits two PT_LOADs for split
+                // segments (Android refuses W+X), so code and
+                // data must occupy disjoint pages. If we don't
+                // pad here, the data extensions get vaddrs
+                // computed from `appended.bytes.len()` (unpadded),
+                // but the writer would then have to shift the
+                // bytes in-file to reach a page boundary —
+                // breaking the vaddr → file_offset mapping the
+                // editor already baked into `.dynamic` tags.
+                // Padding upfront keeps vaddrs and file offsets
+                // in sync.
+                let needs_split = !appended.bytes.is_empty()
+                    && (!appended.exports.is_empty()
+                        || !binary.pending_library_deps.is_empty()
+                        || !binary.pending_appended_init_slots.is_empty());
+                if needs_split {
+                    let cur = appended.bytes.len() as u64;
+                    let aligned = (cur
+                        + crate::container::elf_writer::APPEND_PAGE_ALIGN
+                        - 1)
+                        & !(crate::container::elf_writer::APPEND_PAGE_ALIGN - 1);
+                    let pad = (aligned - cur) as usize;
+                    if pad > 0 {
+                        // NOP-pad — same instruction (`nop`)
+                        // armv8-encode emits elsewhere when it
+                        // needs filler in executable regions.
+                        let nop = [0x1fu8, 0x20, 0x03, 0xd5];
+                        let mut padded = Vec::with_capacity(appended.bytes.len() + pad);
+                        padded.extend_from_slice(&appended.bytes);
+                        for _ in 0..(pad / 4) {
+                            padded.extend_from_slice(&nop);
+                        }
+                        for _ in 0..(pad % 4) {
+                            padded.push(0);
+                        }
+                        appended.bytes = padded;
+                    }
+                }
+
                 // If exports or library dependencies were
                 // registered, extend the dynsym family / dynstr
                 // and pack the new copies into the appended
@@ -2592,16 +2636,15 @@ impl BinaryEditor {
                     &mut overrides,
                 )?;
                 // The first `appended.bytes.len()` bytes of the
-                // segment are executable code (function bodies
-                // packed by `extend_segment_for_exports`'s prefix
-                // copy and any `add_function` payload). Everything
-                // after is data — rebuilt dynsym/dynstr, init
-                // slots, relocated `.dynamic`/`.dynstr`/`.dynsym`.
-                // The writer uses `code_len` to choose between a
-                // single PT_LOAD (all-code or all-data) and a
-                // split (R+X over the code prefix, R+W over the
-                // data suffix). Android refuses W+X PT_LOADs, so
-                // any append that mixes both must split.
+                // segment are executable code (function bodies +
+                // any page-padding the split branch above
+                // inserted). `extend_segment_for_exports` and
+                // friends append data after that. The writer uses
+                // `code_len` to choose between a single PT_LOAD
+                // (all-code or all-data) and a split (R+X over
+                // the code prefix, R+W over the data suffix).
+                // Android refuses W+X PT_LOADs, so any append
+                // that mixes both must split.
                 let original_code_len = appended.bytes.len() as u64;
                 let no_executable_append = appended.exports.is_empty()
                     && appended.bytes.is_empty()

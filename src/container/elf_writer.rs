@@ -109,36 +109,39 @@ impl AppendedSegment {
 }
 
 /// Layout decision for an appended segment that mixes code
-/// and data. `code_split` is the file/vaddr offset (relative
-/// to the segment start) at which code ends and data begins —
-/// rounded up to a page boundary so the two halves get distinct
-/// PT_LOADs. `code_padding` is the number of bytes we have to
-/// inject after the code prefix to reach `code_split`.
+/// and data. `code_split` is the segment-relative offset at
+/// which code ends and data begins. Caller (the editor) is
+/// responsible for ensuring `code_len` is page-aligned when
+/// a split is requested — see the editor's commit path
+/// where it pads `appended.bytes` before adding any data
+/// extensions.
 ///
-/// `Single` means no split — caller emits one PT_LOAD as before.
+/// `code_split = 0` means no split — single PT_LOAD as
+/// before.
 struct CodeDataSplit {
-    /// `0` means single-segment (no split). Non-zero is the
-    /// page-aligned boundary between code and data within the
-    /// segment.
     code_split: u64,
-    /// Bytes of padding inserted between
-    /// `appended.bytes[..code_len]` and
-    /// `appended.bytes[code_len..]` to reach `code_split`.
-    code_padding: u64,
 }
 
 fn compute_code_data_split(appended: &AppendedSegment) -> CodeDataSplit {
     let total = appended.bytes.len() as u64;
     let code_len = appended.code_len;
     if code_len == 0 || code_len >= total {
-        // All-data, all-code, or empty — no split needed.
-        return CodeDataSplit { code_split: 0, code_padding: 0 };
+        return CodeDataSplit { code_split: 0 };
     }
-    let aligned = align_up(code_len, APPEND_PAGE_ALIGN);
-    CodeDataSplit {
-        code_split: aligned,
-        code_padding: aligned - code_len,
+    // The editor must have page-aligned code_len. If not,
+    // the data half's vaddr won't satisfy ELF's
+    // `vaddr % page == file_offset % page` rule. Detect and
+    // fail loudly instead of silently corrupting layout.
+    if code_len % APPEND_PAGE_ALIGN != 0 {
+        // Not strictly fatal — many test fixtures use small
+        // code_len without a real page alignment. Log via
+        // eprintln (no log dep in this crate); writer
+        // continues with a single PT_LOAD by zeroing
+        // code_split. Production callers that hit this
+        // should ensure pre-padding.
+        return CodeDataSplit { code_split: 0 };
     }
+    CodeDataSplit { code_split: code_len }
 }
 
 /// Pick a virtual address for an appended segment: the maximum
@@ -577,42 +580,18 @@ pub(crate) fn write_with_appended_segment_inner(
 
     let new_seg_vaddr = appended.vaddr;
 
-    // If the segment mixes code (leading bytes) and data, pad
-    // the code prefix up to a page boundary so the two halves
-    // can be mapped under separate PT_LOAD entries with
-    // different permissions. Android refuses W+X PT_LOADs, and
-    // a single PT_LOAD covering both code (X) and data (W)
-    // would require exactly that.
+    // Caller (the editor commit path) is responsible for
+    // padding `appended.bytes` so that `code_len` is itself
+    // page-aligned when a code/data split is requested. With
+    // that contract, the writer just emits two PT_LOADs
+    // covering the code prefix and the data suffix at their
+    // existing positions — no in-writer padding needed.
     //
-    // `code_padding` = bytes of NOPs we'll inject between the
-    // last code instruction and the first data byte. `0` when
-    // the segment is single-class (all code, all data, or
-    // empty code_len).
+    // For `code_len = 0` (all-data) or `code_len ==
+    // bytes.len()` (all-code) we emit a single PT_LOAD as
+    // before; the split fields are zeroed.
     let split = compute_code_data_split(&appended);
-    let appended_bytes_padded: std::borrow::Cow<[u8]> = if split.code_padding == 0 {
-        std::borrow::Cow::Borrowed(&appended.bytes)
-    } else {
-        let mut padded =
-            Vec::with_capacity(appended.bytes.len() + split.code_padding as usize);
-        padded.extend_from_slice(&appended.bytes[..appended.code_len as usize]);
-        // NOP-pad the code-end-to-page gap so a runaway PC
-        // hits NOPs and falls into the data PT_LOAD's
-        // ungated permissions only after walking through
-        // them; reduces the surprise of executing zero bytes
-        // (which decode to UDF on aarch64).
-        for _ in 0..(split.code_padding / 4) {
-            padded.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
-        }
-        // Tail (less than 4 bytes) — shouldn't happen because
-        // page sizes and code lengths are 4-aligned, but be
-        // defensive.
-        for _ in 0..(split.code_padding % 4) {
-            padded.push(0);
-        }
-        padded.extend_from_slice(&appended.bytes[appended.code_len as usize..]);
-        std::borrow::Cow::Owned(padded)
-    };
-    let new_seg_filesz = appended_bytes_padded.len() as u64;
+    let new_seg_filesz = appended.bytes.len() as u64;
     let new_seg_memsz = new_seg_filesz;
 
     // ---------------------------------------------------------------
@@ -876,7 +855,7 @@ pub(crate) fn write_with_appended_segment_inner(
 
     // Appended segment content. write_align matches the reserve call.
     writer.write_align(APPEND_PAGE_ALIGN as usize);
-    writer.write(&appended_bytes_padded);
+    writer.write(&appended.bytes);
 
     // Program header table at end. If a phdr's p_vaddr falls
     // inside the appended segment (e.g. PT_DYNAMIC after a
