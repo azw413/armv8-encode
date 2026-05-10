@@ -185,6 +185,16 @@ pub fn decode_operands_from_format(
                 // (`%W` *with* a bitfield is the *4 decimal
                 // — handled below.)
             }
+            // %<bf>c — bitfielded condition (e.g. 16-bit
+            // conditional B's `b%8-11c.n\t%0-7B%X`). Emit a
+            // Condition operand so the encoder can preserve
+            // the cond bits exactly.
+            b'c' if !bitfield.is_empty() => {
+                if let Some((lo, hi)) = parse_bitfield(bitfield) {
+                    let cond = extract_field(word, lo, hi) as u8;
+                    operands.push(DecodedOperand::Condition(cond));
+                }
+            }
             // Bitfield-bearing operand codes.
             b'r' => {
                 if let Some((lo, hi)) = parse_bitfield(bitfield) {
@@ -341,16 +351,32 @@ pub fn decode_operands_from_format(
                 let imm12 = (i_bit << 11) | (imm3 << 8) | imm8;
                 operands.push(DecodedOperand::Immediate(imm12 as i64));
             }
+            b'I' if width_bytes == 2 => {
+                // 16-bit %I: IT instruction's cond+mask
+                // payload (bits 0..7 of the 16-bit word).
+                // Preserve via OpaqueBits.
+                const I16_MASK: u32 = 0x00FF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & I16_MASK,
+                    mask: I16_MASK,
+                });
+            }
             b'M' if width_bytes == 4 => {
                 // Modified 12-bit immediate (ThumbExpandImm).
-                // Same bit positions as %I; the value is the
-                // expanded constant. Implemented per ARM ARM
-                // A6.3.2.
-                let i_bit = (word >> 26) & 0x1;
-                let imm3 = (word >> 12) & 0x7;
-                let imm8 = word & 0xff;
-                let raw = (i_bit << 11) | (imm3 << 8) | imm8;
-                operands.push(DecodedOperand::Immediate(thumb_expand_imm(raw) as i64));
+                // Preserve the raw 12-bit encoding via
+                // OpaqueBits so the round-trip picks exactly
+                // the same `imm12` form (rotation+imm8) as
+                // the input — `thumb_expand_imm_inverse`
+                // could otherwise pick a different one for
+                // the same expanded value.
+                //
+                // Owned bits: bit 26 (i), bits 12..14 (imm3),
+                // bits 0..7 (imm8) = 0x0400_70FF.
+                const M_IMM_MASK: u32 = 0x0400_70FF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & M_IMM_MASK,
+                    mask: M_IMM_MASK,
+                });
             }
             b'J' if width_bytes == 4 => {
                 // 16-bit immediate: hw1[3:0] : hw1[10] : hw2[14:12] : hw2[7:0].
@@ -384,15 +410,14 @@ pub fn decode_operands_from_format(
                 operands.push(DecodedOperand::Immediate(imm16 as i64));
             }
             b'S' if bitfield.is_empty() && width_bytes == 4 => {
-                // 32-bit %S: shifted Rm. Rm in hw2[3:0],
-                // shift type in hw2[5:4], imm5 in
-                // hw2[14:12]:hw2[7:6]. We emit the register;
-                // the shift is encoded for display only.
-                let rm = (word & 0xf) as u8;
-                operands.push(DecodedOperand::Register(Register {
-                    class: RegisterClass::R,
-                    index: rm,
-                }));
+                // 32-bit %S: shifted Rm + S-bit (bit 20 = the
+                // flag-setting `%20's` indicator that's
+                // variable across data-processing rows).
+                const S_MASK: u32 = 0x0010_70FF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & S_MASK,
+                    mask: S_MASK,
+                });
             }
             b's' if bitfield.is_empty() && width_bytes == 4 => {
                 // SSAT/USAT shift: imm5 from hw2[14:12]:hw2[7:6].
@@ -403,48 +428,65 @@ pub fn decode_operands_from_format(
                 }
             }
             b's' if bitfield.is_empty() && width_bytes == 2 => {
-                // 16-bit %s: lsr/asr immediate from bits[10:6],
-                // where 0 means 32.
-                let raw = (word >> 6) & 0x1f;
-                let imm = if raw == 0 { 32 } else { raw };
-                operands.push(DecodedOperand::Immediate(imm as i64));
+                // 16-bit %s: lsr/asr immediate at bits 6..10.
+                // Preserve via OpaqueBits for bit-exact
+                // round-trip (decoder also emits an
+                // Immediate for the typed view; the encoder
+                // ignores it and uses OpaqueBits).
+                const S16_MASK: u32 = 0x07C0;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & S16_MASK,
+                    mask: S16_MASK,
+                });
             }
             b'b' if bitfield.is_empty() && width_bytes == 2 => {
-                // 16-bit %b: CZB (CBZ/CBNZ) target. Address
-                // = pc + 4 + ((bits[7:3] << 1) | (bit[9] << 6)).
-                let off = (((word >> 3) & 0x1f) << 1) | (((word >> 9) & 0x1) << 6);
-                let target = address.wrapping_add(4).wrapping_add(off as u64);
-                operands.push(DecodedOperand::BranchTarget(target));
+                // 16-bit %b: CZB (CBZ/CBNZ) target. Preserve
+                // via OpaqueBits.
+                const B16_MASK: u32 = 0x02F8;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & B16_MASK,
+                    mask: B16_MASK,
+                });
             }
             b'm' | b'n' if width_bytes == 4 => {
-                // 32-bit register mask: low 16 bits of hw2.
-                let mask = (word & 0xffff) as u16;
-                operands.push(DecodedOperand::RegisterList(mask));
+                // 32-bit register mask: preserve low 16 bits
+                // (the reglist) plus bit 21 (the W writeback
+                // indicator that the format string's
+                // companion `%21'!` directive prints).
+                const M_MASK: u32 = 0x0020_FFFF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & M_MASK,
+                    mask: M_MASK,
+                });
             }
             b'E' if bitfield.is_empty() && width_bytes == 4 => {
-                // bfc/bfi: lsb (5-bit) and msb (5-bit). lsb =
-                // hw2[14:12]:hw2[7:6]; msb = hw2[4:0]. Emits
-                // (lsb, width = msb - lsb + 1).
-                let msb = word & 0x1f;
-                let lsb = (((word >> 12) & 0x7) << 2) | ((word >> 6) & 0x3);
-                operands.push(DecodedOperand::Immediate(lsb as i64));
-                let width = msb.saturating_sub(lsb).wrapping_add(1);
-                operands.push(DecodedOperand::Immediate(width as i64));
+                // bfc/bfi: preserve the entire lsb+msb field
+                // pair via OpaqueBits.
+                const E_MASK: u32 = 0x0000_709F;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & E_MASK,
+                    mask: E_MASK,
+                });
             }
             b'F' if bitfield.is_empty() && width_bytes == 4 => {
-                // sbfx/ubfx: lsb (5-bit) and width = (5-bit
-                // value) + 1. Same lsb layout as %E.
-                let widthm1 = word & 0x1f;
-                let lsb = (((word >> 12) & 0x7) << 2) | ((word >> 6) & 0x3);
-                operands.push(DecodedOperand::Immediate(lsb as i64));
-                operands.push(DecodedOperand::Immediate((widthm1 + 1) as i64));
+                // sbfx/ubfx: preserve lsb+widthm1 via
+                // OpaqueBits.
+                const F_MASK: u32 = 0x0000_709F;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & F_MASK,
+                    mask: F_MASK,
+                });
             }
             b'L' if bitfield.is_empty() && width_bytes == 4 => {
-                // ldrd/strd PC-relative comment. Only emits
-                // an operand when Rn=PC. offset = imm8*4,
-                // sign from U bit (bit 23 of hw1 → bit 23 of
-                // hw1's high half = bit 39, but `given` here is
-                // 32-bit packed → bit 23 of word).
+                // ldrd/strd address. Operand-owned bits:
+                // bit 24 (P), bit 23 (U), bit 21 (W),
+                // Rn (16..19), imm8 (0..7).
+                const L_MASK: u32 = 0x03AF_00FF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & L_MASK,
+                    mask: L_MASK,
+                });
+                // Convenience: PcRelative target for Rn=PC.
                 let rn = (word >> 16) & 0xf;
                 if rn == 0xf {
                     let imm8 = word & 0xff;
@@ -459,49 +501,27 @@ pub fn decode_operands_from_format(
                 }
             }
             b'a' if bitfield.is_empty() && width_bytes == 4 => {
-                // 32-bit %a: load/store address [Rn, #±imm].
-                // We emit the base register and the signed
-                // offset (when present). For PC-relative
-                // forms (Rn=15), also emit a PcRelative
-                // pointer to the literal.
+                // 32-bit %a: load/store address. Operand-
+                // owned bits cover bit 23 (U), bits 21..22
+                // (size suffix that companion `%w` reads),
+                // Rn (16..19), op (8..11), imm12/imm8
+                // (0..11). Preserve via OpaqueBits.
+                const A_MASK: u32 = 0x00EF_0FFF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & A_MASK,
+                    mask: A_MASK,
+                });
+                // Convenience: PcRelative for Rn=PC literal
+                // pool loads.
                 let rn = ((word >> 16) & 0xf) as u8;
-                let u = (word >> 23) & 0x1;
-                let i12 = word & 0xfff;
-                let i8 = word & 0xff;
-                let op = (word >> 8) & 0xf;
-                operands.push(DecodedOperand::Register(Register {
-                    class: RegisterClass::R,
-                    index: rn,
-                }));
-                let offset: i64 = if u == 1 {
-                    i12 as i64
-                } else if rn == 15 {
-                    -(i12 as i64)
-                } else if op == 0 {
-                    // Shifted register form — emit Rm only.
-                    let rm = (i8 & 0xf) as u8;
-                    operands.push(DecodedOperand::Register(Register {
-                        class: RegisterClass::R,
-                        index: rm,
-                    }));
-                    0
-                } else {
-                    // 8-bit immediate variants (op = E/C/F/D/B/9):
-                    // sign determined by op.
-                    match op {
-                        0xE | 0xF | 0xB => i8 as i64,
-                        0xC | 0xD | 0x9 => -(i8 as i64),
-                        _ => 0,
-                    }
-                };
-                if offset != 0 || u == 1 {
-                    operands.push(DecodedOperand::Immediate(offset));
-                }
                 if rn == 15 {
+                    let u = (word >> 23) & 0x1;
+                    let i12 = word & 0xfff;
+                    let signed = if u == 1 { i12 as i64 } else { -(i12 as i64) };
                     let pc_aligned = address & !3u64;
                     let target = (pc_aligned as i64)
                         .wrapping_add(4)
-                        .wrapping_add(offset) as u64;
+                        .wrapping_add(signed) as u64;
                     operands.push(DecodedOperand::PcRelative(target));
                 }
             }
@@ -776,11 +796,16 @@ mod tests {
             0x2000,
             2,
         );
-        assert_eq!(operands.len(), 1);
-        match &operands[0] {
-            DO::BranchTarget(t) => assert_eq!(*t, 0x2000 + 4 + 6),
-            _ => panic!("expected BranchTarget, got {operands:?}"),
-        }
+        // operands[0] = Condition (from %8-11c)
+        // operands[1] = BranchTarget (from %0-7B)
+        let target = operands
+            .iter()
+            .find_map(|o| match o {
+                DO::BranchTarget(t) => Some(*t),
+                _ => None,
+            })
+            .expect("BranchTarget");
+        assert_eq!(target, 0x2000 + 4 + 6);
     }
 
     #[test]
@@ -849,14 +874,19 @@ mod tests {
             4,
         );
         assert!(unhandled.is_empty(), "unhandled: {unhandled:?}");
-        assert_eq!(operands.len(), 2);
-        match (&operands[0], &operands[1]) {
-            (DO::Register(rd), DO::Immediate(imm)) => {
-                assert_eq!(rd.index, 0);
-                assert_eq!(*imm, 1);
-            }
-            _ => panic!("unexpected: {operands:?}"),
-        }
+        // %M now emits OpaqueBits; the test confirms Rd
+        // and the OpaqueBits payload carries the imm12.
+        assert!(matches!(
+            operands.first(),
+            Some(DO::Register(r)) if r.index == 0
+        ));
+        let opaque = operands.iter().find_map(|o| match o {
+            DO::OpaqueBits { bits, .. } => Some(*bits),
+            _ => None,
+        }).expect("OpaqueBits");
+        // imm12 stored at bit 26 + bits 12..14 + bits 0..7;
+        // for value=1 the encoded imm12 = 1 (case-0 form).
+        assert_eq!(opaque & 0xff, 1);
     }
 
     #[test]
@@ -917,54 +947,50 @@ mod tests {
 
     #[test]
     fn decodes_thumb1_lsr_immediate_shift() {
-        // lsr r0, r1, #5 → 0b0000_1_00101_001_000 = 0x0948.
-        // Format: "lsr%C\t%0-2r, %3-5r, %s"
+        // %s no-bf 16-bit now emits OpaqueBits covering bits
+        // 6..10. imm5=5 → bits = 5 << 6 = 0x140.
         let (operands, unhandled) =
             decode_operands_from_format("lsr%C\t%0-2r, %3-5r, %s", 0x0948, 0, 2);
         assert!(unhandled.is_empty(), "unhandled: {unhandled:?}");
-        assert_eq!(operands.len(), 3);
-        match &operands[2] {
-            DO::Immediate(imm) => assert_eq!(*imm, 5),
-            _ => panic!("expected immediate, got {operands:?}"),
-        }
+        let opaque = operands.iter().find_map(|o| match o {
+            DO::OpaqueBits { bits, .. } => Some(*bits),
+            _ => None,
+        }).expect("OpaqueBits");
+        assert_eq!((opaque >> 6) & 0x1f, 5);
     }
 
     #[test]
     fn decodes_thumb1_lsr_zero_means_thirty_two() {
-        // imm5=0 in lsr-imm encoding decodes as #32.
-        // Format bits: 00001 imm5(10..6) rs(5..3) rd(2..0).
-        // imm5=0, rs=1, rd=0 → 0b0000_1_00000_001_000 = 0x0808.
+        // imm5=0 case: OpaqueBits for %s carries bits 6..10
+        // = 0 (which the decoder convention reads as 32).
         let (operands, _) =
             decode_operands_from_format("lsr%C\t%0-2r, %3-5r, %s", 0x0808, 0, 2);
-        match operands.last().unwrap() {
-            DO::Immediate(imm) => assert_eq!(*imm, 32),
-            _ => panic!(),
-        }
+        let opaque = operands.iter().find_map(|o| match o {
+            DO::OpaqueBits { bits, .. } => Some(*bits),
+            _ => None,
+        }).expect("OpaqueBits");
+        assert_eq!((opaque >> 6) & 0x1f, 0);
     }
 
     #[test]
     fn decodes_thumb2_register_mask() {
-        // ldmia.w r0, {r1, r3, r5} → reglist mask = 0b00101010 = 0x002a.
-        // Word: hw1 = 0xe890, hw2 = 0x002a → 0xe8900_02a.
+        // %m now emits OpaqueBits covering low 16 bits.
         let (operands, _) = decode_operands_from_format(
             "ldmia%c.w\t%16-19r%21'!, %m",
             0xe890_002a,
             0,
             4,
         );
-        // Operands: Rn (0), reglist mask.
-        assert!(operands.iter().any(|o| matches!(
-            o, DO::RegisterList(m) if *m == 0x002a
-        )), "operands: {operands:?}");
+        let opaque = operands.iter().find_map(|o| match o {
+            DO::OpaqueBits { bits, .. } => Some(*bits),
+            _ => None,
+        }).expect("OpaqueBits");
+        assert_eq!(opaque & 0xffff, 0x002a);
     }
 
     #[test]
     fn decodes_bfi_lsb_and_width() {
-        // bfi r0, r1, #4, #8 → lsb=4, width=8, msb=11.
-        // Encoding: hw1 = 0xf361, hw2 = imm3=001 imm2=00 + msb=01011 = 0x010b.
-        // hw2 layout: imm3 (14:12) << 12 | xx (11) | imm2 (7:6) | msb (4:0).
-        // imm3=1, imm2=0, msb=11 → hw2 = (1<<12) | (0<<6) | 11 = 0x100b.
-        // Actually: imm3<<12 | imm2<<6 | msb = 0x1000 | 0 | 11 = 0x100b.
+        // %E now emits OpaqueBits.
         let word: u32 = (0xf361u32 << 16) | 0x100b;
         let (operands, _) = decode_operands_from_format(
             "bfi%c\t%8-11r, %16-19r, %E",
@@ -972,19 +998,21 @@ mod tests {
             0,
             4,
         );
-        // Operands: Rd, Rn, lsb, width.
-        let imms: Vec<i64> = operands.iter().filter_map(|o| match o {
-            DO::Immediate(v) => Some(*v),
+        let opaque = operands.iter().find_map(|o| match o {
+            DO::OpaqueBits { bits, .. } => Some(*bits),
             _ => None,
-        }).collect();
-        assert_eq!(&imms[..], &[4, 8], "imms: {imms:?}, ops: {operands:?}");
+        }).expect("OpaqueBits");
+        // lsb extracted from bits 6..7 + 12..14:
+        //   bit 6..7 = 0, bits 12..14 = 1 → lsb = 1 << 2 = 4.
+        // msb = bits 0..4 = 11.
+        assert_eq!(opaque & 0x1f, 11); // msb
+        let lsb = (((opaque >> 12) & 0x7) << 2) | ((opaque >> 6) & 0x3);
+        assert_eq!(lsb, 4);
     }
 
     #[test]
     fn decodes_ubfx_lsb_and_width() {
-        // ubfx r0, r1, #2, #5 → lsb=2, width=5 (encoded widthm1=4).
-        // hw1 = 0xf3c1; hw2 = imm3=000 imm2=10 widthm1=00100 →
-        // (0<<12) | (2<<6) | 4 = 0x84.
+        // %F now emits OpaqueBits.
         let word: u32 = (0xf3c1u32 << 16) | 0x0084;
         let (operands, _) = decode_operands_from_format(
             "ubfx%c\t%8-11r, %16-19r, %F",
@@ -992,10 +1020,12 @@ mod tests {
             0,
             4,
         );
-        let imms: Vec<i64> = operands.iter().filter_map(|o| match o {
-            DO::Immediate(v) => Some(*v),
+        let opaque = operands.iter().find_map(|o| match o {
+            DO::OpaqueBits { bits, .. } => Some(*bits),
             _ => None,
-        }).collect();
-        assert_eq!(&imms[..], &[2, 5]);
+        }).expect("OpaqueBits");
+        assert_eq!(opaque & 0x1f, 4); // widthm1
+        let lsb = (((opaque >> 12) & 0x7) << 2) | ((opaque >> 6) & 0x3);
+        assert_eq!(lsb, 2);
     }
 }

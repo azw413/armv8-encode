@@ -137,22 +137,35 @@ impl Isa for ArmIsa {
     }
 
     fn relocation_kind_for(
-        _mnemonic: Self::Mnemonic,
-        _kind: PcRelKind,
+        mnemonic: Self::Mnemonic,
+        kind: PcRelKind,
     ) -> Option<RelocationKind> {
-        // Stage C: ARM-mode relocations: R_ARM_CALL,
-        // R_ARM_JUMP24, R_ARM_PC24, R_ARM_MOVW_ABS_NC,
-        // R_ARM_MOVT_ABS, etc. None mapped yet.
-        None
+        match (kind, mnemonic) {
+            (PcRelKind::Branch, ArmMnemonicGenerated::B) => Some(RelocationKind::ArmCall),
+            (PcRelKind::Branch, ArmMnemonicGenerated::Blx) => Some(RelocationKind::ArmCall),
+            // ARM has no Page operand; rewriter shouldn't ask.
+            _ => None,
+        }
     }
 
-    fn is_pc_relative_relocation(_kind: RelocationKind) -> bool {
-        // Stage C: reflect ARM-mode relocations once mapped.
-        false
+    fn is_pc_relative_relocation(kind: RelocationKind) -> bool {
+        matches!(
+            kind,
+            RelocationKind::ArmCall
+                | RelocationKind::ArmJump24
+                | RelocationKind::ArmPc24
+        )
     }
 
-    fn is_lift_relevant_relocation(_kind: RelocationKind) -> bool {
-        false
+    fn is_lift_relevant_relocation(kind: RelocationKind) -> bool {
+        matches!(
+            kind,
+            RelocationKind::ArmCall
+                | RelocationKind::ArmJump24
+                | RelocationKind::ArmPc24
+                | RelocationKind::ArmMovwAbsNc
+                | RelocationKind::ArmMovtAbs
+        )
     }
 
     fn fuse_macros(

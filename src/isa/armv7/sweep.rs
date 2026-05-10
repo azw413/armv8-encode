@@ -176,8 +176,33 @@ pub fn disassemble_bytes(
         let primary = match_generated(word, width);
         let (mnemonic, operands, row, neon_row) = match primary {
             Some(row) => {
-                let (operands, _unhandled) =
+                let (mut operands, _unhandled) =
                     decode_operands_from_format(row.format, word, address, width_bytes);
+                // Row-mask-tail OpaqueBits: cover bits the
+                // row's mask leaves variable that no format
+                // code captured. This catches stragglers
+                // like `clz`'s duplicated Rn at bits 0..3,
+                // `ldr%10'b`'s LDRB indicator at bit 10,
+                // and the S-bit on cmp-class data-processing
+                // forms whose format string uses `%20's`
+                // (which doesn't write a bit). For
+                // instructions where the row's format codes
+                // already cover everything, this OpaqueBits
+                // is just zero-mask and a no-op at encode.
+                let unmasked_word_bits = match width {
+                    ThumbWidth::Halfword => word & 0xFFFF & !(row.mask & 0xFFFF),
+                    ThumbWidth::Word => word & !row.mask,
+                };
+                let tail_mask = match width {
+                    ThumbWidth::Halfword => 0xFFFFu32 & !(row.mask & 0xFFFF),
+                    ThumbWidth::Word => !row.mask,
+                };
+                if tail_mask != 0 {
+                    operands.push(DecodedOperand::OpaqueBits {
+                        bits: unmasked_word_bits,
+                        mask: tail_mask,
+                    });
+                }
                 (row.mnemonic, operands, Some(row), None)
             }
             None if width_bytes == 4 => {
@@ -188,14 +213,21 @@ pub fn disassemble_bytes(
                 let (neon_row, _norm_word) = match_neon_thumb(word).ok_or(
                     ThumbDisassembleError::NoMatch { address, word, width },
                 )?;
-                // Operand decoding for NEON rows is left to
-                // a follow-up pass — the format strings use
-                // codes (`%A`, `%D`, split-bitfield `R`s)
-                // not yet covered. For now we surface the
-                // row with an empty operand list.
+                // NEON / coprocessor rows: their format
+                // strings use elaborate split-bitfield codes
+                // (`%A`, `%D`, multi-position `R`s) that the
+                // operand decoder doesn't yet model. Emit a
+                // single OpaqueBits operand carrying the
+                // *original* (un-normalised) instruction
+                // word so the encoder can reproduce it
+                // bit-for-bit.
+                let operands = vec![DecodedOperand::OpaqueBits {
+                    bits: word,
+                    mask: 0xFFFF_FFFF,
+                }];
                 (
                     ThumbMnemonicGenerated::Nop,
-                    Vec::new(),
+                    operands,
                     None,
                     Some(neon_row),
                 )

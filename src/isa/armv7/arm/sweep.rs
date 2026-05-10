@@ -85,11 +85,21 @@ pub fn disassemble_bytes(
         // order — these tables are denser for instructions
         // that overlap with main rows).
         if let Some(neon_row) = match_neon_arm(word) {
+            // NEON / coprocessor: emit OpaqueBits carrying
+            // the full instruction word so the encoder can
+            // splice it back exactly. The full operand
+            // grammar (`%A`/`%D`/split-bitfield `R`s) isn't
+            // modelled yet; OpaqueBits provides bit-exact
+            // round-trip without it.
+            let operands = vec![DecodedOperand::OpaqueBits {
+                bits: word,
+                mask: 0xFFFF_FFFF,
+            }];
             out.push(ArmDecodedInstruction {
                 address,
                 word,
                 mnemonic: ArmMnemonicGenerated::Nop,
-                operands: Vec::new(),
+                operands,
                 row: None,
                 neon_row: Some(neon_row),
             });

@@ -19,13 +19,19 @@ pub enum BinaryFormat {
     Elf,
 }
 
-/// Architecture exposed by the container's header. Analysis layers above
-/// this (decoder, classifier, CFG) currently only handle [`Aarch64`].
+/// Architecture exposed by the container's header.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Architecture {
+    /// 64-bit ARM (AArch64 / A64).
     Aarch64,
-    /// Some other architecture — the container parses but the ISA layer
-    /// can't decode the text sections.
+    /// 32-bit ARM (ARMv7 family). Code may be ARM-mode (A32),
+    /// Thumb-mode (T32), or a mix; the per-instruction mode
+    /// is determined at decode time (low bit of symbol
+    /// address = 1 means Thumb; interworking branches like
+    /// `bx`/`blx` switch modes at runtime).
+    Arm,
+    /// Some other architecture — the container parses but
+    /// the ISA layer can't decode the text sections.
     Other,
 }
 
@@ -169,6 +175,37 @@ pub enum RelocationKind {
     LoadStorePageOffset12 { access_width_bytes: u8 },
     /// Absolute pointer (data references, GOT entries).
     Absolute,
+
+    // --- ARMv7 (32-bit ARM) relocation kinds ---
+    /// `R_ARM_CALL` — branch with link, mode-aware (BL or BLX).
+    ArmCall,
+    /// `R_ARM_JUMP24` — A32 branch (24-bit imm × 4).
+    ArmJump24,
+    /// `R_ARM_PC24` — legacy 24-bit PC-relative branch (B/BL pre-ARMv5).
+    ArmPc24,
+    /// `R_ARM_RELATIVE` — base-relative pointer adjustment (data fix-up).
+    ArmRelative,
+    /// `R_ARM_GLOB_DAT` — GOT entry pointing at a global symbol.
+    ArmGlobData,
+    /// `R_ARM_JUMP_SLOT` — PLT GOT slot for an extern function.
+    ArmJumpSlot,
+    /// `R_ARM_ABS32` — absolute 32-bit pointer (data references).
+    ArmAbs32,
+    /// `R_ARM_MOVW_ABS_NC` — low 16 bits of an absolute address loaded by `movw`.
+    ArmMovwAbsNc,
+    /// `R_ARM_MOVT_ABS` — high 16 bits loaded by `movt`.
+    ArmMovtAbs,
+    /// `R_ARM_THM_CALL` — Thumb-2 BL/BLX branch.
+    ThumbCall,
+    /// `R_ARM_THM_JUMP24` — Thumb-2 32-bit branch.
+    ThumbJump24,
+    /// `R_ARM_THM_JUMP19` — Thumb-2 conditional branch (B<cond>.W).
+    ThumbJump19,
+    /// `R_ARM_THM_MOVW_ABS_NC` — Thumb-2 movw of absolute low-16.
+    ThumbMovwAbsNc,
+    /// `R_ARM_THM_MOVT_ABS` — Thumb-2 movt of absolute high-16.
+    ThumbMovtAbs,
+
     /// Format-specific kind not yet mapped. Carries the raw type code so
     /// callers can still distinguish them.
     Other(u32),

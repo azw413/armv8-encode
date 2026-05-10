@@ -177,18 +177,41 @@ impl Isa for ThumbIsa {
     }
 
     fn relocation_kind_for(
-        _mnemonic: Self::Mnemonic,
-        _kind: PcRelKind,
+        mnemonic: Self::Mnemonic,
+        kind: PcRelKind,
     ) -> Option<RelocationKind> {
-        None
+        match (kind, mnemonic) {
+            (PcRelKind::Branch, ThumbMnemonicGenerated::Bl) => Some(RelocationKind::ThumbCall),
+            (PcRelKind::Branch, ThumbMnemonicGenerated::Blx) => Some(RelocationKind::ThumbCall),
+            (PcRelKind::Branch, ThumbMnemonicGenerated::B) => {
+                // Thumb-2 32-bit conditional B.W → JUMP19;
+                // unconditional B.W → JUMP24. We can't tell
+                // them apart from mnemonic alone (both share
+                // `B`); pick JUMP24 as the more common case.
+                Some(RelocationKind::ThumbJump24)
+            }
+            _ => None,
+        }
     }
 
-    fn is_pc_relative_relocation(_kind: RelocationKind) -> bool {
-        false
+    fn is_pc_relative_relocation(kind: RelocationKind) -> bool {
+        matches!(
+            kind,
+            RelocationKind::ThumbCall
+                | RelocationKind::ThumbJump24
+                | RelocationKind::ThumbJump19
+        )
     }
 
-    fn is_lift_relevant_relocation(_kind: RelocationKind) -> bool {
-        false
+    fn is_lift_relevant_relocation(kind: RelocationKind) -> bool {
+        matches!(
+            kind,
+            RelocationKind::ThumbCall
+                | RelocationKind::ThumbJump24
+                | RelocationKind::ThumbJump19
+                | RelocationKind::ThumbMovwAbsNc
+                | RelocationKind::ThumbMovtAbs
+        )
     }
 
     fn fuse_macros(

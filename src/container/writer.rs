@@ -147,6 +147,7 @@ pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
     };
     let architecture = match container.architecture {
         Architecture::Aarch64 => ObjArch::Aarch64,
+        Architecture::Arm => ObjArch::Arm,
         Architecture::Other => return Err(ContainerWriteError::UnsupportedArchitecture),
     };
 
@@ -422,6 +423,21 @@ fn elf_flags(kind: RelocationKind) -> RelocationFlags {
             _ => elf::R_AARCH64_LDST32_ABS_LO12_NC,
         },
         RelocationKind::Absolute => elf::R_AARCH64_ABS64,
+        // ARMv7.
+        RelocationKind::ArmCall => elf::R_ARM_CALL,
+        RelocationKind::ArmJump24 => elf::R_ARM_JUMP24,
+        RelocationKind::ArmPc24 => elf::R_ARM_PC24,
+        RelocationKind::ArmRelative => elf::R_ARM_RELATIVE,
+        RelocationKind::ArmGlobData => elf::R_ARM_GLOB_DAT,
+        RelocationKind::ArmJumpSlot => elf::R_ARM_JUMP_SLOT,
+        RelocationKind::ArmAbs32 => elf::R_ARM_ABS32,
+        RelocationKind::ArmMovwAbsNc => elf::R_ARM_MOVW_ABS_NC,
+        RelocationKind::ArmMovtAbs => elf::R_ARM_MOVT_ABS,
+        RelocationKind::ThumbCall => elf::R_ARM_THM_PC22,
+        RelocationKind::ThumbJump24 => elf::R_ARM_THM_JUMP24,
+        RelocationKind::ThumbJump19 => elf::R_ARM_THM_JUMP19,
+        RelocationKind::ThumbMovwAbsNc => elf::R_ARM_THM_MOVW_ABS_NC,
+        RelocationKind::ThumbMovtAbs => elf::R_ARM_THM_MOVT_ABS,
         RelocationKind::Other(raw) => raw,
     };
     RelocationFlags::Elf { r_type }
@@ -452,7 +468,26 @@ fn macho_flags(kind: RelocationKind) -> Result<RelocationFlags, ContainerWriteEr
         // Branch14: the assembler resolves these locally before emitting
         // the object file. If a caller asks for them, refuse rather than
         // pick something wrong.
-        RelocationKind::Branch19 | RelocationKind::Branch14 => {
+        //
+        // Same for ARMv7 relocation kinds — Mach-O's
+        // ARM-mode relocation flavours are different (and
+        // we don't support writing ARMv7 Mach-O yet).
+        RelocationKind::Branch19
+        | RelocationKind::Branch14
+        | RelocationKind::ArmCall
+        | RelocationKind::ArmJump24
+        | RelocationKind::ArmPc24
+        | RelocationKind::ArmRelative
+        | RelocationKind::ArmGlobData
+        | RelocationKind::ArmJumpSlot
+        | RelocationKind::ArmAbs32
+        | RelocationKind::ArmMovwAbsNc
+        | RelocationKind::ArmMovtAbs
+        | RelocationKind::ThumbCall
+        | RelocationKind::ThumbJump24
+        | RelocationKind::ThumbJump19
+        | RelocationKind::ThumbMovwAbsNc
+        | RelocationKind::ThumbMovtAbs => {
             return Err(ContainerWriteError::UnsupportedRelocation {
                 format: BinaryFormat::Macho,
                 kind,

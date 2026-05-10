@@ -67,6 +67,18 @@ fn relocation_size_bits(kind: RelocationKind) -> u8 {
         RelocationKind::AddPageOffset12 => 12,
         RelocationKind::LoadStorePageOffset12 { .. } => 12,
         RelocationKind::Absolute => 64,
+        // ARMv7 relocation widths (bits the linker patches).
+        RelocationKind::ArmCall
+        | RelocationKind::ArmJump24
+        | RelocationKind::ArmPc24 => 24,
+        RelocationKind::ArmRelative
+        | RelocationKind::ArmGlobData
+        | RelocationKind::ArmJumpSlot
+        | RelocationKind::ArmAbs32 => 32,
+        RelocationKind::ArmMovwAbsNc | RelocationKind::ArmMovtAbs => 16,
+        RelocationKind::ThumbCall | RelocationKind::ThumbJump24 => 24,
+        RelocationKind::ThumbJump19 => 19,
+        RelocationKind::ThumbMovwAbsNc | RelocationKind::ThumbMovtAbs => 16,
         RelocationKind::Other(_) => 32,
     }
 }

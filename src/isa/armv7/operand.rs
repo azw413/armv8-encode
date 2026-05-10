@@ -62,6 +62,21 @@ pub enum DecodedOperand {
     /// instructions (0..=15; 14 is "always", 15 is reserved
     /// in pre-v8 Thumb).
     Condition(u8),
+    /// Raw operand bits the decoder couldn't structurally
+    /// model. Carries the encoded bits at their original
+    /// positions within the instruction word, plus a mask
+    /// covering the bits this operand owns. The encoder uses
+    /// `(bits & mask) | (word & !mask)` to splice the bits
+    /// back into a fresh word at encode time, guaranteeing
+    /// bit-exact round-trip even for addressing-mode and
+    /// shifted-register forms whose full operand grammar
+    /// the typed model doesn't yet cover.
+    ///
+    /// Use this when an instruction's operand mixes several
+    /// orthogonal pieces (P/U/W bits, shift type+amount,
+    /// scaled offset variants) that the rewriter doesn't
+    /// need to introspect — only preserve.
+    OpaqueBits { bits: u32, mask: u32 },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

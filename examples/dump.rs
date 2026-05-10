@@ -738,6 +738,20 @@ fn relocation_kind_label(kind: RelocationKind) -> String {
             format!("LoadStorePageOffset12({access_width_bytes}B)")
         }
         RelocationKind::Absolute => "Absolute".into(),
+        RelocationKind::ArmCall => "ArmCall".into(),
+        RelocationKind::ArmJump24 => "ArmJump24".into(),
+        RelocationKind::ArmPc24 => "ArmPc24".into(),
+        RelocationKind::ArmRelative => "ArmRelative".into(),
+        RelocationKind::ArmGlobData => "ArmGlobData".into(),
+        RelocationKind::ArmJumpSlot => "ArmJumpSlot".into(),
+        RelocationKind::ArmAbs32 => "ArmAbs32".into(),
+        RelocationKind::ArmMovwAbsNc => "ArmMovwAbsNc".into(),
+        RelocationKind::ArmMovtAbs => "ArmMovtAbs".into(),
+        RelocationKind::ThumbCall => "ThumbCall".into(),
+        RelocationKind::ThumbJump24 => "ThumbJump24".into(),
+        RelocationKind::ThumbJump19 => "ThumbJump19".into(),
+        RelocationKind::ThumbMovwAbsNc => "ThumbMovwAbsNc".into(),
+        RelocationKind::ThumbMovtAbs => "ThumbMovtAbs".into(),
         RelocationKind::Other(code) => format!("Other(0x{code:x})"),
     }
 }

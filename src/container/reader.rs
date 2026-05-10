@@ -29,6 +29,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
 
     let architecture = match file.architecture() {
         object::Architecture::Aarch64 => Architecture::Aarch64,
+        object::Architecture::Arm => Architecture::Arm,
         other => Architecture::from_object(other),
     };
     // Don't error on unknown arch — the container is still inspectable;
@@ -108,7 +109,17 @@ fn lift_elf_image(
     };
     use object::Endianness;
 
-    let elf = ElfFile64::<Endianness>::parse(bytes).ok()?;
+    // Try ELF64 first. If that fails, the file is likely
+    // 32-bit (ARMv7 / x86 / RISC-V32). Return a minimal
+    // image populated only with `plt_stubs` for those —
+    // full image lift requires polymorphism over the ELF
+    // header size which is a larger refactor.
+    let elf = match ElfFile64::<Endianness>::parse(bytes) {
+        Ok(f) => f,
+        Err(_) => {
+            return lift_minimal_elf32_image(bytes, sections, symbols);
+        }
+    };
     let endian = elf.endian();
     let mut image = ElfImage::new();
 
@@ -312,6 +323,111 @@ fn raw_section_bytes(
 /// standard layout; non-conforming inputs (e.g. PLT variants used
 /// by some GNU IFUNC schemes) get an empty map and the rewriter
 /// falls back to its existing relocation paths.
+/// 32-bit ELF (ARMv7) minimal image lift. Populates only
+/// the `plt_stubs` field so the rewriter's "fold call to
+/// stub" path works. Other ElfImage fields stay empty.
+fn lift_minimal_elf32_image(
+    bytes: &[u8],
+    sections: &[Section],
+    symbols: &[Symbol],
+) -> Option<crate::container::elf_image::ElfImage> {
+    use crate::container::elf_image::ElfImage;
+    use object::read::elf::{ElfFile32, FileHeader as _};
+    use object::Endianness;
+    let elf = ElfFile32::<Endianness>::parse(bytes).ok()?;
+    let endian = elf.endian();
+    // Only ARM ELF32 is interesting today.
+    let machine = elf.elf_header().e_machine(endian);
+    const EM_ARM: u16 = 40;
+    if machine != EM_ARM {
+        return None;
+    }
+    let mut image = ElfImage::new();
+    image.plt_stubs = build_arm_plt_stub_map(&elf, sections, symbols);
+    Some(image)
+}
+
+/// ARMv7 PLT stub layout: 20-byte header followed by 12-byte
+/// entries. The Nth `.rel.plt` entry corresponds to the Nth
+/// stub at `.plt + 20 + N*12`. Each `.rel.plt` entry is 8
+/// bytes (`Elf32_Rel`: r_offset + r_info; no addend), with
+/// the symbol index in the high 24 bits of `r_info`.
+fn build_arm_plt_stub_map(
+    elf: &object::read::elf::ElfFile32<object::Endianness>,
+    sections: &[Section],
+    symbols: &[Symbol],
+) -> std::collections::HashMap<crate::container::SymbolId, u64> {
+    use object::elf;
+    use object::read::elf::Sym;
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    let endian = elf.endian();
+
+    let Some(plt) = sections.iter().find(|s| s.name == ".plt") else {
+        return map;
+    };
+    const PLT_HEADER_SIZE: u64 = 20;
+    const PLT_ENTRY_SIZE: u64 = 12;
+
+    // ARMv7 uses REL (no addend), so the relocation table is
+    // `.rel.plt` not `.rela.plt`.
+    let Some(rel_plt) = sections.iter().find(|s| s.name == ".rel.plt") else {
+        return map;
+    };
+    const REL_ENTRY_SIZE: usize = 8; // sizeof Elf32_Rel
+    if rel_plt.bytes.len() % REL_ENTRY_SIZE != 0 {
+        return map;
+    }
+
+    let dyn_table = elf.elf_dynamic_symbol_table();
+
+    let entries = rel_plt.bytes.len() / REL_ENTRY_SIZE;
+    for index in 0..entries {
+        let off = index * REL_ENTRY_SIZE;
+        let r_info = u32::from_le_bytes(
+            rel_plt.bytes[off + 4..off + 8].try_into().unwrap(),
+        );
+        let r_sym = r_info >> 8;
+        let r_type = (r_info & 0xff) as u32;
+        if r_type != elf::R_ARM_JUMP_SLOT {
+            continue;
+        }
+        let dyn_symbol =
+            match dyn_table.symbol(object::read::SymbolIndex(r_sym as usize)) {
+                Ok(sym) => sym,
+                Err(_) => continue,
+            };
+        let Ok(name_bytes) = dyn_symbol.name(endian, dyn_table.strings()) else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        let dynsym_base = name.split_once('@').map(|(b, _)| b).unwrap_or(name);
+        let neutral_id = symbols
+            .iter()
+            .find(|s| {
+                if !s.is_undefined {
+                    return false;
+                }
+                let static_base = s
+                    .name
+                    .split_once('@')
+                    .map(|(b, _)| b)
+                    .unwrap_or(s.name.as_str());
+                static_base == dynsym_base
+            })
+            .map(|s| s.id);
+        let Some(neutral_id) = neutral_id else {
+            continue;
+        };
+        let stub_addr = plt.address + PLT_HEADER_SIZE + index as u64 * PLT_ENTRY_SIZE;
+        map.insert(neutral_id, stub_addr);
+    }
+
+    map
+}
+
 fn build_plt_stub_map(
     elf: &object::read::elf::ElfFile64<object::Endianness>,
     sections: &[Section],
@@ -415,15 +531,21 @@ fn classify_container(file: &File<'_>, bytes: &[u8]) -> crate::container::Contai
 
 fn classify_elf(bytes: &[u8]) -> crate::container::ContainerKind {
     use crate::container::ContainerKind;
-    use object::read::elf::{ElfFile64, FileHeader as _};
+    use object::read::elf::{ElfFile32, ElfFile64, FileHeader as _};
     use object::Endianness;
 
-    let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) else {
+    // Try ELF64 first (the original implementation). Fall
+    // back to ELF32 for ARMv7 / x86 / RISC-V32 inputs.
+    let e_type = if let Ok(elf) = ElfFile64::<Endianness>::parse(bytes) {
+        let endian = elf.endian();
+        elf.elf_header().e_type(endian)
+    } else if let Ok(elf) = ElfFile32::<Endianness>::parse(bytes) {
+        let endian = elf.endian();
+        elf.elf_header().e_type(endian)
+    } else {
         return ContainerKind::Other;
     };
-    let endian = elf.endian();
-    let header = elf.elf_header();
-    match header.e_type(endian) {
+    match e_type {
         object::elf::ET_REL => ContainerKind::Relocatable,
         object::elf::ET_DYN => ContainerKind::SharedObject,
         object::elf::ET_EXEC => ContainerKind::Executable,
@@ -546,49 +668,73 @@ fn lift_symbols(
     let mut symbols = Vec::new();
     let mut symbol_index_to_id = HashMap::new();
 
+    // Static symbol table (`.symtab` on ELF). Empty for
+    // stripped binaries, full of locals + globals on object
+    // files and unstripped executables.
     for symbol in file.symbols() {
-        let id = SymbolId(symbols.len());
-        symbol_index_to_id.insert(symbol.index(), id);
+        push_symbol(symbol, section_index_to_id, &mut symbols, &mut symbol_index_to_id);
+    }
 
-        let name = symbol.name().unwrap_or("").to_string();
-        let address = symbol.address();
-        let size = symbol.size();
-        let kind = map_symbol_kind(symbol.kind());
-        let binding = if symbol.is_weak() {
-            SymbolBinding::Weak
-        } else if symbol.is_global() {
-            SymbolBinding::Global
-        } else if symbol.is_local() {
-            SymbolBinding::Local
-        } else {
-            SymbolBinding::Unknown
-        };
-        let section = match symbol.section() {
-            object::SymbolSection::Section(index) => section_index_to_id.get(&index).copied(),
-            _ => None,
-        };
-        let is_undefined = symbol.is_undefined();
-        let flags = match symbol.flags() {
-            ObjSymbolFlags::Elf { st_info, st_other } => {
-                Some(SymbolExtraFlags::Elf { st_info, st_other })
-            }
-            _ => None,
-        };
-
-        symbols.push(Symbol {
-            id,
-            name,
-            address,
-            size,
-            kind,
-            binding,
-            section,
-            is_undefined,
-            flags,
-        });
+    // Dynamic symbol table (`.dynsym` on ELF, dyld export
+    // trie on Mach-O). Stripped Android `.so` files often
+    // have only `.dynsym` — the static `.symtab` is empty.
+    // Pulling these makes PLT stubs, imports, and exported
+    // entry points visible to the analysis layers.
+    for symbol in file.dynamic_symbols() {
+        if symbol_index_to_id.contains_key(&symbol.index()) {
+            continue;
+        }
+        push_symbol(symbol, section_index_to_id, &mut symbols, &mut symbol_index_to_id);
     }
 
     (symbols, symbol_index_to_id)
+}
+
+fn push_symbol<'data, 'file>(
+    symbol: object::read::Symbol<'data, 'file, &'data [u8]>,
+    section_index_to_id: &HashMap<object::SectionIndex, SectionId>,
+    symbols: &mut Vec<Symbol>,
+    symbol_index_to_id: &mut HashMap<object::SymbolIndex, SymbolId>,
+) {
+    let id = SymbolId(symbols.len());
+    symbol_index_to_id.insert(symbol.index(), id);
+
+    let name = symbol.name().unwrap_or("").to_string();
+    let address = symbol.address();
+    let size = symbol.size();
+    let kind = map_symbol_kind(symbol.kind());
+    let binding = if symbol.is_weak() {
+        SymbolBinding::Weak
+    } else if symbol.is_global() {
+        SymbolBinding::Global
+    } else if symbol.is_local() {
+        SymbolBinding::Local
+    } else {
+        SymbolBinding::Unknown
+    };
+    let section = match symbol.section() {
+        object::SymbolSection::Section(index) => section_index_to_id.get(&index).copied(),
+        _ => None,
+    };
+    let is_undefined = symbol.is_undefined();
+    let flags = match symbol.flags() {
+        ObjSymbolFlags::Elf { st_info, st_other } => {
+            Some(SymbolExtraFlags::Elf { st_info, st_other })
+        }
+        _ => None,
+    };
+
+    symbols.push(Symbol {
+        id,
+        name,
+        address,
+        size,
+        kind,
+        binding,
+        section,
+        is_undefined,
+        flags,
+    });
 }
 
 fn lift_relocations(
@@ -598,6 +744,9 @@ fn lift_relocations(
 ) -> Vec<Relocation> {
     let mut relocations = Vec::new();
 
+    // Per-section relocations: these are the static
+    // relocations object files carry in `.rela.text` / similar
+    // companions to each section.
     for section in file.sections() {
         let Some(&section_id) = section_index_to_id.get(&section.index()) else {
             continue;
@@ -607,6 +756,47 @@ fn lift_relocations(
             let symbol = match reloc.target() {
                 RelocationTarget::Symbol(index) => symbol_index_to_id.get(&index).copied(),
                 _ => None,
+            };
+            relocations.push(Relocation {
+                id: RelocationId(relocations.len()),
+                section: section_id,
+                offset,
+                kind,
+                size: reloc.size(),
+                addend: reloc.addend(),
+                symbol,
+            });
+        }
+    }
+
+    // Dynamic relocations: linked .so / executables carry
+    // these in `.rel.dyn`/`.rela.dyn` and `.rel.plt`/
+    // `.rela.plt` tables. The `object` crate exposes them
+    // separately from the per-section iterator. Their
+    // `offset` is a virtual address; we resolve back to the
+    // owning section by address range.
+    if let Some(dyn_relocs) = file.dynamic_relocations() {
+        let section_lookup: Vec<(u64, u64, SectionId)> = file
+            .sections()
+            .filter_map(|s| {
+                let id = section_index_to_id.get(&s.index()).copied()?;
+                Some((s.address(), s.address() + s.size(), id))
+            })
+            .collect();
+        for (vaddr, reloc) in dyn_relocs {
+            let kind = map_relocation_kind(&reloc);
+            let symbol = match reloc.target() {
+                RelocationTarget::Symbol(index) => symbol_index_to_id.get(&index).copied(),
+                _ => None,
+            };
+            // Find which section owns this VA so the
+            // relocation's `offset` becomes section-relative.
+            let owning = section_lookup
+                .iter()
+                .find(|(start, end, _)| vaddr >= *start && vaddr < *end);
+            let (section_id, offset) = match owning {
+                Some((start, _, id)) => (*id, vaddr - start),
+                None => continue, // dyn-reloc points outside any section
             };
             relocations.push(Relocation {
                 id: RelocationId(relocations.len()),
@@ -689,6 +879,26 @@ fn map_elf_relocation(r_type: u32) -> RelocationKind {
             RelocationKind::LoadStorePageOffset12 { access_width_bytes: 16 }
         }
         elf::R_AARCH64_ABS64 | elf::R_AARCH64_ABS32 => RelocationKind::Absolute,
+
+        // --- ARMv7 relocation types ---
+        elf::R_ARM_CALL => RelocationKind::ArmCall,
+        elf::R_ARM_JUMP24 => RelocationKind::ArmJump24,
+        elf::R_ARM_PC24 => RelocationKind::ArmPc24,
+        elf::R_ARM_RELATIVE => RelocationKind::ArmRelative,
+        elf::R_ARM_GLOB_DAT => RelocationKind::ArmGlobData,
+        elf::R_ARM_JUMP_SLOT => RelocationKind::ArmJumpSlot,
+        elf::R_ARM_ABS32 => RelocationKind::ArmAbs32,
+        elf::R_ARM_MOVW_ABS_NC => RelocationKind::ArmMovwAbsNc,
+        elf::R_ARM_MOVT_ABS => RelocationKind::ArmMovtAbs,
+        // Thumb relocations. `R_ARM_THM_PC22` (10) is the
+        // legacy name for the same shape as ARM's `R_ARM_THM_CALL`
+        // — the `object` crate exposes only the legacy const.
+        elf::R_ARM_THM_PC22 => RelocationKind::ThumbCall,
+        elf::R_ARM_THM_JUMP24 => RelocationKind::ThumbJump24,
+        elf::R_ARM_THM_JUMP19 => RelocationKind::ThumbJump19,
+        elf::R_ARM_THM_MOVW_ABS_NC => RelocationKind::ThumbMovwAbsNc,
+        elf::R_ARM_THM_MOVT_ABS => RelocationKind::ThumbMovtAbs,
+
         other => RelocationKind::Other(other),
     }
 }
@@ -717,6 +927,7 @@ impl Architecture {
     fn from_object(arch: object::Architecture) -> Self {
         match arch {
             object::Architecture::Aarch64 => Architecture::Aarch64,
+            object::Architecture::Arm => Architecture::Arm,
             _ => Architecture::Other,
         }
     }

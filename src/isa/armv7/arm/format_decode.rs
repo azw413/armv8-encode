@@ -89,11 +89,19 @@ pub fn decode_operands_from_format(
             }
             _ => {}
         }
-        // Display-only ARM codes: %c (condition), %x/%X
-        // (warnings), %p (writes-to-PC marker), %t (T-bit
-        // marker), %C (PSR sub-type print), %q (UAL hint),
-        // %s (SPSR/CPSR mode in mrs).
-        if matches!(code, b'c' | b'C' | b'x' | b'X' | b'%' | b'p' | b't' | b'q')
+        // %c — extract the cond field from word bits 28..31
+        // and emit a Condition operand. This makes the
+        // round-trip preserve the original cond instead of
+        // forcing the encoder to invent one.
+        if code == b'c' && bitfield.is_empty() {
+            let cond = ((word >> 28) & 0xf) as u8;
+            operands.push(DecodedOperand::Condition(cond));
+            continue;
+        }
+        // Other display-only ARM codes: %x/%X (warnings),
+        // %p (writes-to-PC marker), %t (T-bit marker),
+        // %C (PSR sub-type print), %q (UAL hint).
+        if matches!(code, b'C' | b'x' | b'X' | b'%' | b'p' | b't' | b'q')
             && bitfield.is_empty()
         {
             continue;
@@ -168,54 +176,46 @@ pub fn decode_operands_from_format(
                 operands.push(DecodedOperand::RegisterList(mask));
             }
             b'o' if bitfield.is_empty() => {
-                // Operand2: bit 25 selects immediate (1) or
-                // register-with-shift (0).
-                if (word >> 25) & 0x1 == 1 {
-                    let imm8 = word & 0xff;
-                    let rot = (word >> 8) & 0xf;
-                    let value = (imm8).rotate_right(rot * 2);
-                    operands.push(DecodedOperand::Immediate(value as i64));
-                } else {
-                    // Register form. We emit the Rm; the
-                    // shift type / amount stay in opcode bits
-                    // for now (the rewriter normally only
-                    // cares about the register).
-                    let rm = (word & 0xf) as u8;
-                    operands.push(DecodedOperand::Register(Register {
-                        class: RegisterClass::R,
-                        index: rm,
-                    }));
-                }
+                // Operand2 — orthogonal forms (rotated
+                // immediate vs shifted register) with several
+                // sub-fields. Preserve the full 12-bit operand
+                // plus the I-bit (25) so the encoder can
+                // splice them back exactly.
+                //
+                // Includes bit 20 (S-bit) in the mask so the
+                // round-trip preserves the flag-setting bit.
+                // For most data-processing rows the S-bit
+                // is split off by a `%20's` format directive;
+                // for `cmp`/`cmn`/`tst`/`teq` the S-bit is
+                // implicit (always 1) and the format string
+                // doesn't mention it — but the row's mask
+                // still leaves it open, so the round-trip
+                // needs to preserve it from input.
+                const O_MASK: u32 = 0x0210_0FFF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & O_MASK,
+                    mask: O_MASK,
+                });
             }
             b'a' if bitfield.is_empty() => {
-                // ldr/str address: [Rn, ±offset]. Rn = bits
-                // 16..19. P/U/W bits = 24/23/21. I-bit (25)
-                // = immediate (0) vs register-shifted (1).
+                // ldr/str address: P/U/W (24/23/21), I-bit
+                // (25), Rn (16..19), offset/Rm+shift (0..11).
+                // Preserve all of them via OpaqueBits.
+                const A_MASK: u32 = 0x03AF_0FFF;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & A_MASK,
+                    mask: A_MASK,
+                });
+                // Convenience: surface a PcRelative pointer
+                // for `ldr Rt, [pc, #imm]` literal-pool
+                // loads (Rn=15, immediate form). The
+                // rewriter cares about the literal target
+                // even though the encoded bits are the
+                // OpaqueBits.
                 let rn = ((word >> 16) & 0xf) as u8;
-                operands.push(DecodedOperand::Register(Register {
-                    class: RegisterClass::R,
-                    index: rn,
-                }));
-                let u = (word >> 23) & 0x1;
                 let i_bit = (word >> 25) & 0x1;
-                if i_bit == 0 {
-                    let imm12 = (word & 0xfff) as i64;
-                    let signed = if u == 1 { imm12 } else { -imm12 };
-                    if signed != 0 || u == 1 {
-                        operands.push(DecodedOperand::Immediate(signed));
-                    }
-                } else {
-                    let rm = (word & 0xf) as u8;
-                    operands.push(DecodedOperand::Register(Register {
-                        class: RegisterClass::R,
-                        index: rm,
-                    }));
-                }
-                // PC-relative: Rn=15 → emit a PcRelative
-                // pointing at (PC+8) ± imm. For ARM mode,
-                // PC reads as the address of the current
-                // instruction + 8.
                 if rn == 15 && i_bit == 0 {
+                    let u = (word >> 23) & 0x1;
                     let imm12 = (word & 0xfff) as i64;
                     let signed = if u == 1 { imm12 } else { -imm12 };
                     let target = (address as i64).wrapping_add(8).wrapping_add(signed);
@@ -223,29 +223,16 @@ pub fn decode_operands_from_format(
                 }
             }
             b's' if bitfield.is_empty() => {
-                // %s — ldr/str halfword/signextend address.
-                // Two forms: bit 22 = 1 → 8-bit immediate
-                // split across [11:8] and [3:0]; bit 22 = 0
-                // → register Rm in [3:0]. Plus PUW bits.
-                let rn = ((word >> 16) & 0xf) as u8;
-                operands.push(DecodedOperand::Register(Register {
-                    class: RegisterClass::R,
-                    index: rn,
-                }));
-                let u = (word >> 23) & 0x1;
-                if (word >> 22) & 0x1 == 1 {
-                    let imm = (((word >> 8) & 0xf) << 4) | (word & 0xf);
-                    let signed = if u == 1 { imm as i64 } else { -(imm as i64) };
-                    if signed != 0 || u == 1 {
-                        operands.push(DecodedOperand::Immediate(signed));
-                    }
-                } else {
-                    let rm = (word & 0xf) as u8;
-                    operands.push(DecodedOperand::Register(Register {
-                        class: RegisterClass::R,
-                        index: rm,
-                    }));
-                }
+                // ldr/str halfword/signextend address.
+                // Operand-owned bits: P/U/W (24/23/21), Rn
+                // (16..19), bit 22 (immediate-vs-register
+                // form), bits 8..11 (imm hi half), bits 0..3
+                // (Rm or imm low half).
+                const S_MASK: u32 = 0x02EF_0F0F;
+                operands.push(DecodedOperand::OpaqueBits {
+                    bits: word & S_MASK,
+                    mask: S_MASK,
+                });
             }
             b'V' if bitfield.is_empty() => {
                 // MOVT/MOVW: 16-bit immediate from bits
@@ -328,13 +315,15 @@ mod tests {
 
     #[test]
     fn decodes_arm_bx_lr() {
-        // bx lr → e12fff1e. Format: "bx%c\t%0-3r"
+        // bx lr → e12fff1e. Format: "bx%c\t%0-3r".
+        // Decoder emits Condition + Register.
         let (ops, unh) = decode_operands_from_format("bx%c\t%0-3r", 0xe12f_ff1e, 0);
         assert!(unh.is_empty());
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], DecodedOperand::Condition(0xe)));
+        match &ops[1] {
             DecodedOperand::Register(r) => assert_eq!(r.index, 14),
-            _ => panic!(),
+            _ => panic!("{ops:?}"),
         }
     }
 
@@ -343,10 +332,15 @@ mod tests {
         // b +0 (offset 0) at address 0x100 → e_a000000. Format: "b%c\t%b"
         // Encoded: 0xea00_0000 (signed imm24 = 0).
         let (ops, _) = decode_operands_from_format("b%c\t%b", 0xea00_0000, 0x100);
-        match &ops[0] {
-            DecodedOperand::BranchTarget(t) => assert_eq!(*t, 0x100 + 8),
-            _ => panic!("{ops:?}"),
-        }
+        // ops[0] = Condition; ops[1] = BranchTarget
+        let target = ops
+            .iter()
+            .find_map(|o| match o {
+                DecodedOperand::BranchTarget(t) => Some(*t),
+                _ => None,
+            })
+            .expect("BranchTarget");
+        assert_eq!(target, 0x100 + 8);
     }
 
     #[test]
@@ -359,16 +353,21 @@ mod tests {
             0xe52d_e004,
             0,
         );
-        // Expect: Rt=14 (lr), Rn=13 (sp), and an immediate.
+        // Expect: Rt=14 (lr) as Register, then OpaqueBits
+        // covering the [sp, #-4]! address (Rn=13 + offset/PUW
+        // bits all packed into the OpaqueBits payload).
         assert!(ops
             .iter()
             .any(|o| matches!(o, DecodedOperand::Register(r) if r.index == 14)));
-        assert!(ops
+        let opaque = ops
             .iter()
-            .any(|o| matches!(o, DecodedOperand::Register(r) if r.index == 13)));
-        assert!(ops
-            .iter()
-            .any(|o| matches!(o, DecodedOperand::Immediate(_))));
+            .find_map(|o| match o {
+                DecodedOperand::OpaqueBits { bits, .. } => Some(*bits),
+                _ => None,
+            })
+            .expect("expected OpaqueBits for %a address");
+        // Rn = bits 16..19 of the OpaqueBits payload.
+        assert_eq!((opaque >> 16) & 0xf, 13, "Rn should be sp");
     }
 
     #[test]
@@ -386,12 +385,28 @@ mod tests {
     #[test]
     fn decodes_arm_operand2_immediate() {
         // mov r0, #1 → e3a00001. Format includes %o.
+        // Rd=0 still surfaces as a Register (from %12-15r).
+        // %o now emits OpaqueBits carrying the encoded
+        // operand2 form (immediate-with-rotation, here just
+        // imm8=1 rot=0 → bits = 0x0200_0001).
         let (ops, _) = decode_operands_from_format(
             "mov%20's%c\t%12-15r, %o",
             0xe3a0_0001,
             0,
         );
-        // Rd=0 + immediate=1.
-        assert!(ops.iter().any(|o| matches!(o, DecodedOperand::Immediate(1))));
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, DecodedOperand::Register(r) if r.index == 0)));
+        let opaque = ops
+            .iter()
+            .find_map(|o| match o {
+                DecodedOperand::OpaqueBits { bits, mask } => Some((*bits, *mask)),
+                _ => None,
+            })
+            .expect("expected OpaqueBits for %o operand2");
+        // Bit 25 (I-bit) should be set; low byte is the imm8.
+        assert_eq!(opaque.0 & 0x0200_0000, 0x0200_0000);
+        assert_eq!(opaque.0 & 0xff, 1);
+        assert_eq!(opaque.1, 0x0210_0FFF);
     }
 }

@@ -49,10 +49,34 @@
 //! Codes not yet inverted (`%C`, `%P`, `%S`, `%W` standalone)
 //! cause [`EncodeError::UnsupportedFormatCode`].
 
+use crate::isa::armv7::neon_table_generated::NeonOpcodeGenerated;
 use crate::isa::armv7::operand::{DecodedOperand, EncodeError, Register};
 use super::table_generated::{
     ArmMnemonicGenerated, ArmOpcodeGenerated, ARM_OPCODE_TABLE_GENERATED,
 };
+
+/// Encode a NEON / coprocessor row by extracting the
+/// full-word OpaqueBits the decoder emitted. NEON's elaborate
+/// format-string grammar isn't fully invertible yet; the
+/// decoder preserves the entire instruction word as a single
+/// OpaqueBits operand so this round-trips bit-exact.
+pub fn encode_neon_row(
+    _row: &NeonOpcodeGenerated,
+    operands: &[DecodedOperand],
+) -> Result<u32, EncodeError> {
+    match operands.first() {
+        Some(DecodedOperand::OpaqueBits { bits, mask }) if *mask == 0xFFFF_FFFF => Ok(*bits),
+        Some(other) => Err(EncodeError::OperandShapeMismatch {
+            slot: 0,
+            format_code: "neon",
+            got: operand_kind(other),
+        }),
+        None => Err(EncodeError::ArityMismatch {
+            format_slots: 1,
+            operands: 0,
+        }),
+    }
+}
 
 /// Encode against a specific table row.
 pub fn encode_with_row(
@@ -101,16 +125,9 @@ pub fn encode_with_format(
     address: u64,
 ) -> Result<u32, EncodeError> {
     let mut word = opcode_base;
-    // The imported ARM table stores the condition field
-    // (bits 28..31) as zero on conditional rows — the row's
-    // mask leaves those bits unspecified so any condition
-    // matches at decode time. When *encoding*, we must pick
-    // a concrete condition. Default to AL (`0xe` = always).
-    // Callers wanting a specific condition can post-process
-    // the output word.
-    if (opcode_base & 0xf000_0000) == 0 {
-        word |= 0xe000_0000;
-    }
+    // Condition field is now explicitly carried as a
+    // Condition operand consumed by the `%c` format code,
+    // so no default-to-AL fallback needed.
     let bytes = format.as_bytes();
     let mut i = 0;
     let mut operand_idx = 0usize;
@@ -180,8 +197,32 @@ pub fn encode_with_format(
             }
             _ => {}
         }
-        // Display-only (no operand consumed).
-        if matches!(code, b'c' | b'C' | b'x' | b'X' | b'%' | b'p' | b't' | b'q')
+        // %c consumes a Condition operand (the decoder
+        // emits it for every ARM-mode instruction so
+        // round-trip preserves the cond exactly).
+        if code == b'c' && bitfield.is_empty() {
+            let slot = operand_idx;
+            let operand = operands.get(slot).ok_or(EncodeError::ArityMismatch {
+                format_slots: slot + 1,
+                operands: operands.len(),
+            })?;
+            match operand {
+                DecodedOperand::Condition(c) => {
+                    place_field(&mut word, 28, 31, *c as u32);
+                    operand_idx += 1;
+                }
+                _ => {
+                    return Err(EncodeError::OperandShapeMismatch {
+                        slot,
+                        format_code: "c",
+                        got: operand_kind(operand),
+                    });
+                }
+            }
+            continue;
+        }
+        // Other display-only.
+        if matches!(code, b'C' | b'x' | b'X' | b'%' | b'p' | b't' | b'q')
             && bitfield.is_empty()
         {
             continue;
@@ -269,7 +310,24 @@ fn encode_walk_inner(
             }
             _ => {}
         }
-        if matches!(code, b'c' | b'C' | b'x' | b'X' | b'%' | b'p' | b't' | b'q')
+        if code == b'c' && bitfield.is_empty() {
+            let operand = operands.get(consumed).ok_or(EncodeError::ArityMismatch {
+                format_slots: consumed + 1,
+                operands: operands.len(),
+            })?;
+            if let DecodedOperand::Condition(c) = operand {
+                place_field(&mut word, 28, 31, *c as u32);
+                consumed += 1;
+            } else {
+                return Err(EncodeError::OperandShapeMismatch {
+                    slot: consumed,
+                    format_code: "c",
+                    got: operand_kind(operand),
+                });
+            }
+            continue;
+        }
+        if matches!(code, b'C' | b'x' | b'X' | b'%' | b'p' | b't' | b'q')
             && bitfield.is_empty()
         {
             continue;
@@ -413,61 +471,30 @@ fn pack_operand(
             place_field(word, 0, 15, mask as u32);
             Ok(true)
         }
-        b'o' if bitfield.is_empty() => {
-            // Operand2: bit 25 = 1 → immediate-with-rotation;
-            // bit 25 = 0 → register Rm in [3:0].
-            //
-            // The decoder picks one form based on bit 25 of
-            // the input word; the encoder must agree with
-            // whatever form the row's opcode_base already
-            // chose. Inspect the current `word` bit 25 to
-            // know which form to encode into.
-            let i_bit = (*word >> 25) & 0x1;
-            if i_bit == 1 {
-                let v = expect_immediate(operand, slot, "o")?;
-                if !(0..=u32::MAX as i64).contains(&v) {
-                    return Err(EncodeError::ImmediateOutOfRange {
-                        slot,
-                        value: v,
-                        bits: 12,
-                    });
+        b'o' | b'a' | b's' if bitfield.is_empty() => {
+            // Splice the OpaqueBits payload back into the
+            // word. The decoder emits OpaqueBits for these
+            // codes carrying the full operand-owned bit
+            // pattern (mask + value); we OR it into the
+            // current word, clearing the destination bits
+            // first.
+            match operand {
+                DecodedOperand::OpaqueBits { bits, mask } => {
+                    *word &= !*mask;
+                    *word |= *bits & *mask;
+                    Ok(true)
                 }
-                let raw = arm_expand_imm_inverse(v as u32).ok_or(
-                    EncodeError::UnsupportedFormatCode {
-                        format_code: "%o (immediate not representable)".into(),
+                _ => Err(EncodeError::OperandShapeMismatch {
+                    slot,
+                    format_code: match code {
+                        b'o' => "o",
+                        b'a' => "a",
+                        b's' => "s",
+                        _ => "?",
                     },
-                )?;
-                place_field(word, 0, 11, raw);
-                Ok(true)
-            } else {
-                let reg = expect_register(operand, slot, "o")?;
-                place_field(word, 0, 3, (reg.index & 0xf) as u32);
-                Ok(true)
+                    got: operand_kind(operand),
+                }),
             }
-        }
-        b'a' if bitfield.is_empty() => {
-            // Load/store address: encoder consumes the base
-            // register and (optionally) the offset operand.
-            // The decoder emits Rn + Immediate (or Rn + Rm).
-            // Inspect bit 25 to pick the form.
-            let i_bit = (*word >> 25) & 0x1;
-            if i_bit == 0 {
-                // Immediate offset form: Rn at [16:19],
-                // imm12 at [0:11], U bit at 23.
-                let reg = expect_register(operand, slot, "a")?;
-                place_field(word, 16, 19, (reg.index & 0xf) as u32);
-                Ok(true)
-            } else {
-                let reg = expect_register(operand, slot, "a")?;
-                place_field(word, 16, 19, (reg.index & 0xf) as u32);
-                Ok(true)
-            }
-        }
-        b's' if bitfield.is_empty() => {
-            // Halfword/signextend address: Rn at [16:19].
-            let reg = expect_register(operand, slot, "s")?;
-            place_field(word, 16, 19, (reg.index & 0xf) as u32);
-            Ok(true)
         }
         b'V' if bitfield.is_empty() => {
             // MOVT/MOVW: 16-bit immediate split across
@@ -682,6 +709,7 @@ fn operand_kind(o: &DecodedOperand) -> &'static str {
         DecodedOperand::PcRelative(_) => "PcRelative",
         DecodedOperand::RegisterList(_) => "RegisterList",
         DecodedOperand::Condition(_) => "Condition",
+        DecodedOperand::OpaqueBits { .. } => "OpaqueBits",
     }
 }
 
@@ -754,7 +782,12 @@ mod tests {
     fn rejects_branch_out_of_range() {
         let word_in = 0xea00_0000u32;
         let row = match_generated(word_in).unwrap();
-        let bad_operands = vec![DecodedOperand::BranchTarget(0x4_0000_0000)];
+        // Operand list now requires Condition first (consumed
+        // by %c) before the branch target.
+        let bad_operands = vec![
+            DecodedOperand::Condition(0xe),
+            DecodedOperand::BranchTarget(0x4_0000_0000),
+        ];
         let err = encode_with_row(row, &bad_operands, 0).unwrap_err();
         assert!(matches!(err, EncodeError::BranchOutOfRange { .. }));
     }

@@ -86,6 +86,116 @@ fn report_objdump_comparison_for_libtool_checker() {
     report_binary_comparison(&binary);
 }
 
+/// Round-trip the entire Thumb-mode portion of
+/// libtool-checker.so through decode → encode.
+#[test]
+#[ignore = "requires the libtool-checker.so fixture"]
+fn report_thumb_encoder_round_trip_for_libtool_checker() {
+    use armv8_encode::isa::armv7::encode::{encode_neon_row, encode_with_row};
+    use armv8_encode::isa::armv7::sweep::disassemble_bytes;
+    use armv8_encode::isa::armv7::table::ThumbWidth;
+    use std::collections::BTreeMap;
+    let mut error_formats: BTreeMap<String, usize> = BTreeMap::new();
+    let mut approximate_formats: BTreeMap<String, usize> = BTreeMap::new();
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let binary = PathBuf::from(manifest_dir)
+        .join("tests")
+        .join("libtool-checker.so");
+    let raw = run_objdump(&binary);
+    let instructions = parse_objdump_lines(&raw);
+
+    let thumb_insns: Vec<&ObjdumpInstruction> = instructions
+        .iter()
+        .filter(|i| i.mode == Mode::Thumb)
+        .collect();
+
+    let mut roundtripped = 0usize;
+    let mut approximate = 0usize;
+    let mut errored = 0usize;
+    let mut neon = 0usize;
+
+    for insn in &thumb_insns {
+        let decoded = match disassemble_bytes(insn.address, &insn.bytes) {
+            Ok(d) if d.len() == 1 => d.into_iter().next().unwrap(),
+            _ => {
+                errored += 1;
+                continue;
+            }
+        };
+        let result = match (decoded.row, decoded.neon_row) {
+            (Some(row), _) => {
+                encode_with_row(row, &decoded.operands, decoded.address)
+                    .map(|(w, width)| (w, width))
+            }
+            (None, Some(neon_row)) => {
+                neon += 1;
+                encode_neon_row(neon_row, &decoded.operands)
+                    .map(|w| (w, ThumbWidth::Word))
+            }
+            (None, None) => {
+                errored += 1;
+                continue;
+            }
+        };
+        match result {
+            Ok((word, width)) => {
+                let bytes_out = match width {
+                    ThumbWidth::Halfword => (word as u16).to_le_bytes().to_vec(),
+                    ThumbWidth::Word => {
+                        let hw1 = ((word >> 16) & 0xffff) as u16;
+                        let hw2 = (word & 0xffff) as u16;
+                        let mut v = Vec::with_capacity(4);
+                        v.extend_from_slice(&hw1.to_le_bytes());
+                        v.extend_from_slice(&hw2.to_le_bytes());
+                        v
+                    }
+                };
+                if bytes_out == insn.bytes {
+                    roundtripped += 1;
+                } else {
+                    let fmt = decoded
+                        .row
+                        .map(|r| r.format.to_string())
+                        .unwrap_or_else(|| "<neon>".to_string());
+                    *approximate_formats.entry(fmt).or_insert(0) += 1;
+                    approximate += 1;
+                }
+            }
+            Err(_) => {
+                let fmt = decoded
+                    .row
+                    .map(|r| r.format.to_string())
+                    .unwrap_or_else(|| "<neon>".to_string());
+                *error_formats.entry(fmt).or_insert(0) += 1;
+                errored += 1;
+            }
+        }
+    }
+    eprintln!("--- top approximate formats ---");
+    let mut approx_vec: Vec<_> = approximate_formats.iter().collect();
+    approx_vec.sort_by(|a, b| b.1.cmp(a.1));
+    for (fmt, count) in approx_vec.iter().take(15) {
+        eprintln!("  {count:5}  {fmt}");
+    }
+    eprintln!("--- top error formats ---");
+    let mut err_vec: Vec<_> = error_formats.iter().collect();
+    err_vec.sort_by(|a, b| b.1.cmp(a.1));
+    for (fmt, count) in err_vec.iter().take(15) {
+        eprintln!("  {count:5}  {fmt}");
+    }
+
+    eprintln!("Thumb encoder round-trip: total={}", thumb_insns.len());
+    eprintln!("  exact roundtrip: {roundtripped} (incl NEON: {neon})");
+    eprintln!("  approximate: {approximate}");
+    eprintln!("  encoder error: {errored}");
+    assert!(
+        roundtripped + approximate + errored == thumb_insns.len(),
+        "accounting bug: {roundtripped} + {approximate} + {errored} != {}",
+        thumb_insns.len(),
+    );
+}
+
 /// Round-trip the entire ARM-mode portion of
 /// libtool-checker.so through decode → encode and report the
 /// match rate. Verifies the new ARM encoder against real
@@ -94,7 +204,7 @@ fn report_objdump_comparison_for_libtool_checker() {
 #[ignore = "requires the libtool-checker.so fixture"]
 fn report_arm_encoder_round_trip_for_libtool_checker() {
     use armv8_encode::isa::armv7::arm::{
-        encode::encode_with_row, sweep::disassemble_bytes,
+        encode::{encode_neon_row, encode_with_row}, sweep::disassemble_bytes,
     };
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -125,18 +235,28 @@ fn report_arm_encoder_round_trip_for_libtool_checker() {
                 continue;
             }
         };
-        let Some(row) = decoded.row else {
-            // NEON/coprocessor row — encoder doesn't cover.
-            neon += 1;
-            continue;
+        let result = match (decoded.row, decoded.neon_row) {
+            (Some(row), _) => encode_with_row(row, &decoded.operands, decoded.address),
+            (None, Some(neon_row)) => {
+                neon += 1;
+                encode_neon_row(neon_row, &decoded.operands)
+            }
+            (None, None) => {
+                errored += 1;
+                continue;
+            }
         };
-        match encode_with_row(row, &decoded.operands, decoded.address) {
+        match result {
             Ok(word) => {
                 let mut out = Vec::with_capacity(4);
                 out.extend_from_slice(&word.to_le_bytes());
                 if out == insn.bytes {
                     roundtripped += 1;
                 } else {
+                    eprintln!(
+                        "approximate at 0x{:x}: in={:02x?} out={:02x?}",
+                        insn.address, insn.bytes, out,
+                    );
                     approximate += 1;
                 }
             }
@@ -145,17 +265,17 @@ fn report_arm_encoder_round_trip_for_libtool_checker() {
     }
 
     eprintln!("ARM encoder round-trip: total={}", arm_insns.len());
-    eprintln!("  exact roundtrip: {roundtripped}");
+    eprintln!("  exact roundtrip: {roundtripped} (incl NEON: {neon})");
     eprintln!("  approximate (decoder/encoder loses bits): {approximate}");
     eprintln!("  encoder error: {errored}");
-    eprintln!("  NEON / no-row: {neon}");
-
-    // Sanity floor: at least the bx/movt/movw-shaped rows
-    // should round-trip exactly. PLT stubs use ldr-pc forms
-    // whose %a encoding is approximate.
+    // NEON instructions are counted in `roundtripped` once
+    // they encode successfully (which they do, via the
+    // OpaqueBits round-trip path). `neon` is a sub-tally
+    // for visibility, not an independent bucket.
     assert!(
-        roundtripped + approximate + neon + errored == arm_insns.len(),
-        "accounting bug",
+        roundtripped + approximate + errored == arm_insns.len(),
+        "accounting bug: {roundtripped} + {approximate} + {errored} != {}",
+        arm_insns.len(),
     );
 }
 

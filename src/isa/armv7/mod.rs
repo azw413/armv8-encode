@@ -34,14 +34,18 @@
 
 pub mod arm;
 pub mod control_flow;
+pub mod dispatch;
 pub mod encode;
 pub mod format_decode;
 pub mod isa_impl;
 pub mod neon_table_generated;
 pub mod operand;
+pub mod recursive;
 pub mod sweep;
 pub mod table;
 pub mod table_generated;
+
+pub use dispatch::{disassemble_function_at, disassemble_functions, FunctionDisassembly, Mode};
 
 pub use isa_impl::{ThumbIsa, ThumbMacroKind};
 

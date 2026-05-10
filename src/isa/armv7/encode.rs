@@ -43,9 +43,36 @@
 //! data-processing rewrites; complex addressing modes can
 //! grow as use cases appear.
 
+use super::neon_table_generated::NeonOpcodeGenerated;
 use super::operand::{DecodedOperand, EncodeError, Register, RegisterClass};
 use super::table::ThumbWidth;
 use super::table_generated::{ThumbMnemonicGenerated, ThumbOpcodeGenerated, THUMB_OPCODE_TABLE_GENERATED};
+
+/// Encode a NEON / coprocessor row. The decoder emits a
+/// single full-word OpaqueBits for these matches because the
+/// NEON format-string grammar isn't fully invertible; round-
+/// trip is bit-exact via the preserved OpaqueBits.
+///
+/// Returns the encoded word in *Thumb* form (i.e. the
+/// original word as it appeared in memory before any
+/// `normalise_neon_thumb` transform).
+pub fn encode_neon_row(
+    _row: &NeonOpcodeGenerated,
+    operands: &[DecodedOperand],
+) -> Result<u32, EncodeError> {
+    match operands.first() {
+        Some(DecodedOperand::OpaqueBits { bits, mask }) if *mask == 0xFFFF_FFFF => Ok(*bits),
+        Some(other) => Err(EncodeError::OperandShapeMismatch {
+            slot: 0,
+            format_code: "neon",
+            got: operand_kind(other),
+        }),
+        None => Err(EncodeError::ArityMismatch {
+            format_slots: 1,
+            operands: 0,
+        }),
+    }
+}
 
 /// Encode against a specific table row. The recommended
 /// entry point: the caller (typically the rewriter, holding
@@ -182,13 +209,31 @@ pub fn encode_with_format(
             }
             _ => {}
         }
-        // Display-only codes — no operand consumed. `%c`
-        // and `%C` may carry a bitfield (the condition-code
-        // bits) but the decoder treats them as display-only;
-        // the encoder must do the same and leave the bits
-        // alone (they're already encoded into opcode_base
-        // for unconditional rows, or carried verbatim from
-        // the round-trip word for conditional ones).
+        // %<bf>c — bitfielded cond consumes a Condition
+        // operand (matches the decoder's emission).
+        if code == b'c' && !bitfield.is_empty() {
+            if let Some((lo, hi)) = parse_bitfield(bitfield) {
+                let slot = operand_idx;
+                let operand = operands.get(slot).ok_or(EncodeError::ArityMismatch {
+                    format_slots: slot + 1,
+                    operands: operands.len(),
+                })?;
+                if let DecodedOperand::Condition(c) = operand {
+                    place_field(&mut word, lo, hi, *c as u32);
+                    operand_idx += 1;
+                } else {
+                    return Err(EncodeError::OperandShapeMismatch {
+                        slot,
+                        format_code: "c",
+                        got: operand_kind(operand),
+                    });
+                }
+                continue;
+            }
+        }
+        // Display-only codes — no operand consumed.
+        // %c/%C without bitfield are display-only (e.g.
+        // unconditional Thumb-2 forms whose cond is implicit).
         if matches!(code, b'c' | b'C' | b'x' | b'X' | b'%' | b't') {
             continue;
         }
@@ -213,6 +258,17 @@ pub fn encode_with_format(
         if bits_written {
             operand_idx += 1;
         }
+    }
+    // After the format walk, splice any remaining trailing
+    // OpaqueBits operands (the sweep emits a row-mask-tail
+    // OpaqueBits to preserve bits the row's mask leaves
+    // variable that no format code captured).
+    while operand_idx < operands.len() {
+        if let DecodedOperand::OpaqueBits { bits, mask } = &operands[operand_idx] {
+            word &= !*mask;
+            word |= *bits & *mask;
+        }
+        operand_idx += 1;
     }
     Ok(word)
 }
@@ -491,13 +547,22 @@ fn pack_operand(
             Ok(true)
         }
         b'S' if bitfield.is_empty() && width_bytes == 4 => {
-            // 32-bit %S: shifted Rm. We pack the register at
-            // hw2[3:0]; the shift-type and amount stay in
-            // opcode_base (zero-shift is the canonical decoder
-            // approximation).
-            let reg = expect_register(operand, slot, "S")?;
-            place_field(word, 0, 3, (reg.index & 0xf) as u32);
-            Ok(true)
+            // 32-bit %S: splice the OpaqueBits payload back.
+            // The decoder emits the full Rm + shift type +
+            // imm5 as a single OpaqueBits so the encoder can
+            // reproduce all bits exactly.
+            match operand {
+                DecodedOperand::OpaqueBits { bits, mask } => {
+                    *word &= !*mask;
+                    *word |= *bits & *mask;
+                    Ok(true)
+                }
+                _ => Err(EncodeError::OperandShapeMismatch {
+                    slot,
+                    format_code: "S",
+                    got: operand_kind(operand),
+                }),
+            }
         }
         b'D' if bitfield.is_empty() && width_bytes == 2 => {
             // 16-bit %D: Rd at bits[0..2] + bit 7 for hi-bit.
@@ -554,16 +619,34 @@ fn pack_operand(
             Ok(true)
         }
         b'M' if width_bytes == 4 => {
-            // ThumbExpandImm — invertible only for "constant"
-            // forms. Refuse rotation forms for now.
-            let v = expect_immediate(operand, slot, "M")?;
-            let raw = thumb_expand_imm_inverse(v).ok_or(EncodeError::UnsupportedFormatCode {
-                format_code: "%M (rotation form not yet invertible)".into(),
-            })?;
-            place_field(word, 0, 7, raw & 0xff);
-            place_field(word, 12, 14, (raw >> 8) & 0x7);
-            place_field(word, 26, 26, (raw >> 11) & 0x1);
-            Ok(true)
+            // ThumbExpandImm — round-trip via OpaqueBits when
+            // the decoder preserved the raw form, otherwise
+            // fall back to the inverse-expand path for
+            // hand-built operand lists carrying just the
+            // expanded value as Immediate.
+            match operand {
+                DecodedOperand::OpaqueBits { bits, mask } => {
+                    *word &= !*mask;
+                    *word |= *bits & *mask;
+                    Ok(true)
+                }
+                DecodedOperand::Immediate(v) => {
+                    let raw = thumb_expand_imm_inverse(*v).ok_or(
+                        EncodeError::UnsupportedFormatCode {
+                            format_code: "%M (rotation form not yet invertible)".into(),
+                        },
+                    )?;
+                    place_field(word, 0, 7, raw & 0xff);
+                    place_field(word, 12, 14, (raw >> 8) & 0x7);
+                    place_field(word, 26, 26, (raw >> 11) & 0x1);
+                    Ok(true)
+                }
+                _ => Err(EncodeError::OperandShapeMismatch {
+                    slot,
+                    format_code: "M",
+                    got: operand_kind(operand),
+                }),
+            }
         }
         b'J' if width_bytes == 4 => {
             // 16-bit immediate: hw1[3:0] : hw1[10] : hw2[14:12] : hw2[7:0].
@@ -582,20 +665,34 @@ fn pack_operand(
             place_field(word, 16, 19, (v >> 12) & 0xf);
             Ok(true)
         }
-        // Codes recognised but not yet invertible. We accept
-        // a placeholder Immediate(0) without writing bits, so
-        // round-trips through canonical row-driven encoders
-        // still work for instructions whose operands the
-        // decoder reported as approximations.
-        b'a' | b's' | b'L' | b'E' | b'F' | b'G' | b'V' | b'K' | b'P' | b'Q' | b'U'
-        | b'm' | b'n' | b'W' | b'Y' | b'Z' | b'H' | b'S'
+        // Codes whose decoder emits OpaqueBits as the
+        // operand. Splice the bits back into the encoded
+        // word via (word & !mask) | (bits & mask).
+        b'a' | b's' | b'L' | b'E' | b'F' | b'm' | b'n' | b'b' | b'I'
             if !applies_already(code, bitfield, width_bytes) =>
         {
-            // Consume the operand silently — preserves the
-            // base opcode bits, which is what
-            // decode-then-encode wants when the field's
-            // value happens to be zero.
-            // (This is the "approximation" branch.)
+            match operand {
+                DecodedOperand::OpaqueBits { bits, mask } => {
+                    *word &= !*mask;
+                    *word |= *bits & *mask;
+                    Ok(true)
+                }
+                _ => Err(EncodeError::OperandShapeMismatch {
+                    slot,
+                    format_code: "OpaqueBits-expected",
+                    got: operand_kind(operand),
+                }),
+            }
+        }
+        // Codes still falling back to the no-op
+        // "approximation" branch. These are display-only
+        // markers (no operand consumed) — but our outer
+        // loop has already fetched an operand for them.
+        // The tail OpaqueBits at the sweep level preserves
+        // any row-mask-variable bits these refer to.
+        b'G' | b'V' | b'K' | b'P' | b'Q' | b'U' | b'W' | b'Y' | b'Z' | b'H' | b'S' | b'R'
+            if !applies_already(code, bitfield, width_bytes) =>
+        {
             let _ = operand;
             let _ = slot;
             Ok(true)
@@ -782,6 +879,7 @@ fn operand_kind(o: &DecodedOperand) -> &'static str {
         DecodedOperand::PcRelative(_) => "PcRelative",
         DecodedOperand::RegisterList(_) => "RegisterList",
         DecodedOperand::Condition(_) => "Condition",
+        DecodedOperand::OpaqueBits { .. } => "OpaqueBits",
     }
 }
 
