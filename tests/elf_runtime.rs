@@ -1267,6 +1267,129 @@ fn et_dyn_add_library_dependency_forces_extra_load() {
     );
 }
 
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_remove_library_dependency_drops_dt_needed() {
+    // Symmetric to `add_library_dependency`. The
+    // `libgreet_with_libdep.so` fixture variant has a real
+    // build-time DT_NEEDED for libdep.so (forced via
+    // `--no-as-needed` so the linker keeps it even though
+    // libgreet doesn't call any of libdep's symbols). The
+    // test:
+    //
+    //   1. Confirms the baseline: with the unmodified
+    //      libgreet_with_libdep.so installed in place of
+    //      libgreet.so, the host run reports marker = 171
+    //      because dyld pulled libdep in.
+    //   2. Calls `remove_library_dependency("libdep.so")` and
+    //      commits. Static check: the new `.dynamic` no
+    //      longer has a DT_NEEDED whose dynstr name is
+    //      "libdep.so".
+    //   3. Runtime check: marker = 0 (libdep no longer
+    //      loaded).
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    // Use the variant that build-time-links libdep.
+    let with_dep_path = lib_path.with_file_name("libgreet_with_libdep.so");
+    let with_dep_bytes =
+        std::fs::read(&with_dep_path).expect("read libgreet_with_libdep.so");
+    let original_libgreet = std::fs::read(&lib_path).expect("read libgreet.so");
+
+    // Baseline: install the build-time-linked variant under
+    // the name `libgreet.so` (which is what `host` was
+    // linked against) and confirm dyld pulls libdep in.
+    std::fs::write(&lib_path, &with_dep_bytes).expect("install libgreet_with_libdep");
+    let baseline_stdout = run_in_lib_demo_with_args("host", &["libdep"]);
+    assert_eq!(
+        baseline_stdout, "libdep_marker=171\n",
+        "baseline sanity: libgreet_with_libdep should pull \
+         libdep in via its build-time DT_NEEDED; got \
+         {baseline_stdout:?}",
+    );
+
+    // Strip the DT_NEEDED for libdep.so.
+    let container = Container::from_bytes(&with_dep_bytes).expect("parse with-libdep");
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .remove_library_dependency("libdep.so")
+        .expect("remove_library_dependency");
+    let without_dep = editor
+        .commit_to_bytes()
+        .expect("commit remove_library_dependency");
+
+    // Static: no DT_NEEDED resolves to "libdep.so".
+    let rewritten = Container::from_bytes(&without_dep).expect("re-parse without dep");
+    let image = rewritten.elf_image.as_ref().expect("elf_image");
+    let dynstr = image.dynstr.as_ref().expect("dynstr").bytes.clone();
+    use armv8_encode::container::dynsym_extension as dx;
+    let needed_names: Vec<String> = image
+        .dynamic
+        .iter()
+        .filter(|e| e.tag == object::elf::DT_NEEDED as u64)
+        .filter_map(|e| dx::read_dynstr_at(&dynstr, e.value as u32).map(str::to_owned))
+        .collect();
+    assert!(
+        !needed_names.iter().any(|n| n == "libdep.so"),
+        "DT_NEEDED for \"libdep.so\" should be gone after \
+         remove_library_dependency; saw {needed_names:?}",
+    );
+
+    // Runtime: marker = 0 proves dyld no longer pulls libdep
+    // in.
+    std::fs::write(&lib_path, &without_dep).expect("install libgreet (dep removed)");
+    let stdout = run_in_lib_demo_with_args("host", &["libdep"]);
+    assert_eq!(
+        stdout, "libdep_marker=0\n",
+        "expected libdep_marker=0 after remove_library_dependency \
+         (libdep should not be loaded); got {stdout:?}",
+    );
+
+    // Regular host flow still works.
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after \
+         remove_library_dependency",
+    );
+
+    // Restore the pristine fixture.
+    std::fs::write(&lib_path, &original_libgreet).expect("restore libgreet.so");
+}
+
+#[test]
+#[ignore = "requires Docker with linux/arm64 (qemu-user); run with \
+            --ignored --nocapture"]
+fn et_dyn_remove_library_dependency_missing_name_errors() {
+    // remove_library_dependency must report a clear error when
+    // the name doesn't match any DT_NEEDED. Run inside docker
+    // since the test depends on the fixture's `.dynamic` layout
+    // matching what a real linker emits (i.e., libc + ld are
+    // the only DT_NEEDED tags).
+    require_docker();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::{BinaryEditor, TextEditorError};
+
+    let bytes = std::fs::read(&lib_path).expect("read libgreet.so");
+    let container = Container::from_bytes(&bytes).expect("parse libgreet.so");
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    let result = editor.binary.remove_library_dependency("libnothere.so");
+    match result {
+        Err(TextEditorError::LibraryDependencyNotFound(name)) => {
+            assert_eq!(name, "libnothere.so");
+        }
+        other => panic!(
+            "expected LibraryDependencyNotFound(\"libnothere.so\"); got {other:?}",
+        ),
+    }
+}
+
 /// Inject a synthetic PT_PHDR program header into the
 /// container's elf_image. Used to simulate Android NDK
 /// output, which carries PT_PHDR by default. The synthesised

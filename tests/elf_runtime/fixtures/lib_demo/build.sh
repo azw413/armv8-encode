@@ -44,6 +44,18 @@ clang --target=aarch64-linux-gnu \
     -fno-stack-protector \
     -o libdep.so libdep.c
 
+# libgreet_with_libdep.so: identical to libgreet.so but
+# additionally links against libdep.so at build time, so its
+# `.dynamic` carries a real DT_NEEDED for libdep. Used by the
+# `remove_library_dependency` acceptance test, which strips
+# that tag and verifies dyld stops pulling libdep in.
+clang --target=aarch64-linux-gnu \
+    -fPIC -shared -O0 -g \
+    -fno-stack-protector \
+    -Wl,-rpath,'$ORIGIN' -Wl,--disable-new-dtags \
+    -Wl,--no-as-needed \
+    -L. -o libgreet_with_libdep.so libgreet.c -ldl -ldep
+
 # `-Wl,-rpath,$ORIGIN` makes the loader look next to the host
 # executable for `libgreet.so`. Without it the test would need
 # `LD_LIBRARY_PATH=. ./host`, which is fragile across shells.

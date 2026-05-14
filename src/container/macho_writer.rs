@@ -715,6 +715,98 @@ fn build_dylib_command(path: &str) -> Vec<u8> {
     out
 }
 
+/// Remove a single `LC_LOAD_DYLIB` (or related dylib-loading
+/// load command) whose embedded path matches `path` from the
+/// load-command list in `bytes`. Shifts subsequent load
+/// commands up by the removed entry's `cmdsize`, zero-pads the
+/// freed tail bytes (which become extra headerpad), and
+/// patches `mach_header_64.ncmds` and `sizeofcmds` to match.
+///
+/// Returns the matched LC's `cmdsize` on success. Returns
+/// `Ok(None)` if no entry matched the given path so the caller
+/// can surface a recognisable error.
+///
+/// We match against all four dylib-loading commands the linker
+/// might emit: `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`,
+/// `LC_REEXPORT_DYLIB`, and `LC_LOAD_UPWARD_DYLIB`. Each shares
+/// the same `dylib_command` layout (cmd, cmdsize, name.offset,
+/// timestamp, current_version, compatibility_version, then the
+/// inline path string).
+pub fn strip_lc_load_dylib(
+    bytes: &mut Vec<u8>,
+    path: &str,
+) -> Result<Option<u32>, ContainerWriteError> {
+    use object::macho;
+
+    if bytes.len() < 24 {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O remove dep: input too short for mach_header_64".into(),
+        ));
+    }
+    let mut ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let mut sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    let lc_start = 32usize;
+    let lc_end = lc_start + sizeofcmds as usize;
+
+    let mut cursor = lc_start;
+    while cursor + 8 <= lc_end {
+        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if cmdsize == 0 || cursor + cmdsize > lc_end {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "Mach-O remove dep: invalid cmdsize {cmdsize} at offset {cursor}",
+            )));
+        }
+        let is_dylib_load = matches!(
+            cmd,
+            macho::LC_LOAD_DYLIB
+                | macho::LC_LOAD_WEAK_DYLIB
+                | macho::LC_REEXPORT_DYLIB
+                | macho::LC_LOAD_UPWARD_DYLIB,
+        );
+        if is_dylib_load && cmdsize >= 24 {
+            // name.offset is at cursor+8 (relative to the LC
+            // start). The path is a NUL-terminated string
+            // starting at `cursor + name_off`.
+            let name_off =
+                u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap())
+                    as usize;
+            if name_off >= cmdsize {
+                cursor += cmdsize;
+                continue;
+            }
+            let path_start = cursor + name_off;
+            let path_end_max = cursor + cmdsize;
+            let nul_rel = bytes[path_start..path_end_max].iter().position(|&b| b == 0);
+            let path_end = match nul_rel {
+                Some(n) => path_start + n,
+                None => path_end_max,
+            };
+            let entry_path = std::str::from_utf8(&bytes[path_start..path_end]).ok();
+            if entry_path == Some(path) {
+                // Shift subsequent LCs up by cmdsize and zero
+                // the freed tail bytes (which are now extra
+                // headerpad).
+                let tail_start = cursor + cmdsize;
+                let tail_end = lc_end;
+                bytes.copy_within(tail_start..tail_end, cursor);
+                let freed_start = tail_end - cmdsize;
+                for b in &mut bytes[freed_start..tail_end] {
+                    *b = 0;
+                }
+                ncmds -= 1;
+                sizeofcmds -= cmdsize as u32;
+                bytes[16..20].copy_from_slice(&ncmds.to_le_bytes());
+                bytes[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
+                return Ok(Some(cmdsize as u32));
+            }
+        }
+        cursor += cmdsize;
+    }
+    Ok(None)
+}
+
 /// Inputs to the Mach-O intra-`__TEXT` append writer.
 pub struct IntraTextAppend {
     /// vmaddr inside an existing `__TEXT` free region where

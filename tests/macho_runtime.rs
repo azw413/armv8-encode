@@ -665,6 +665,166 @@ fn et_dyn_add_library_dependency_forces_extra_load() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn et_dyn_remove_library_dependency_drops_lc_load_dylib() {
+    // Symmetric to add_library_dependency. Two-step:
+    //   1. Add @rpath/libdep.dylib, commit, install, run host
+    //      to confirm dyld is honouring the injected dep
+    //      (marker = 171).
+    //   2. Re-parse the rewritten dylib, remove the dep,
+    //      commit, install, and confirm:
+    //        - statically: no LC_LOAD_DYLIB entry carries the
+    //          path "@rpath/libdep.dylib";
+    //        - at runtime: marker reads back as 0 because dyld
+    //          no longer pulls libdep in.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let original_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+
+    // Step 1: add the dep.
+    let container =
+        Container::from_bytes(&original_bytes).expect("parse libgreet.dylib");
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .add_library_dependency("@rpath/libdep.dylib")
+        .expect("add_library_dependency");
+    let with_dep = editor.commit_to_bytes().expect("commit add_library_dependency");
+    std::fs::write(&lib_path, &with_dep).expect("install libgreet+libdep");
+    let baseline = run_in_lib_demo_with_args("host", &["libdep"]);
+    assert_eq!(
+        baseline, "libdep_marker=171\n",
+        "baseline sanity: libdep should be force-loaded after \
+         add_library_dependency before we try removing it; \
+         got {baseline:?}",
+    );
+
+    // Step 2: remove the dep.
+    let with_dep_container =
+        Container::from_bytes(&with_dep).expect("re-parse libgreet+libdep");
+    let mut editor = BinaryEditor::new(&with_dep_container).expect("BinaryEditor::new");
+    editor
+        .binary
+        .remove_library_dependency("@rpath/libdep.dylib")
+        .expect("remove_library_dependency");
+    let without_dep =
+        editor.commit_to_bytes().expect("commit remove_library_dependency");
+
+    // Static: no LC_LOAD_DYLIB resolves to "@rpath/libdep.dylib".
+    let rewritten =
+        Container::from_bytes(&without_dep).expect("re-parse libgreet (dep removed)");
+    // Walk the raw load commands directly; we don't yet have a
+    // typed view of LC_LOAD_DYLIB on the container.
+    let raw = &rewritten
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .raw_bytes;
+    assert!(
+        !find_load_dylib_path(raw, "@rpath/libdep.dylib"),
+        "LC_LOAD_DYLIB for \"@rpath/libdep.dylib\" should be gone \
+         after remove_library_dependency",
+    );
+
+    std::fs::write(&lib_path, &without_dep).expect("install libgreet (dep removed)");
+    let stdout = run_in_lib_demo_with_args("host", &["libdep"]);
+    assert_eq!(
+        stdout, "libdep_marker=0\n",
+        "expected libdep_marker=0 after remove_library_dependency \
+         (libdep should not be loaded); got {stdout:?}",
+    );
+    let stdout_default = run_in_lib_demo("host");
+    assert_eq!(
+        stdout_default,
+        "double=42 offset=107\n",
+        "regular library functions should still work after \
+         remove_library_dependency",
+    );
+
+    std::fs::write(&lib_path, &original_bytes).expect("restore libgreet.dylib");
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
+fn et_dyn_remove_library_dependency_missing_name_errors() {
+    // remove_library_dependency must surface a clear error
+    // when no LC_LOAD_DYLIB matches the requested path.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::{BinaryEditor, TextEditorError};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor = BinaryEditor::new(&container).expect("BinaryEditor::new");
+    let result = editor
+        .binary
+        .remove_library_dependency("@rpath/libnothere.dylib");
+    match result {
+        Err(TextEditorError::LibraryDependencyNotFound(name)) => {
+            assert_eq!(name, "@rpath/libnothere.dylib");
+        }
+        other => panic!(
+            "expected LibraryDependencyNotFound; got {other:?}",
+        ),
+    }
+}
+
+/// Walk a Mach-O byte stream's load-command list looking for any
+/// `LC_LOAD_DYLIB` (or sibling) whose embedded path equals
+/// `target`. Returns true iff a match exists.
+fn find_load_dylib_path(bytes: &[u8], target: &str) -> bool {
+    use object::macho;
+    if bytes.len() < 24 {
+        return false;
+    }
+    let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let lc_start = 32usize;
+    let lc_end = lc_start + sizeofcmds;
+    let mut cursor = lc_start;
+    while cursor + 8 <= lc_end {
+        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if cmdsize == 0 || cursor + cmdsize > lc_end {
+            return false;
+        }
+        if matches!(
+            cmd,
+            macho::LC_LOAD_DYLIB
+                | macho::LC_LOAD_WEAK_DYLIB
+                | macho::LC_REEXPORT_DYLIB
+                | macho::LC_LOAD_UPWARD_DYLIB,
+        ) && cmdsize >= 24
+        {
+            let name_off =
+                u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap())
+                    as usize;
+            if name_off < cmdsize {
+                let path_start = cursor + name_off;
+                let path_end_max = cursor + cmdsize;
+                let nul = bytes[path_start..path_end_max]
+                    .iter()
+                    .position(|&b| b == 0);
+                let path_end = nul.map_or(path_end_max, |n| path_start + n);
+                if let Ok(p) = std::str::from_utf8(&bytes[path_start..path_end]) {
+                    if p == target {
+                        return true;
+                    }
+                }
+            }
+        }
+        cursor += cmdsize;
+    }
+    false
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_add_initialiser_hijacks_init_offsets_slot() {
     // Phase 6 acceptance: `add_initialiser` hijacks the
     // `__init_offsets` slot (modern Mach-O equivalent of

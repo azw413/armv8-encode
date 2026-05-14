@@ -256,6 +256,57 @@ pub fn parse_dynamic(bytes: &[u8]) -> Vec<crate::container::DynamicEntry> {
     out
 }
 
+/// Read a NUL-terminated string out of a `.dynstr` blob at the
+/// given byte offset. Returns `None` if the offset is past the
+/// end of the blob or if no terminator is found before the blob
+/// ends.
+pub fn read_dynstr_at(dynstr: &[u8], offset: u32) -> Option<&str> {
+    let start = offset as usize;
+    if start >= dynstr.len() {
+        return None;
+    }
+    let end = dynstr[start..].iter().position(|&b| b == 0)? + start;
+    std::str::from_utf8(&dynstr[start..end]).ok()
+}
+
+/// Remove all `.dynamic` entries matching `(tag, predicate(value))`
+/// and pad the section back to its original length with trailing
+/// `DT_NULL` entries. Used to drop a `DT_NEEDED` tag for a
+/// specific library without changing the section's byte length.
+///
+/// Returns the new entry list and the number of entries removed.
+pub fn remove_dynamic_entries<F>(
+    source: &[crate::container::DynamicEntry],
+    tag: u64,
+    mut predicate: F,
+) -> (Vec<crate::container::DynamicEntry>, usize)
+where
+    F: FnMut(u64) -> bool,
+{
+    use crate::container::DynamicEntry;
+    use object::elf::DT_NULL;
+
+    let mut removed = 0usize;
+    let mut out: Vec<DynamicEntry> = Vec::with_capacity(source.len());
+    for entry in source {
+        if entry.tag == tag && predicate(entry.value) {
+            removed += 1;
+            continue;
+        }
+        out.push(*entry);
+    }
+    // Re-pad to original length with DT_NULL so the section's
+    // byte size is preserved (matches `insert_dynamic_tags`
+    // discipline).
+    while out.len() < source.len() {
+        out.push(DynamicEntry {
+            tag: DT_NULL as u64,
+            value: 0,
+        });
+    }
+    (out, removed)
+}
+
 /// Encode a `.dynamic` tag list into bytes (Elf64_Dyn × N).
 /// Each entry is 16 bytes: u64 d_tag, u64 d_un.d_val.
 pub fn encode_dynamic(entries: &[crate::container::DynamicEntry]) -> Vec<u8> {
@@ -301,5 +352,55 @@ mod tests {
         let extended = append_gnu_versym(&source, 1);
         assert_eq!(extended.len(), 6);
         assert_eq!(&extended[4..6], &1u16.to_le_bytes());
+    }
+
+    #[test]
+    fn read_dynstr_at_returns_name_at_offset() {
+        let dynstr = b"\0libc.so.6\0libdep.so\0";
+        assert_eq!(read_dynstr_at(dynstr, 1), Some("libc.so.6"));
+        assert_eq!(read_dynstr_at(dynstr, 11), Some("libdep.so"));
+        assert_eq!(read_dynstr_at(dynstr, 0), Some(""));
+        assert_eq!(read_dynstr_at(dynstr, 999), None);
+    }
+
+    #[test]
+    fn remove_dynamic_entries_drops_matching_and_pads_with_null() {
+        use crate::container::DynamicEntry;
+        use object::elf::{DT_NEEDED, DT_NULL, DT_STRTAB};
+        let source = vec![
+            DynamicEntry { tag: DT_NEEDED as u64, value: 1 },   // libc
+            DynamicEntry { tag: DT_NEEDED as u64, value: 11 },  // libdep (to drop)
+            DynamicEntry { tag: DT_STRTAB as u64, value: 0x100 },
+            DynamicEntry { tag: DT_NULL as u64, value: 0 },
+            DynamicEntry { tag: DT_NULL as u64, value: 0 },
+        ];
+        let (out, removed) =
+            remove_dynamic_entries(&source, DT_NEEDED as u64, |v| v == 11);
+        assert_eq!(removed, 1);
+        // Preserved length (matches original).
+        assert_eq!(out.len(), source.len());
+        // libc DT_NEEDED still present; libdep gone.
+        let needed: Vec<_> = out
+            .iter()
+            .filter(|e| e.tag == DT_NEEDED as u64)
+            .collect();
+        assert_eq!(needed.len(), 1);
+        assert_eq!(needed[0].value, 1);
+        // Last entry is DT_NULL (terminator preserved).
+        assert_eq!(out.last().unwrap().tag, DT_NULL as u64);
+    }
+
+    #[test]
+    fn remove_dynamic_entries_reports_zero_when_no_match() {
+        use crate::container::DynamicEntry;
+        use object::elf::{DT_NEEDED, DT_NULL};
+        let source = vec![
+            DynamicEntry { tag: DT_NEEDED as u64, value: 1 },
+            DynamicEntry { tag: DT_NULL as u64, value: 0 },
+        ];
+        let (out, removed) =
+            remove_dynamic_entries(&source, DT_NEEDED as u64, |v| v == 999);
+        assert_eq!(removed, 0);
+        assert_eq!(out, source);
     }
 }

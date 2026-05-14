@@ -134,6 +134,12 @@ pub enum TextEditorError {
     /// rejection so callers can identify which add_*
     /// invocation crossed the line.
     WouldCreateNewSegment { reason: String },
+    /// `remove_library_dependency` was called with a name that
+    /// isn't present in the input's dependency list (no
+    /// `DT_NEEDED` tag on ELF / no `LC_LOAD_DYLIB` on Mach-O
+    /// resolves to it). The caller should check the existing
+    /// dependency list first if the name is dynamic.
+    LibraryDependencyNotFound(String),
 }
 
 impl std::fmt::Display for TextEditorError {
@@ -190,6 +196,11 @@ impl std::fmt::Display for TextEditorError {
                 f,
                 "operation would create a new segment but \
                  prohibit_new_segments() is set: {reason}",
+            ),
+            Self::LibraryDependencyNotFound(name) => write!(
+                f,
+                "remove_library_dependency: no DT_NEEDED / LC_LOAD_DYLIB \
+                 entry matches {name:?}",
             ),
         }
     }
@@ -1720,6 +1731,158 @@ impl BinaryState {
         Ok(())
     }
 
+    /// Drop a previously-recorded library dependency so the
+    /// dynamic linker stops loading it alongside this
+    /// binary.
+    ///
+    /// Symmetric to [`Self::add_library_dependency`]:
+    ///
+    /// - **ELF**: walks `.dynamic`, finds the `DT_NEEDED` tag
+    ///   whose value names `library_name` (resolved via
+    ///   `.dynstr`), drops the entry, and pads the trailing
+    ///   slot with `DT_NULL` so the section's byte length is
+    ///   unchanged. The orphan string in `.dynstr` is left in
+    ///   place — harmless, since nothing references it any more.
+    /// - **Mach-O**: walks the load-command list, finds the
+    ///   `LC_LOAD_DYLIB` (or `LC_LOAD_WEAK_DYLIB` /
+    ///   `LC_REEXPORT_DYLIB` / `LC_LOAD_UPWARD_DYLIB`) whose
+    ///   inline path equals `library_name`, removes it, zero-
+    ///   pads the freed tail bytes (which become extra
+    ///   headerpad), and patches `mach_header_64.ncmds` /
+    ///   `sizeofcmds`. The binary is re-signed ad-hoc on
+    ///   commit.
+    ///
+    /// Both formats keep the file's overall byte length and
+    /// section/segment offsets unchanged, so the change
+    /// commits through the in-place writer path — no appended
+    /// segment is created.
+    ///
+    /// Returns
+    /// [`TextEditorError::LibraryDependencyNotFound`] if no
+    /// matching entry is present.
+    ///
+    /// ## Caveat: bind-info references
+    ///
+    /// On Mach-O, the bind info (LC_DYLD_INFO /
+    /// LC_DYLD_CHAINED_FIXUPS) encodes each imported symbol's
+    /// dylib by *ordinal* (1-based index into the dylib LC
+    /// list). Removing an entry shifts later ordinals down,
+    /// which corrupts bind info for any symbol still imported
+    /// from a shifted-down library. This method intentionally
+    /// does *not* fix that up — it's safe only when the
+    /// removed library has no remaining bound imports (the
+    /// common case: callers either remove a force-loaded dep
+    /// they added themselves, or remove an unused dep an
+    /// audit flagged). Callers who need to remove a depended-
+    /// upon library must rebind its imports first.
+    ///
+    /// On ELF, undefined symbols carry no per-library
+    /// reference, so this caveat doesn't apply.
+    pub fn remove_library_dependency(
+        &mut self,
+        library_name: &str,
+    ) -> Result<(), TextEditorError> {
+        match self.container.format {
+            crate::container::BinaryFormat::Elf => {
+                self.remove_library_dependency_elf(library_name)
+            }
+            crate::container::BinaryFormat::Macho => {
+                self.remove_library_dependency_macho(library_name)
+            }
+        }
+    }
+
+    fn remove_library_dependency_elf(
+        &mut self,
+        library_name: &str,
+    ) -> Result<(), TextEditorError> {
+        use crate::container::dynsym_extension as dx;
+        use object::elf::DT_NEEDED;
+
+        let image = self
+            .container
+            .elf_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let dynstr = image
+            .dynstr
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?
+            .bytes
+            .clone();
+
+        let (new_entries, removed) = dx::remove_dynamic_entries(
+            &image.dynamic,
+            DT_NEEDED as u64,
+            |value| {
+                matches!(
+                    dx::read_dynstr_at(&dynstr, value as u32),
+                    Some(s) if s == library_name,
+                )
+            },
+        );
+        if removed == 0 {
+            return Err(TextEditorError::LibraryDependencyNotFound(
+                library_name.to_string(),
+            ));
+        }
+
+        let new_bytes = dx::encode_dynamic(&new_entries);
+
+        // Mutate the container in place so the writer's
+        // section-bytes path emits the new contents.
+        let dynamic_idx = self
+            .container
+            .sections
+            .iter()
+            .position(|s| s.name == ".dynamic")
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        // Preserve the section's existing byte length — the
+        // writer's reserve phase assumes section offsets are
+        // stable. `remove_dynamic_entries` pads with DT_NULL to
+        // keep the entry count, so `new_bytes.len()` already
+        // matches `source.len() * 16` from the input.
+        let orig_len = self.container.sections[dynamic_idx].bytes.len();
+        debug_assert_eq!(new_bytes.len(), orig_len);
+        self.container.sections[dynamic_idx].bytes = new_bytes;
+        self.container.sections[dynamic_idx].size = orig_len as u64;
+
+        // Update the parsed image so any subsequent edits see
+        // a consistent view.
+        if let Some(image) = self.container.elf_image.as_mut() {
+            image.dynamic = new_entries;
+        }
+        Ok(())
+    }
+
+    fn remove_library_dependency_macho(
+        &mut self,
+        library_name: &str,
+    ) -> Result<(), TextEditorError> {
+        let image = self
+            .container
+            .macho_image
+            .as_mut()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let removed = crate::container::macho_writer::strip_lc_load_dylib(
+            &mut image.raw_bytes,
+            library_name,
+        )?;
+        if removed.is_none() {
+            return Err(TextEditorError::LibraryDependencyNotFound(
+                library_name.to_string(),
+            ));
+        }
+        // Re-parse the layout so subsequent edits see the
+        // updated ncmds / sizeofcmds. `MachOImage::parse`
+        // consumes its input, so move the mutated raw_bytes
+        // through it.
+        let raw = std::mem::take(&mut image.raw_bytes);
+        let reparsed = crate::container::MachOImage::parse(raw)?;
+        *image = reparsed;
+        Ok(())
+    }
+
     /// Run the layout + emit + commit pipeline and return the
     /// rewritten container.
     ///
@@ -2407,16 +2570,24 @@ impl BinaryEditor {
         match binary.appended {
             None => {
                 // No appended functions — straightforward path.
-                // Requires a lifted text section (otherwise
-                // there's nothing to commit and no edits to make).
-                let text = text.ok_or_else(|| TextEditorError::SectionNotFound(
-                    "<no lifted text section and no whole-binary edits to commit>".into(),
-                ))?;
-                let layout = lay_out(&text.plan, text.base_address, Some(&binary.container))?;
-                let output: EmitOutput =
-                    emit(&text.plan, &layout, Some(&binary.container))?;
-                let edited = commit_to_container(&binary.container, text.section_id, output);
-                edited.to_bytes().map_err(TextEditorError::from)
+                // If no text section was lifted either, the
+                // only edits are whole-binary mutations the
+                // caller applied directly to `container` (e.g.
+                // `remove_library_dependency`); fall through
+                // to the in-place writer with the mutated
+                // container as-is.
+                match text {
+                    Some(text) => {
+                        let layout =
+                            lay_out(&text.plan, text.base_address, Some(&binary.container))?;
+                        let output: EmitOutput =
+                            emit(&text.plan, &layout, Some(&binary.container))?;
+                        let edited =
+                            commit_to_container(&binary.container, text.section_id, output);
+                        edited.to_bytes().map_err(TextEditorError::from)
+                    }
+                    None => binary.container.to_bytes().map_err(TextEditorError::from),
+                }
             }
             Some(mut appended) => {
                 // Run the in-place layout/emit for the lifted
