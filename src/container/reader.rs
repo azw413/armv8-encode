@@ -76,6 +76,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
                 crate::container::macho_image::MachOImage::parse(bytes.to_vec()).ok();
             if let Some(img) = image.as_mut() {
                 populate_macho_stubs(img, &symbol_index_to_id);
+                reclassify_macho_text_sections(&img.layout, &mut sections);
             }
             image
         }
@@ -558,6 +559,38 @@ fn populate_macho_stubs(
             .get(&object::SymbolIndex(entry.symtab_index as usize));
         if let Some(&id) = neutral {
             image.import_pointers.insert(id, entry.address);
+        }
+    }
+}
+
+/// `object` classifies Mach-O `__stubs` (and other `S_SYMBOL_STUBS`
+/// sections) as `Other` because the load command doesn't tag them as
+/// executable in the way `object`'s neutral kind enum recognises.
+/// They're code though — three `adrp`/`ldr`/`br` instructions per
+/// 12-byte stub — so reclassify them as `Text` after the Mach-O image
+/// is parsed and we can see the section-type byte. Same treatment
+/// for the rarer `__auth_stubs` (PAC-signed variant).
+///
+/// We match on flags rather than name so non-standard stub section
+/// names still get routed to the disassembler.
+fn reclassify_macho_text_sections(
+    layout: &crate::container::macho_image::MachOLayout,
+    sections: &mut [Section],
+) {
+    use crate::container::macho_image::{S_SYMBOL_STUBS, SECTION_TYPE_MASK};
+    for macho_sec in &layout.sections {
+        if macho_sec.flags & SECTION_TYPE_MASK != S_SYMBOL_STUBS {
+            continue;
+        }
+        // Match the neutral section by (segname, sectname). Mach-O
+        // section names aren't unique across segments — e.g. both
+        // `__TEXT,__const` and `__DATA,__const` exist — but for our
+        // purposes the neutral list uses just the sectname, which is
+        // unique within `__TEXT` for stub sections.
+        if let Some(section) =
+            sections.iter_mut().find(|s| s.name == macho_sec.sectname)
+        {
+            section.kind = SectionKind::Text;
         }
     }
 }
