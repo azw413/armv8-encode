@@ -22,7 +22,9 @@
 //! Round-trip preserves anything not modelled here byte-for-byte
 //! via [`MachOImage::raw_bytes`].
 
-use crate::container::ContainerWriteError;
+use std::collections::HashMap;
+
+use crate::container::{ContainerWriteError, SymbolId};
 
 /// Mach-O file metadata captured at parse time.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -34,6 +36,16 @@ pub struct MachOImage {
     /// Parsed load-command metadata. Populated by the reader for
     /// any input that parses as a 64-bit Mach-O.
     pub layout: MachOLayout,
+    /// Import name → `__stubs` trampoline address. Mirrors
+    /// `ElfImage::plt_stubs`. Populated by the high-level reader
+    /// from the indirect symbol table once neutral `SymbolId`s
+    /// exist. Empty until then.
+    pub stubs: HashMap<SymbolId, u64>,
+    /// Import name → `__got` / `__la_symbol_ptr` slot address.
+    /// Lets the disassembler resolve `adrp/ldr` pairs that load an
+    /// imported function pointer directly (no `__stubs` hop) to the
+    /// import name.
+    pub import_pointers: HashMap<SymbolId, u64>,
 }
 
 impl MachOImage {
@@ -43,7 +55,12 @@ impl MachOImage {
     /// path that doesn't depend on the parsed layout.
     pub fn parse(raw_bytes: Vec<u8>) -> Result<Self, ContainerWriteError> {
         let layout = MachOLayout::parse(&raw_bytes)?;
-        Ok(Self { raw_bytes, layout })
+        Ok(Self {
+            raw_bytes,
+            layout,
+            stubs: HashMap::new(),
+            import_pointers: HashMap::new(),
+        })
     }
 }
 
@@ -110,6 +127,15 @@ pub struct MachODysymtab {
     pub nextdefsym: u32,
     pub iundefsym: u32,
     pub nundefsym: u32,
+    /// File offset of the indirect symbol table. Each entry is a
+    /// `u32` index into `LC_SYMTAB`'s symbol table; sections with
+    /// type `S_SYMBOL_STUBS` / `S_*_SYMBOL_POINTERS` use
+    /// `reserved1 + i` to index into it.
+    pub indirectsymoff: u32,
+    /// Number of `u32` entries at `indirectsymoff`. Bounds the
+    /// indirect-table walk so a malformed `reserved1` can't read
+    /// past the table.
+    pub nindirectsyms: u32,
 }
 
 /// One contiguous range of bytes inside an existing segment
@@ -274,7 +300,33 @@ pub struct MachOSection {
     /// on-disk content.
     pub file_offset: u64,
     pub flags: u32,
+    /// `section_64.reserved1`. Type-dependent:
+    ///   - `S_SYMBOL_STUBS` / `S_LAZY_SYMBOL_POINTERS` /
+    ///     `S_NON_LAZY_SYMBOL_POINTERS`: index into the indirect
+    ///     symbol table for the section's first entry.
+    /// Captured so the stub-address → SymbolId map can be built
+    /// without re-parsing the file.
+    pub reserved1: u32,
+    /// `section_64.reserved2`. Type-dependent:
+    ///   - `S_SYMBOL_STUBS`: stub size in bytes (12 for arm64).
+    /// Captured to walk `__stubs` in strides without hard-coding
+    /// per-arch sizes.
+    pub reserved2: u32,
 }
+
+/// `section_64.flags` low-byte section types we care about for
+/// stub / import-pointer resolution. Values match `<mach-o/loader.h>`.
+pub const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x06;
+pub const S_LAZY_SYMBOL_POINTERS: u32 = 0x07;
+pub const S_SYMBOL_STUBS: u32 = 0x08;
+
+/// Mask isolating the section type from `section_64.flags`.
+pub const SECTION_TYPE_MASK: u32 = 0x0000_00ff;
+
+/// Sentinel values in indirect-symbol-table entries that mean
+/// "this slot doesn't bind to a named import" — skip them.
+pub const INDIRECT_SYMBOL_LOCAL: u32 = 0x8000_0000;
+pub const INDIRECT_SYMBOL_ABS: u32 = 0x4000_0000;
 
 /// `LC_CODE_SIGNATURE` (and similar `linkedit_data_command`-
 /// shaped commands like `LC_FUNCTION_STARTS`, `LC_DATA_IN_CODE`,
@@ -421,6 +473,15 @@ impl MachOLayout {
                     let nundefsym = u32::from_le_bytes(
                         bytes[cursor + 28..cursor + 32].try_into().unwrap(),
                     );
+                    // `dysymtab_command` continues with toc/modtab/
+                    // extrefsym pairs (24 bytes), then the indirect
+                    // symbol table pair at offsets 56/60.
+                    let indirectsymoff = u32::from_le_bytes(
+                        bytes[cursor + 56..cursor + 60].try_into().unwrap(),
+                    );
+                    let nindirectsyms = u32::from_le_bytes(
+                        bytes[cursor + 60..cursor + 64].try_into().unwrap(),
+                    );
                     dysymtab = Some(MachODysymtab {
                         ilocalsym,
                         nlocalsym,
@@ -428,6 +489,8 @@ impl MachOLayout {
                         nextdefsym,
                         iundefsym,
                         nundefsym,
+                        indirectsymoff,
+                        nindirectsyms,
                     });
                 }
                 _ => {}
@@ -506,6 +569,124 @@ impl MachOLayout {
             .iter()
             .find(|s| s.segname == segname && s.sectname == sectname)
     }
+
+    /// Decode the indirect symbol table referenced by `LC_DYSYMTAB`.
+    /// Each entry is a `u32` index into the Mach-O symbol table
+    /// (`LC_SYMTAB`), used by sections of type `S_SYMBOL_STUBS`,
+    /// `S_LAZY_SYMBOL_POINTERS`, and `S_NON_LAZY_SYMBOL_POINTERS`
+    /// to identify which import each slot binds to.
+    ///
+    /// Returns an empty vec when `LC_DYSYMTAB` was absent or the
+    /// table's declared range extends past the file.
+    pub fn read_indirect_symtab(&self, bytes: &[u8]) -> Vec<u32> {
+        let Some(dyn_) = self.dysymtab else { return Vec::new() };
+        let off = dyn_.indirectsymoff as usize;
+        let n = dyn_.nindirectsyms as usize;
+        let end = off.saturating_add(n.saturating_mul(4));
+        if n == 0 || end > bytes.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = off + i * 4;
+            out.push(u32::from_le_bytes(bytes[base..base + 4].try_into().unwrap()));
+        }
+        out
+    }
+
+    /// Enumerate every `__stubs`-style trampoline in the image, one
+    /// entry per stub slot. Walks each section whose type is
+    /// [`S_SYMBOL_STUBS`] in `reserved2`-byte strides; the entry's
+    /// indirect-table slot (`reserved1 + i`) yields the symbol-table
+    /// index of the import the stub binds to.
+    ///
+    /// Sentinel slots (`INDIRECT_SYMBOL_LOCAL` / `_ABS`) are
+    /// dropped so callers only see real imports. Bad `reserved2`
+    /// values (zero or larger than the section) skip that section
+    /// rather than abort — a malformed binary shouldn't break
+    /// disassembly of the rest of the image.
+    pub fn stub_entries(&self, bytes: &[u8]) -> Vec<MachOStubEntry> {
+        let indirect = self.read_indirect_symtab(bytes);
+        if indirect.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for sec in &self.sections {
+            if sec.flags & SECTION_TYPE_MASK != S_SYMBOL_STUBS {
+                continue;
+            }
+            let stride = sec.reserved2 as u64;
+            if stride == 0 || stride > sec.size {
+                continue;
+            }
+            let count = (sec.size / stride) as u32;
+            let base_idx = sec.reserved1;
+            for i in 0..count {
+                let slot = match base_idx.checked_add(i).and_then(|j| indirect.get(j as usize)) {
+                    Some(&v) => v,
+                    None => break,
+                };
+                if slot & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS) != 0 {
+                    continue;
+                }
+                let address = sec.vaddr + (i as u64) * stride;
+                out.push(MachOStubEntry {
+                    address,
+                    symtab_index: slot,
+                });
+            }
+        }
+        out
+    }
+
+    /// Same idea as `stub_entries`, but for `__got` / `__la_symbol_ptr`
+    /// pointer slots. Each entry is one 8-byte slot whose runtime
+    /// value will be filled in by dyld from the named import. Used
+    /// by the disassembler to resolve `adrp x16, __got` /
+    /// `ldr x16, [x16, #imp_off]` pairs to the import symbol.
+    pub fn import_pointer_entries(&self, bytes: &[u8]) -> Vec<MachOStubEntry> {
+        let indirect = self.read_indirect_symtab(bytes);
+        if indirect.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for sec in &self.sections {
+            let kind = sec.flags & SECTION_TYPE_MASK;
+            if kind != S_NON_LAZY_SYMBOL_POINTERS && kind != S_LAZY_SYMBOL_POINTERS {
+                continue;
+            }
+            // Pointer slots are always 8 bytes wide on 64-bit Mach-O.
+            const PTR_SIZE: u64 = 8;
+            let count = (sec.size / PTR_SIZE) as u32;
+            let base_idx = sec.reserved1;
+            for i in 0..count {
+                let slot = match base_idx.checked_add(i).and_then(|j| indirect.get(j as usize)) {
+                    Some(&v) => v,
+                    None => break,
+                };
+                if slot & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS) != 0 {
+                    continue;
+                }
+                let address = sec.vaddr + (i as u64) * PTR_SIZE;
+                out.push(MachOStubEntry {
+                    address,
+                    symtab_index: slot,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// One resolved stub or import-pointer slot. `address` is the
+/// run-time address of the trampoline / pointer; `symtab_index` is
+/// the entry's slot in the Mach-O `LC_SYMTAB` symbol table — the
+/// reader maps this back to a neutral `SymbolId` via the same
+/// `object::SymbolIndex` mapping used everywhere else.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MachOStubEntry {
+    pub address: u64,
+    pub symtab_index: u32,
 }
 
 fn parse_segment_64(
@@ -561,6 +742,8 @@ fn parse_segment_64(
         let file_offset =
             u32::from_le_bytes(bytes[s + 48..s + 52].try_into().unwrap()) as u64;
         let sect_flags = u32::from_le_bytes(bytes[s + 64..s + 68].try_into().unwrap());
+        let reserved1 = u32::from_le_bytes(bytes[s + 68..s + 72].try_into().unwrap());
+        let reserved2 = u32::from_le_bytes(bytes[s + 72..s + 76].try_into().unwrap());
         sections.push(MachOSection {
             sectname,
             segname: sect_segname,
@@ -568,6 +751,8 @@ fn parse_segment_64(
             size,
             file_offset,
             flags: sect_flags,
+            reserved1,
+            reserved2,
         });
     }
 
@@ -946,5 +1131,232 @@ mod tests {
                 region.file_offset,
             );
         }
+    }
+
+    // ---- LC_DYSYMTAB + stub enumeration --------------------------------
+
+    /// Build an `LC_DYSYMTAB` load command. 80 bytes total.
+    /// All fields zero except those passed in — enough to exercise
+    /// indirect-table reads.
+    fn dysymtab(indirectsymoff: u32, nindirectsyms: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(80);
+        out.extend_from_slice(&macho::LC_DYSYMTAB.to_le_bytes());
+        out.extend_from_slice(&80u32.to_le_bytes()); // cmdsize
+        // 6 × u32 symbol-range counts.
+        for _ in 0..6 {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // 3 × (offset, count) pairs we don't care about (toc, modtab,
+        // extrefsym) — 24 bytes.
+        for _ in 0..6 {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // indirectsymoff, nindirectsyms.
+        out.extend_from_slice(&indirectsymoff.to_le_bytes());
+        out.extend_from_slice(&nindirectsyms.to_le_bytes());
+        // extreloff, nextrel, locreloff, nlocrel.
+        for _ in 0..4 {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        out
+    }
+
+    /// Build a one-section segment with caller-supplied
+    /// `flags` / `reserved1` / `reserved2` — used to drop a
+    /// `__TEXT,__stubs` (or pointer) section into the synthetic
+    /// image. 72 + 80 = 152 bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn segment_64_with_typed_section(
+        segname: &str,
+        sect_name: &str,
+        sect_addr: u64,
+        sect_size: u64,
+        sect_offset: u32,
+        sect_flags: u32,
+        reserved1: u32,
+        reserved2: u32,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(152);
+        out.extend_from_slice(&macho::LC_SEGMENT_64.to_le_bytes());
+        out.extend_from_slice(&152u32.to_le_bytes());
+        let mut name = [0u8; 16];
+        name[..segname.len().min(16)]
+            .copy_from_slice(&segname.as_bytes()[..segname.len().min(16)]);
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+        out.extend_from_slice(&0x4000u64.to_le_bytes()); // vmsize
+        out.extend_from_slice(&0u64.to_le_bytes()); // fileoff
+        out.extend_from_slice(&0x4000u64.to_le_bytes()); // filesize
+        out.extend_from_slice(&5u32.to_le_bytes()); // maxprot
+        out.extend_from_slice(&5u32.to_le_bytes()); // initprot
+        out.extend_from_slice(&1u32.to_le_bytes()); // nsects
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        let mut sectname_field = [0u8; 16];
+        sectname_field[..sect_name.len().min(16)]
+            .copy_from_slice(&sect_name.as_bytes()[..sect_name.len().min(16)]);
+        out.extend_from_slice(&sectname_field);
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&sect_addr.to_le_bytes());
+        out.extend_from_slice(&sect_size.to_le_bytes());
+        out.extend_from_slice(&sect_offset.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes()); // align
+        out.extend_from_slice(&0u32.to_le_bytes()); // reloff
+        out.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+        out.extend_from_slice(&sect_flags.to_le_bytes());
+        out.extend_from_slice(&reserved1.to_le_bytes());
+        out.extend_from_slice(&reserved2.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+        out
+    }
+
+    #[test]
+    fn parse_captures_section_reserved_fields() {
+        // __stubs section with reserved1=3, reserved2=12.
+        let bytes = synth_macho(&[segment_64_with_typed_section(
+            "__TEXT",
+            "__stubs",
+            0x1000,
+            0x60,
+            0x1000,
+            S_SYMBOL_STUBS,
+            3,
+            12,
+        )]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let sect = layout.section("__TEXT", "__stubs").expect("__stubs");
+        assert_eq!(sect.flags & SECTION_TYPE_MASK, S_SYMBOL_STUBS);
+        assert_eq!(sect.reserved1, 3);
+        assert_eq!(sect.reserved2, 12);
+    }
+
+    #[test]
+    fn parse_captures_dysymtab_indirect_pointers() {
+        let bytes = synth_macho(&[dysymtab(0x2000, 5)]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let dyn_ = layout.dysymtab.expect("LC_DYSYMTAB");
+        assert_eq!(dyn_.indirectsymoff, 0x2000);
+        assert_eq!(dyn_.nindirectsyms, 5);
+    }
+
+    #[test]
+    fn read_indirect_symtab_returns_entries_in_order() {
+        // Build a file with a DYSYMTAB pointing at a trailing 5-entry
+        // indirect table laid out immediately after the load commands.
+        // To keep the synth_macho helper simple, we splice the table
+        // into a fixed offset.
+        let cmds = vec![dysymtab(0, 5)]; // patch indirectsymoff after build
+        let mut bytes = synth_macho(&cmds);
+        // Indirect table at end of file: 5 × u32 = 20 bytes.
+        let indirect_off = bytes.len() as u32;
+        for v in [10u32, 11, 12, 0x8000_0000, 13] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        // Patch the LC_DYSYMTAB's indirectsymoff field.
+        // Layout: 32 (hdr) + 0 cmd-start + 8 (cmd, cmdsize) + 6*4 + 6*4
+        //       = 32 + 56 = 88.
+        bytes[88..92].copy_from_slice(&indirect_off.to_le_bytes());
+
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let table = layout.read_indirect_symtab(&bytes);
+        assert_eq!(table, vec![10, 11, 12, 0x8000_0000, 13]);
+    }
+
+    #[test]
+    fn stub_entries_walks_symbol_stubs_section() {
+        // __stubs with vaddr 0x1000, size 36 = 3 × 12-byte stubs.
+        // reserved1=2 means the first stub binds to indirect[2].
+        // Indirect table = [99, 99, 7, 8, 9] so the three stubs map
+        // to symbol-table indices 7, 8, 9 at addresses 0x1000, 0x100c,
+        // 0x1018.
+        let cmds = vec![
+            segment_64_with_typed_section(
+                "__TEXT",
+                "__stubs",
+                0x1000,
+                36,
+                0x1000,
+                S_SYMBOL_STUBS,
+                2,
+                12,
+            ),
+            dysymtab(0, 5),
+        ];
+        let mut bytes = synth_macho(&cmds);
+        let indirect_off = bytes.len() as u32;
+        for v in [99u32, 99, 7, 8, 9] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        // dysymtab is the 2nd load command (offset 32 + 152 = 184),
+        // indirectsymoff field is 56 bytes into the cmd body.
+        bytes[184 + 56..184 + 60].copy_from_slice(&indirect_off.to_le_bytes());
+
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let stubs = layout.stub_entries(&bytes);
+        assert_eq!(stubs.len(), 3);
+        assert_eq!(stubs[0], MachOStubEntry { address: 0x1000, symtab_index: 7 });
+        assert_eq!(stubs[1], MachOStubEntry { address: 0x100c, symtab_index: 8 });
+        assert_eq!(stubs[2], MachOStubEntry { address: 0x1018, symtab_index: 9 });
+    }
+
+    #[test]
+    fn stub_entries_drops_sentinel_slots() {
+        let cmds = vec![
+            segment_64_with_typed_section(
+                "__TEXT",
+                "__stubs",
+                0x2000,
+                24,
+                0x2000,
+                S_SYMBOL_STUBS,
+                0,
+                12,
+            ),
+            dysymtab(0, 2),
+        ];
+        let mut bytes = synth_macho(&cmds);
+        let indirect_off = bytes.len() as u32;
+        // Both slots are sentinels — stub_entries should return empty.
+        for v in [INDIRECT_SYMBOL_LOCAL, INDIRECT_SYMBOL_ABS] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes[184 + 56..184 + 60].copy_from_slice(&indirect_off.to_le_bytes());
+
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        assert!(layout.stub_entries(&bytes).is_empty());
+    }
+
+    #[test]
+    fn import_pointer_entries_walks_nonlazy_section() {
+        // __got with vaddr 0x3000, size 24 = 3 × 8-byte pointers.
+        // reserved1=1, indirect = [99, 21, 22, 23] → entries at
+        // 0x3000/21, 0x3008/22, 0x3010/23.
+        let cmds = vec![
+            segment_64_with_typed_section(
+                "__DATA_CONST",
+                "__got",
+                0x3000,
+                24,
+                0x3000,
+                S_NON_LAZY_SYMBOL_POINTERS,
+                1,
+                0,
+            ),
+            dysymtab(0, 4),
+        ];
+        let mut bytes = synth_macho(&cmds);
+        let indirect_off = bytes.len() as u32;
+        for v in [99u32, 21, 22, 23] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes[184 + 56..184 + 60].copy_from_slice(&indirect_off.to_le_bytes());
+
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let ptrs = layout.import_pointer_entries(&bytes);
+        assert_eq!(ptrs.len(), 3);
+        assert_eq!(ptrs[0].address, 0x3000);
+        assert_eq!(ptrs[0].symtab_index, 21);
+        assert_eq!(ptrs[2].address, 0x3010);
+        assert_eq!(ptrs[2].symtab_index, 23);
     }
 }
