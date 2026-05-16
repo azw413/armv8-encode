@@ -72,7 +72,12 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
             // The writer paths that need parsed metadata
             // explicitly check for `Some(layout)` and fall back
             // appropriately.
-            crate::container::macho_image::MachOImage::parse(bytes.to_vec()).ok()
+            let mut image =
+                crate::container::macho_image::MachOImage::parse(bytes.to_vec()).ok();
+            if let Some(img) = image.as_mut() {
+                populate_macho_stubs(img, &symbol_index_to_id);
+            }
+            image
         }
         _ => None,
     };
@@ -522,6 +527,39 @@ fn build_plt_stub_map(
     }
 
     map
+}
+
+/// Populate `MachOImage::stubs` and `MachOImage::import_pointers`
+/// from the indirect symbol table. Each entry returned by
+/// `MachOLayout::stub_entries` / `import_pointer_entries` carries a
+/// `LC_SYMTAB` index; we translate that to a neutral `SymbolId`
+/// using the same mapping `lift_symbols` built from
+/// `object::SymbolIndex`. Entries whose symbol index doesn't
+/// resolve are silently dropped — a malformed indirect table
+/// shouldn't break disassembly of the rest of the image.
+fn populate_macho_stubs(
+    image: &mut crate::container::macho_image::MachOImage,
+    symbol_index_to_id: &HashMap<object::SymbolIndex, SymbolId>,
+) {
+    // Borrow image fields disjointly: read from `layout` while
+    // writing the destination maps. We can't call `&self`-style
+    // methods on layout through `&mut image`, so snapshot the bytes
+    // separately first.
+    let bytes = image.raw_bytes.clone();
+    for entry in image.layout.stub_entries(&bytes) {
+        let neutral = symbol_index_to_id
+            .get(&object::SymbolIndex(entry.symtab_index as usize));
+        if let Some(&id) = neutral {
+            image.stubs.insert(id, entry.address);
+        }
+    }
+    for entry in image.layout.import_pointer_entries(&bytes) {
+        let neutral = symbol_index_to_id
+            .get(&object::SymbolIndex(entry.symtab_index as usize));
+        if let Some(&id) = neutral {
+            image.import_pointers.insert(id, entry.address);
+        }
+    }
 }
 
 /// Classify a parsed file into the high-level [`ContainerKind`] taxonomy

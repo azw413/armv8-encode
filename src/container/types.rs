@@ -401,19 +401,29 @@ impl Container {
 
     /// Callable address of a symbol — its defined address when
     /// the symbol has one, else its PLT stub address when one is
-    /// recorded in `elf_image.plt_stubs`. Lets the rewriter call
-    /// extern functions like `puts` from new code: the call lands
-    /// on the existing PLT stub which then routes to the runtime
-    /// linker's resolved address.
+    /// recorded in `elf_image.plt_stubs` (or the corresponding
+    /// `__stubs` entry on Mach-O). Lets the rewriter call extern
+    /// functions like `puts` from new code: the call lands on the
+    /// existing stub which then routes to the runtime linker's
+    /// resolved address.
     ///
     /// Returns `None` for symbols that are neither defined nor
-    /// PLT-bound (a true unresolved extern).
+    /// stub-bound (a true unresolved extern).
     pub fn callable_address_of_symbol(&self, id: SymbolId) -> Option<u64> {
         if let Some(addr) = self.address_of_symbol(id) {
             return Some(addr);
         }
-        let image = self.elf_image.as_ref()?;
-        image.plt_stubs.get(&id).copied()
+        if let Some(image) = self.elf_image.as_ref() {
+            if let Some(&addr) = image.plt_stubs.get(&id) {
+                return Some(addr);
+            }
+        }
+        if let Some(image) = self.macho_image.as_ref() {
+            if let Some(&addr) = image.stubs.get(&id) {
+                return Some(addr);
+            }
+        }
+        None
     }
 
     /// Merged view of all known functions: symbol-kind functions plus any
