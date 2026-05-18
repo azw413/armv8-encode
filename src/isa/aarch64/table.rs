@@ -6,8 +6,8 @@ use self::Operands::*;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-type Aarch64Insn = u32;
-type Aarch64Flags = u32;
+pub type Aarch64Insn = u32;
+pub type Aarch64Flags = u32;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Aarch64Mnemonic {
@@ -265,7 +265,7 @@ enum Aarch64OperandClass {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum Operands {
+pub enum Operands {
     Op0,
     Op1(Aarch64Opnd),
     Op2(Aarch64Opnd, Aarch64Opnd),
@@ -312,7 +312,7 @@ const fn F_OD(X: Aarch64Flags) -> Aarch64Flags {
 const F_LSE_SZ: Aarch64Flags = (1 << 27);
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum Aarch64Opnd {
+pub enum Aarch64Opnd {
     Nil,     /* no operand---MUST BE FIRST!*/
     Rd,      /* Integer register as destination.  */
     Rn,      /* Integer register as source.  */
@@ -598,19 +598,19 @@ pub struct Aarch64Opcode {
 }
 
 impl Aarch64Opcode {
-    pub(crate) fn mnemonic(&self) -> &'static str {
+    pub fn mnemonic(&self) -> &'static str {
         self.name
     }
 
-    pub(crate) fn mnemonic_id(&self) -> Aarch64Mnemonic {
+    pub fn mnemonic_id(&self) -> Aarch64Mnemonic {
         Aarch64Mnemonic::parse(self.name)
     }
 
-    pub(crate) fn base_opcode(&self) -> Aarch64Insn {
+    pub fn base_opcode(&self) -> Aarch64Insn {
         self.opcode
     }
 
-    pub(crate) fn mask(&self) -> Aarch64Insn {
+    pub fn mask(&self) -> Aarch64Insn {
         self.mask
     }
 
@@ -622,7 +622,7 @@ impl Aarch64Opcode {
         self.flags & F_CONV != 0
     }
 
-    pub(crate) fn operands(&self) -> Vec<Aarch64Opnd> {
+    pub fn operands(&self) -> Vec<Aarch64Opnd> {
         match self.operands {
             Operands::Op0 => Vec::new(),
             Operands::Op1(a) => vec![a],
@@ -633,8 +633,119 @@ impl Aarch64Opcode {
         }
     }
 
-    pub(crate) fn class_name(&self) -> &'static str {
+    pub fn class_name(&self) -> &'static str {
         self.iclass.name()
+    }
+
+    /// Bit ranges (within the 32-bit instruction word) occupied by each
+    /// operand of this opcode.
+    ///
+    /// Returned in the same order as `operands()`. Each operand maps to one
+    /// or more `Range<u8>` entries — most operands occupy a single
+    /// contiguous field, but some (e.g. shifted-register operands, split
+    /// immediates) span several disjoint ranges.
+    ///
+    /// Intended for tooling that needs to mask out operand bits when
+    /// matching encoded instructions (e.g. assemblers with wildcard
+    /// support). Ranges are expressed as `lo..hi` where `lo` is the
+    /// least-significant bit position (inclusive) and `hi` is exclusive,
+    /// matching the convention used throughout this crate's decoder
+    /// helpers.
+    ///
+    /// Note: a small number of operand kinds (mostly system/SIMD list
+    /// forms whose encodings are spread across the entire word) return an
+    /// empty range list. Callers should treat an empty list as "do not
+    /// wildcard this operand."
+    pub fn operand_bit_ranges(&self) -> Vec<Vec<std::ops::Range<u8>>> {
+        self.operands().into_iter().map(operand_bit_ranges).collect()
+    }
+}
+
+/// Bit ranges occupied by a single operand kind in the 32-bit instruction
+/// word. See [`Aarch64Opcode::operand_bit_ranges`] for the contract.
+pub fn operand_bit_ranges(kind: Aarch64Opnd) -> Vec<std::ops::Range<u8>> {
+    use Aarch64Opnd::*;
+    match kind {
+        Nil | Pairreg | Imm0 | Fpimm0 | BarrierPsb | ShllImm => Vec::new(),
+        // Rd-family: bits 0..5
+        Rd | RdSp | Rt | RtSys | Fd | Ft | Sd | Vd | VdD1 | Lvt | LvtAl | Let => vec![0..5],
+        // Rn-family: bits 5..10
+        Rn | RnSp | Fn | Sn | Vn | VnD1 | Lvn => vec![5..10],
+        // Rm-family: bits 16..21
+        Rm | Fm | Sm | Vm => vec![16..21],
+        // Other named registers
+        Rt2 | Ft2 => vec![10..15],
+        Rs => vec![16..21],
+        Ra | Fa => vec![10..15],
+
+        // Shifted / extended register variants split across Rm + shift fields.
+        RmSft => vec![16..21, 22..24, 10..16],
+        RmExt => vec![16..21, 13..16, 10..13],
+
+        // SIMD vector elements: Ed/En reuse Rd/Rn plus the imm5 size field;
+        // Em packs index bits across H/L/M positions.
+        Ed => vec![0..5, 16..21],
+        En => vec![5..10, 16..21, 11..15],
+        Em => vec![16..21, 11..12, 20..22, 22..24],
+
+        // Co-processor CRn/CRm
+        Cn => vec![12..16],
+        Cm => vec![8..12],
+
+        // Indices and shift immediates
+        Idx => vec![11..15],
+        ImmVlsl | ImmVlsr => vec![16..23],
+
+        // SIMD immediates: imm8 = abc:defgh at 16..19 + 5..10, with cmode at 12..16
+        SimdImm | SimdFpimm => vec![5..10, 16..19],
+        SimdImmSft => vec![5..10, 16..19, 12..16],
+
+        // FP immediates
+        Fpimm => vec![13..21],
+
+        // Bitfield immediates
+        Immr => vec![16..22],
+        Imms | Width => vec![10..16],
+
+        // Generic immediates / specific immediate slots
+        Imm => vec![10..22],
+        Uimm3Op1 => vec![16..19],
+        Uimm3Op2 => vec![5..8],
+        Uimm4 => vec![8..12],
+        Uimm7 => vec![5..8, 8..12],
+        BitNum => vec![19..24, 31..32],
+        Exc => vec![5..21],
+        CcmpImm => vec![16..21],
+        Nzcv => vec![0..4],
+        Limm => vec![10..23],
+        Aimm => vec![10..22, 22..23],
+        Half | ImmMov => vec![5..21, 21..23],
+        Fbits => vec![10..16],
+
+        // Condition codes
+        Cond | Cond1 => vec![12..16],
+
+        // PC-relative branch targets
+        AddrAdrp | AddrPcrel21 => vec![5..24, 29..31],
+        AddrPcrel14 => vec![5..19],
+        AddrPcrel19 => vec![5..24],
+        AddrPcrel26 => vec![0..26],
+
+        // Memory addressing forms
+        AddrSimple => vec![5..10],
+        AddrRegoff => vec![5..10, 16..21, 13..14, 12..13],
+        AddrSimm7 => vec![5..10, 15..22, 23..25],
+        AddrSimm9 | AddrSimm92 => vec![5..10, 12..21, 10..12],
+        AddrUimm12 => vec![5..10, 10..22],
+        SimdAddrSimple => vec![5..10],
+        SimdAddrPost => vec![5..10, 16..21],
+
+        // System operands
+        Sysreg => vec![5..21],
+        Pstatefield => vec![5..8, 16..19],
+        SysregAt | SysregDc | SysregIc | SysregTlbi => vec![5..8, 8..12, 12..16, 16..19],
+        Barrier | BarrierIsb => vec![8..12],
+        Prfop => vec![0..5],
     }
 }
 
@@ -9882,6 +9993,14 @@ pub(crate) fn operand_kinds() -> Vec<Aarch64Opnd> {
     }
 
     kinds
+}
+
+/// Iterates every opcode row in the static A64 opcode table.
+///
+/// Intended for clients that build their own index (e.g. an assembler /
+/// autocomplete layer) over the full table without taking a heap copy.
+pub fn iter_opcodes() -> impl Iterator<Item = &'static Aarch64Opcode> {
+    aarch64_opcode_table.iter()
 }
 
 pub(crate) fn opcodes_for_mnemonic(mnemonic: Aarch64Mnemonic) -> Vec<Aarch64Opcode> {

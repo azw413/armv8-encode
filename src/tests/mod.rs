@@ -10,6 +10,7 @@ mod data;
 mod decode;
 mod editor;
 mod encode;
+mod public_opcode_api;
 mod recursive;
 mod rewrite;
 mod sweep;

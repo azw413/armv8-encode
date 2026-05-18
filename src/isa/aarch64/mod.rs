@@ -30,7 +30,10 @@ pub use operand::{
     ShiftedRegister, VectorArrangement, VectorElement, VectorElementSize, VectorList,
     VectorRegister,
 };
-pub use table::Aarch64Mnemonic;
+pub use table::{
+    iter_opcodes, operand_bit_ranges, Aarch64Flags, Aarch64Insn, Aarch64Mnemonic, Aarch64Opcode,
+    Aarch64Opnd, Operands,
+};
 
 /// Raw AArch64 instruction word.
 pub type Word = u32;
