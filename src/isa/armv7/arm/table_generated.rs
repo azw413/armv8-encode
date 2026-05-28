@@ -646,6 +646,18 @@ impl ArmMnemonicGenerated {
             Self::Yield => "yield",
         }
     }
+
+    /// Display alias for the canonical mnemonic, when the
+    /// disassembler renders the instruction with a different
+    /// name than [`Self::as_str`]. Returns `None` for the
+    /// vast majority of ARM-mode mnemonics — the condition
+    /// suffix (`bne`, `addseq`, etc.) is driven by the
+    /// format string's `%c`, not by a separate alias
+    /// mnemonic. Provided for API symmetry with
+    /// `aarch64::Aarch64Mnemonic::display_alias`.
+    pub fn display_alias(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Auto-generated table: every ARM-mode instruction binutils 2.41 recognises.
@@ -996,10 +1008,27 @@ pub struct ArmOpcodeGenerated {
     pub format: &'static str,
 }
 
+impl ArmOpcodeGenerated {
+    /// Bit ranges (within the 32-bit instruction word) occupied
+    /// by each operand of this opcode, in left-to-right order.
+    /// Re-uses the shared format-string walker in
+    /// [`super::super::format_bit_ranges`]; ARM-mode rows are
+    /// always 32-bit, so `width_bytes` is 4.
+    pub fn operand_bit_ranges(&self) -> Vec<Vec<std::ops::Range<u8>>> {
+        super::super::format_bit_ranges::extract_operand_bit_ranges(self.format, 4)
+    }
+}
+
 /// Find the first row whose mask + opcode matches the input word.
 pub fn match_generated(word: u32) -> Option<&'static ArmOpcodeGenerated> {
     ARM_OPCODE_TABLE_GENERATED
         .iter()
         .find(|row| (word & row.mask) == row.opcode)
+}
+
+/// Iterate every ARM-mode opcode row in the static table.
+/// Mirrors `aarch64::iter_opcodes` and the Thumb equivalent.
+pub fn iter_opcodes() -> impl Iterator<Item = &'static ArmOpcodeGenerated> {
+    ARM_OPCODE_TABLE_GENERATED.iter()
 }
 

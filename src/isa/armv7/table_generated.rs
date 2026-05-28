@@ -739,6 +739,19 @@ impl ThumbMnemonicGenerated {
             Self::Yield => "yield",
         }
     }
+
+    /// Display alias for the canonical mnemonic, when the
+    /// disassembler renders the instruction with a different
+    /// name than [`Self::as_str`]. Returns `None` for the
+    /// vast majority of Thumb mnemonics — Thumb-2's condition
+    /// suffixes (`b.eq`, `bcc.n`, etc.) are driven by the
+    /// format string's `%c` and `%X`/`%x` size markers, not
+    /// by a separate alias mnemonic the way AArch64 handles
+    /// `b.eq`. Provided for API symmetry with
+    /// `aarch64::Aarch64Mnemonic::display_alias`.
+    pub fn display_alias(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Auto-generated table covering every Thumb instruction
@@ -1094,11 +1107,35 @@ pub struct ThumbOpcodeGenerated {
     pub format: &'static str,
 }
 
+impl ThumbOpcodeGenerated {
+    /// Bit ranges (within the 32-bit working word) occupied
+    /// by each operand of this opcode, in left-to-right
+    /// order. See [`super::format_bit_ranges`] for the
+    /// extraction model and word-layout convention. Empty
+    /// inner Vec means the operand's bit pattern isn't
+    /// modelled.
+    pub fn operand_bit_ranges(&self) -> Vec<Vec<std::ops::Range<u8>>> {
+        let width = match self.width {
+            ThumbWidth::Halfword => 2,
+            ThumbWidth::Word => 4,
+        };
+        super::format_bit_ranges::extract_operand_bit_ranges(self.format, width)
+    }
+}
+
 /// Find the first generated table entry whose mask + opcode
 /// matches the input word for the given width.
 pub fn match_generated(word: u32, width: ThumbWidth) -> Option<&'static ThumbOpcodeGenerated> {
     THUMB_OPCODE_TABLE_GENERATED
         .iter()
         .find(|row| row.width == width && (word & row.mask) == row.opcode)
+}
+
+/// Iterate every Thumb opcode row in the static table. Intended
+/// for external tooling that builds its own index (e.g. an
+/// assembler / autocomplete UI) over the full table without
+/// taking a heap copy. Mirrors `aarch64::iter_opcodes`.
+pub fn iter_opcodes() -> impl Iterator<Item = &'static ThumbOpcodeGenerated> {
+    THUMB_OPCODE_TABLE_GENERATED.iter()
 }
 

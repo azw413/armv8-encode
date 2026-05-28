@@ -36,6 +36,7 @@ pub mod arm;
 pub mod control_flow;
 pub mod dispatch;
 pub mod encode;
+pub mod format_bit_ranges;
 pub mod format_decode;
 pub mod isa_impl;
 pub mod macro_emit;
@@ -52,6 +53,10 @@ pub use isa_impl::{ThumbIsa, ThumbMacroKind};
 
 pub use operand::{DecodeError, EncodeError, Register, RegisterClass};
 pub use table::{ThumbMnemonic, ThumbOpcode, ThumbWidth};
+pub use table_generated::{
+    iter_opcodes, ThumbMnemonicGenerated, ThumbOpcodeGenerated,
+    THUMB_OPCODE_TABLE_GENERATED,
+};
 
 /// Read a single Thumb instruction's raw word from `bytes` at
 /// `offset`. Returns `(word, width_bytes)` so callers can

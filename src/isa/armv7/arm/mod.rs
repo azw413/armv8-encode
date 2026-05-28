@@ -31,3 +31,6 @@ pub mod sweep;
 pub mod table_generated;
 
 pub use isa_impl::{ArmIsa, ArmMacroKind};
+pub use table_generated::{
+    iter_opcodes, ArmMnemonicGenerated, ArmOpcodeGenerated, ARM_OPCODE_TABLE_GENERATED,
+};
