@@ -205,6 +205,21 @@ fn alias_implicit_bits(
             let rn = gp_register_at(operands, 1, "Rn")?;
             Ok((rn as Word) << 16)
         }
+        Some(AliasFixup::CopyDestSfToN) => {
+            // SXTB/SXTH/UXTB/UXTH share the SBFM/UBFM base opcode but have no
+            // Imm/Width operands, so the bitfield encoders that normally set
+            // N don't run. The Rd encoder sets sf (bit 31) from the
+            // destination register class; mirror that into N (bit 22) so
+            // the X-class form encodes legally (sf:N = 11).
+            let Some(DecodedOperand::Register(register)) = operands.first() else {
+                return Err(EncodeError::InvalidOperand { kind: "Rd" });
+            };
+            let n = match register.class {
+                RegisterClass::X => 1u32 << 22,
+                _ => 0,
+            };
+            Ok(n)
+        }
         None => Ok(0),
     }
 }
@@ -214,11 +229,18 @@ enum AliasFixup {
     /// The alias drops the canonical `Rm` operand and the encoder must copy
     /// `Rn` into the `Rm` field. Used by `cinc` (vs. `csinc`).
     CopyRnToRm,
+    /// SXTB/SXTH/UXTB/UXTH share their base opcode with SBFM/UBFM but
+    /// have no Imm/Width operand, so the bitfield encoders that normally
+    /// set the N bit don't run. Force N = (Rd is X-class).
+    CopyDestSfToN,
 }
 
 fn alias_fixup(mnemonic: Aarch64Mnemonic) -> Option<AliasFixup> {
-    match mnemonic {
-        Aarch64Mnemonic::Cinc => Some(AliasFixup::CopyRnToRm),
+    if matches!(mnemonic, Aarch64Mnemonic::Cinc) {
+        return Some(AliasFixup::CopyRnToRm);
+    }
+    match mnemonic.as_str() {
+        "sxtb" | "sxth" | "uxtb" | "uxth" => Some(AliasFixup::CopyDestSfToN),
         _ => None,
     }
 }

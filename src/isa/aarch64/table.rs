@@ -9839,8 +9839,8 @@ fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
     let max = if sf { 63 } else { 31 };
 
     match opcode.name {
-        "ubfiz" | "bfi" => imms < immr,
-        "ubfx" | "bfxil" => imms >= immr,
+        "ubfiz" | "sbfiz" | "bfi" => imms < immr,
+        "ubfx" | "sbfx" | "bfxil" => imms >= immr,
         "lsl" if is_bitfield_alias(opcode) => imms + 1 == immr,
         "lsr" | "asr" if is_bitfield_alias(opcode) => imms == max,
         "ror" if opcode.iclass == Aarch64InsnClass::Extract => {

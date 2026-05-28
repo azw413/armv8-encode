@@ -948,9 +948,13 @@ fn encode_bitfield_imm(
         return Err(EncodeError::InvalidOperand { kind: kind.name() });
     }
 
+    let regsize = max + 1;
     let immr = match opcode.mnemonic() {
-        "lsl" => (max + 1 - *value) & max,
-        "lsr" | "asr" | "ubfx" | "bfxil" => *value,
+        "lsl" => (regsize - *value) & max,
+        "lsr" | "asr" | "ubfx" | "sbfx" | "bfxil" => *value,
+        // Insert aliases encode immr = (-lsb) mod regsize. Symmetric to the
+        // alias-aware unwrapping in `bitfield_imm` (the decode path).
+        "bfi" | "ubfiz" | "sbfiz" => (regsize - *value) % regsize,
         _ => *value,
     };
     let imms = match opcode.mnemonic() {
@@ -979,7 +983,9 @@ fn encode_bitfield_width(
 
     let immr = ((word >> 16) & 0x3f) as i64;
     let imms = match opcode.mnemonic() {
-        "ubfx" | "bfxil" => immr + *width - 1,
+        // Extract aliases: imms = lsb + width - 1; `immr` already holds lsb.
+        "ubfx" | "sbfx" | "bfxil" => immr + *width - 1,
+        // Insert aliases (bfi/ubfiz/sbfiz) encode imms = width - 1.
         _ => *width - 1,
     };
     if imms > max {
@@ -2745,11 +2751,16 @@ fn bitfield_imm(word: Word, opcode: &Aarch64Opcode) -> i64 {
     let immr = ((word >> 16) & 0x3f) as i64;
     let imms = ((word >> 10) & 0x3f) as i64;
     let max = if (word >> 31) & 1 == 0 { 31 } else { 63 };
+    let regsize = max + 1;
 
     match opcode.mnemonic() {
         "lsl" => max - imms,
         "lsr" | "asr" => immr,
-        "ubfx" | "bfxil" => immr,
+        "ubfx" | "sbfx" | "bfxil" => immr,
+        // Insert aliases encode immr = (-lsb) mod regsize. Unwrap so callers
+        // see the semantic lsb that the disassembler renders, mirroring the
+        // alias-aware width arithmetic in `bitfield_width`.
+        "bfi" | "ubfiz" | "sbfiz" => (regsize - immr) % regsize,
         _ => immr,
     }
 }
@@ -2759,7 +2770,10 @@ fn bitfield_width(word: Word, opcode: &Aarch64Opcode) -> i64 {
     let imms = ((word >> 10) & 0x3f) as i64;
 
     match opcode.mnemonic() {
-        "ubfx" | "bfxil" => imms - immr + 1,
+        // Extract aliases: imms = lsb + width - 1, so width = imms - immr + 1.
+        // Insert aliases (bfi/ubfiz/sbfiz) encode imms = width - 1, so they
+        // correctly fall through to the imms + 1 branch.
+        "ubfx" | "sbfx" | "bfxil" => imms - immr + 1,
         _ => imms + 1,
     }
 }

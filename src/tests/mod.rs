@@ -1,6 +1,8 @@
 //! AArch64 unit tests, split by concern: operand-level encoding, decode + format
 //! comparisons against `otool`, and table/group coverage assertions.
 
+mod bitfield_aliases;
+mod bitfield_corpus;
 mod cfg;
 mod common;
 mod container;
