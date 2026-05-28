@@ -5,7 +5,9 @@
 //! require real branch encoding / fusion / emission detail
 //! `unimplemented!()` until Stage C.
 
-use super::table_generated::ArmMnemonicGenerated;
+use super::table_generated::{
+    ArmMnemonicGenerated, ArmOpcodeGenerated, ARM_OPCODE_TABLE_GENERATED,
+};
 use crate::container::RelocationKind;
 use crate::isa::armv7::operand::{DecodedOperand, EncodeError, Register};
 use crate::isa::{
@@ -81,30 +83,22 @@ impl Isa for ArmIsa {
         }
     }
 
-    fn invert_conditional_branch(_mnemonic: Self::Mnemonic) -> Option<Self::Mnemonic> {
-        // ARM-mode design issue: the condition lives in the
-        // encoded word's top 4 bits, not the mnemonic.
-        // Inverting a conditional branch is a bit-flip on the
-        // word, not a mnemonic swap. The current trait shape
-        // takes only `mnemonic` and returns a different
-        // mnemonic — there's no way to express ARM-mode
-        // inversion within it.
+    fn invert_conditional_branch(mnemonic: Self::Mnemonic) -> Option<Self::Mnemonic> {
+        // ARM mode stores the condition in the encoded word's
+        // top 4 bits, which our decoder surfaces as a
+        // `DecodedOperand::Condition(c)` slot. The trait can
+        // only return a mnemonic here, so we return `Some(B)`
+        // to signal "this is widenable" and let
+        // `encode_widened_conditional` do the operand-side
+        // cond inversion. Same approach as Thumb mode.
         //
-        // Returning `None` here means the layout pass will
-        // never widen ARM-mode conditional branches into the
-        // <inverted> + far form; it'll surface
-        // DisplacementTooLarge instead. That's acceptable for
-        // now: cross-section ARM jumps are rare, and the
-        // PLT (the main ARM-mode code in real binaries) uses
-        // unconditional ldr-pc-style indirect jumps that
-        // don't widen.
-        //
-        // A future trait revision could change the signature
-        // to `(mnemonic, operands) -> Option<(mnemonic, operands)>`
-        // so ARM mode can flip the cond bits within an
-        // operand-side condition representation — but that's
-        // a larger discussion than Stage C should resolve.
-        None
+        // For an unconditional B (Condition = AL / 14), the
+        // widened sequence degenerates to a single B + NOP
+        // pair, which `encode_widened_conditional` handles.
+        match mnemonic {
+            ArmMnemonicGenerated::B => Some(ArmMnemonicGenerated::B),
+            _ => None,
+        }
     }
 
     fn widened_conditional_size() -> u64 {
@@ -129,11 +123,68 @@ impl Isa for ArmIsa {
 
     fn encode_widened_conditional(
         _mnemonic: Self::Mnemonic,
-        _operands_template: &[Self::Operand],
-        _here: u64,
-        _far_target: u64,
+        operands_template: &[Self::Operand],
+        here: u64,
+        far_target: u64,
     ) -> Result<IsaEncodeOutput, Self::EncodeError> {
-        unimplemented!("ArmIsa::encode_widened_conditional — Stage C")
+        // ARM-mode widened conditional sequence:
+        //   B<!cond>  here+8   (skip past the unconditional)
+        //   B         far_target
+        //
+        // Each is 4 bytes; total 8 bytes — matches
+        // widened_conditional_size. The B row shared by both
+        // conditional and unconditional uses cond in the top 4
+        // encoded bits, sourced from the `Condition` operand.
+        //
+        // If the source branch is unconditional (cond == AL),
+        // inversion is vacuous: emit a single B to far_target
+        // plus an ARM NOP (mov r0, r0) to preserve the 8-byte
+        // size promise.
+        let cond = operands_template.iter().find_map(|op| match op {
+            DecodedOperand::Condition(c) => Some(*c),
+            _ => None,
+        });
+        let is_conditional = matches!(cond, Some(c) if c < 14);
+
+        let row_b = find_row(0x0a000000, 0x0e000000)
+            .expect("ARM B row must be in the opcode table");
+
+        let mut bytes = Vec::with_capacity(8);
+
+        if is_conditional {
+            let inverted_cond = (cond.unwrap() ^ 1) & 0xf;
+            let skip = here.wrapping_add(8);
+            let inv_operands = build_operands_with_overrides(
+                operands_template,
+                Some(inverted_cond),
+                Some(skip),
+            );
+            let word = super::encode::encode_with_row(row_b, &inv_operands, here)?;
+            bytes.extend_from_slice(&word.to_le_bytes());
+
+            let far_operands = vec![
+                DecodedOperand::Condition(14),
+                DecodedOperand::BranchTarget(far_target),
+            ];
+            let word = super::encode::encode_with_row(
+                row_b,
+                &far_operands,
+                here.wrapping_add(4),
+            )?;
+            bytes.extend_from_slice(&word.to_le_bytes());
+        } else {
+            // Unconditional source: emit B to far_target +
+            // ARM NOP (0xe1a00000 = mov r0, r0, the v5 canonical
+            // form).
+            let far_operands = vec![
+                DecodedOperand::Condition(14),
+                DecodedOperand::BranchTarget(far_target),
+            ];
+            let word = super::encode::encode_with_row(row_b, &far_operands, here)?;
+            bytes.extend_from_slice(&word.to_le_bytes());
+            bytes.extend_from_slice(&0xe1a0_0000u32.to_le_bytes());
+        }
+        Ok(IsaEncodeOutput { bytes })
     }
 
     fn relocation_kind_for(
@@ -184,19 +235,75 @@ impl Isa for ArmIsa {
     }
 
     fn emit_macro(
-        _macro_op: &MacroOp<Self>,
-        _here: u64,
-        _block_addresses: &[u64],
-        _container: Option<&crate::container::Container>,
-        _current_section: Option<crate::container::SectionId>,
-        _bytes: &mut Vec<u8>,
-        _relocations: &mut Vec<MacroEmittedRelocation>,
+        macro_op: &MacroOp<Self>,
+        here: u64,
+        block_addresses: &[u64],
+        container: Option<&crate::container::Container>,
+        current_section: Option<crate::container::SectionId>,
+        bytes: &mut Vec<u8>,
+        relocations: &mut Vec<MacroEmittedRelocation>,
     ) -> Result<(), MacroEmitError<Self::EncodeError>> {
-        unimplemented!("ArmIsa::emit_macro — Stage C")
+        super::macro_emit::emit_macro(
+            macro_op,
+            here,
+            block_addresses,
+            container,
+            current_section,
+            bytes,
+            relocations,
+        )
     }
 
     // instruction_source_size + macro_source_size: defaults
     // are correct for ARM mode (4 bytes per instruction).
+}
+
+/// Find a row in the static ARM opcode table by exact
+/// (opcode, mask) match. Used by `encode_widened_conditional`
+/// to pin the specific B row.
+fn find_row(opcode: u32, mask: u32) -> Option<&'static ArmOpcodeGenerated> {
+    ARM_OPCODE_TABLE_GENERATED
+        .iter()
+        .find(|row| row.opcode == opcode && row.mask == mask)
+}
+
+/// Build an operand list for the inverted-conditional branch:
+/// copy the original operands, overriding the `Condition` slot
+/// with `cond_override` and the `BranchTarget` slot with
+/// `branch_override`. If either slot is absent in the original,
+/// append the override.
+fn build_operands_with_overrides(
+    template: &[DecodedOperand],
+    cond_override: Option<u8>,
+    branch_override: Option<u64>,
+) -> Vec<DecodedOperand> {
+    let mut overrode_cond = false;
+    let mut overrode_branch = false;
+    let mut out: Vec<DecodedOperand> = template
+        .iter()
+        .map(|op| match op {
+            DecodedOperand::Condition(_) if cond_override.is_some() => {
+                overrode_cond = true;
+                DecodedOperand::Condition(cond_override.unwrap())
+            }
+            DecodedOperand::BranchTarget(_) if branch_override.is_some() => {
+                overrode_branch = true;
+                DecodedOperand::BranchTarget(branch_override.unwrap())
+            }
+            other => other.clone(),
+        })
+        .collect();
+    if let Some(c) = cond_override {
+        if !overrode_cond {
+            out.push(DecodedOperand::Condition(c));
+        }
+    }
+    if let Some(b) = branch_override {
+        if !overrode_branch {
+            out.push(DecodedOperand::BranchTarget(b));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -212,6 +319,86 @@ mod tests {
     #[test]
     fn arm_isa_satisfies_trait() {
         _assert_isa::<ArmIsa>();
+    }
+
+    #[test]
+    fn widened_conditional_for_conditional_branch_decodes_back_as_pair() {
+        let here = 0x1000u64;
+        // Far target within ARM B reach (±32 MiB).
+        let far_target = 0x80_0000u64; // 8 MiB
+        let template = vec![
+            DecodedOperand::Condition(0), // eq
+            DecodedOperand::BranchTarget(here.wrapping_add(8)),
+        ];
+        let out = <ArmIsa as Isa>::encode_widened_conditional(
+            ArmMnemonicGenerated::B,
+            &template,
+            here,
+            far_target,
+        )
+        .expect("widening encode");
+        assert_eq!(out.bytes.len(), 8, "widened conditional must be 8 bytes");
+
+        let decoded =
+            disassemble_bytes(here, &out.bytes).expect("decode widened pair");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].mnemonic, ArmMnemonicGenerated::B);
+        assert_eq!(decoded[1].mnemonic, ArmMnemonicGenerated::B);
+
+        // First branch: inverted-cond (eq → ne = 1) to here + 8.
+        let first_cond = decoded[0].operands.iter().find_map(|o| match o {
+            DecodedOperand::Condition(c) => Some(*c),
+            _ => None,
+        });
+        assert_eq!(first_cond, Some(1));
+        let first_target = decoded[0].operands.iter().find_map(|o| match o {
+            DecodedOperand::BranchTarget(a) => Some(*a),
+            _ => None,
+        });
+        assert_eq!(first_target, Some(here.wrapping_add(8)));
+
+        // Second branch: AL to far_target.
+        let second_cond = decoded[1].operands.iter().find_map(|o| match o {
+            DecodedOperand::Condition(c) => Some(*c),
+            _ => None,
+        });
+        assert_eq!(second_cond, Some(14));
+        let second_target = decoded[1].operands.iter().find_map(|o| match o {
+            DecodedOperand::BranchTarget(a) => Some(*a),
+            _ => None,
+        });
+        assert_eq!(second_target, Some(far_target));
+    }
+
+    #[test]
+    fn widened_conditional_for_unconditional_branch_is_b_plus_nop() {
+        let here = 0x1000u64;
+        let far_target = 0x40_0000u64;
+        let template = vec![
+            DecodedOperand::Condition(14), // AL
+            DecodedOperand::BranchTarget(here.wrapping_add(8)),
+        ];
+        let out = <ArmIsa as Isa>::encode_widened_conditional(
+            ArmMnemonicGenerated::B,
+            &template,
+            here,
+            far_target,
+        )
+        .expect("widening encode (unconditional)");
+        assert_eq!(out.bytes.len(), 8);
+
+        // First word: B AL to far_target. Second word:
+        // 0xe1a00000 = mov r0, r0 (ARM NOP). The disassembler's
+        // Nop row matches this exactly (table_generated.rs
+        // line 653 has the canonical 0xe1a00000).
+        let decoded = disassemble_bytes(here, &out.bytes).expect("decode");
+        assert_eq!(decoded[0].mnemonic, ArmMnemonicGenerated::B);
+        let target = decoded[0].operands.iter().find_map(|o| match o {
+            DecodedOperand::BranchTarget(a) => Some(*a),
+            _ => None,
+        });
+        assert_eq!(target, Some(far_target));
+        assert_eq!(decoded[1].mnemonic, ArmMnemonicGenerated::Nop);
     }
 
     #[test]

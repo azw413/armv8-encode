@@ -25,6 +25,7 @@ pub mod control_flow;
 pub mod encode;
 pub mod format_decode;
 pub mod isa_impl;
+pub mod macro_emit;
 pub mod recursive;
 pub mod sweep;
 pub mod table_generated;

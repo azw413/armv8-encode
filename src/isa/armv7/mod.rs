@@ -38,6 +38,7 @@ pub mod dispatch;
 pub mod encode;
 pub mod format_decode;
 pub mod isa_impl;
+pub mod macro_emit;
 pub mod neon_table_generated;
 pub mod operand;
 pub mod recursive;
