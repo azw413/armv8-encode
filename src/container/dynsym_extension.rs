@@ -238,19 +238,33 @@ pub fn insert_dynamic_tags_growing(
     prefix
 }
 
-/// Parse `.dynamic` bytes (Elf64_Dyn × N) back into a tag list.
-/// Inverse of [`encode_dynamic`]. Caller is responsible for
-/// the byte length being a multiple of 16.
-pub fn parse_dynamic(bytes: &[u8]) -> Vec<crate::container::DynamicEntry> {
+/// Parse `.dynamic` bytes back into a tag list.
+/// Inverse of [`encode_dynamic`]. `is_64` selects the entry
+/// width: ELF64 uses `Elf64_Dyn` (16 bytes), ELF32 uses
+/// `Elf32_Dyn` (8 bytes). Caller is responsible for the byte
+/// length being a multiple of the entry width.
+pub fn parse_dynamic(bytes: &[u8], is_64: bool) -> Vec<crate::container::DynamicEntry> {
     use crate::container::DynamicEntry;
+    let entry_size = if is_64 { 16 } else { 8 };
     assert!(
-        bytes.len() % 16 == 0,
-        ".dynamic byte length must be a multiple of 16",
+        bytes.len() % entry_size == 0,
+        ".dynamic byte length must be a multiple of the per-class entry size \
+         ({entry_size} for {})",
+        if is_64 { "ELF64" } else { "ELF32" },
     );
-    let mut out = Vec::with_capacity(bytes.len() / 16);
-    for chunk in bytes.chunks_exact(16) {
-        let tag = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+    let mut out = Vec::with_capacity(bytes.len() / entry_size);
+    for chunk in bytes.chunks_exact(entry_size) {
+        let (tag, value) = if is_64 {
+            (
+                u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
+                u64::from_le_bytes(chunk[8..16].try_into().unwrap()),
+            )
+        } else {
+            (
+                u32::from_le_bytes(chunk[0..4].try_into().unwrap()) as u64,
+                u32::from_le_bytes(chunk[4..8].try_into().unwrap()) as u64,
+            )
+        };
         out.push(DynamicEntry { tag, value });
     }
     out
@@ -307,13 +321,29 @@ where
     (out, removed)
 }
 
-/// Encode a `.dynamic` tag list into bytes (Elf64_Dyn × N).
-/// Each entry is 16 bytes: u64 d_tag, u64 d_un.d_val.
-pub fn encode_dynamic(entries: &[crate::container::DynamicEntry]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(entries.len() * 16);
+/// Encode a `.dynamic` tag list into bytes. `is_64` selects
+/// the entry layout: ELF64 emits `Elf64_Dyn` (16 bytes per
+/// entry — u64 d_tag + u64 d_un), ELF32 emits `Elf32_Dyn`
+/// (8 bytes per entry — u32 d_tag + u32 d_un). The DynamicEntry
+/// tag and value fields are always stored as u64 in the
+/// neutral representation; for ELF32 the writer truncates each
+/// to u32 (which is safe — tags are well within u32 and the
+/// values are either string-table offsets or vaddrs, also
+/// always within the 32-bit address space for ELF32 inputs).
+pub fn encode_dynamic(
+    entries: &[crate::container::DynamicEntry],
+    is_64: bool,
+) -> Vec<u8> {
+    let entry_size = if is_64 { 16 } else { 8 };
+    let mut out = Vec::with_capacity(entries.len() * entry_size);
     for entry in entries {
-        out.extend_from_slice(&entry.tag.to_le_bytes());
-        out.extend_from_slice(&entry.value.to_le_bytes());
+        if is_64 {
+            out.extend_from_slice(&entry.tag.to_le_bytes());
+            out.extend_from_slice(&entry.value.to_le_bytes());
+        } else {
+            out.extend_from_slice(&(entry.tag as u32).to_le_bytes());
+            out.extend_from_slice(&(entry.value as u32).to_le_bytes());
+        }
     }
     out
 }

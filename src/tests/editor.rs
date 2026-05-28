@@ -306,3 +306,236 @@ fn lift_text_section_arm_on_armv7_container_yields_arm_variant() {
     assert!(text.arm().is_some(), "expected ARM variant");
     assert!(!text.arm().unwrap().instructions().is_empty());
 }
+
+// ------------------------------------------------------------
+// Tier 3: ARMv7 ELF32 verification of the editor's format-keyed
+// methods. The `add_library_dependency` / `remove_library_dependency`
+// implementations are ISA-agnostic — they dispatch on
+// `container.format` (ELF vs Mach-O), not on architecture. These
+// tests exercise the ELF code paths against a real 32-bit ARMv7
+// fixture (libtool-checker.so) to catch any ELF32-specific bugs
+// that the aarch64 ELF64 integration tests would miss.
+
+fn libtool_checker_bytes() -> Vec<u8> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("libtool-checker.so");
+    std::fs::read(&path).expect("read libtool-checker.so")
+}
+
+/// Resolve DT_NEEDED entries against the *current* DT_STRTAB
+/// vaddr rather than the section-named `.dynstr`. After
+/// `add_library_dependency`, DT_STRTAB points at a new dynstr
+/// copy in the appended segment; the original `.dynstr` section
+/// stays in place but is orphaned. Tests need to follow the
+/// loader's resolution path (DT_STRTAB → segment vaddr) to see
+/// the real DT_NEEDED names.
+fn dt_needed_names_via_strtab(container: &Container, bytes: &[u8]) -> Vec<String> {
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    const DT_STRSZ: u64 = 10;
+    let img = container.elf_image.as_ref().expect("ElfImage");
+    let strtab_vaddr = img
+        .dynamic
+        .iter()
+        .find(|e| e.tag == DT_STRTAB)
+        .map(|e| e.value)
+        .expect("DT_STRTAB");
+    let strsz = img
+        .dynamic
+        .iter()
+        .find(|e| e.tag == DT_STRSZ)
+        .map(|e| e.value as usize)
+        .expect("DT_STRSZ");
+
+    // Find the PT_LOAD segment containing strtab_vaddr and
+    // extract the dynstr bytes from the file's loaded image.
+    let dynstr_bytes: Vec<u8> = {
+        let mut found: Option<Vec<u8>> = None;
+        for ph in &img.program_headers {
+            if ph.p_type != 1 /* PT_LOAD */ {
+                continue;
+            }
+            if strtab_vaddr >= ph.p_vaddr && strtab_vaddr < ph.p_vaddr + ph.p_filesz {
+                let off_in_seg = (strtab_vaddr - ph.p_vaddr) as usize;
+                let file_off = ph.p_offset as usize + off_in_seg;
+                let end = (file_off + strsz).min(bytes.len());
+                found = Some(bytes[file_off..end].to_vec());
+                break;
+            }
+        }
+        found.unwrap_or_else(|| img.dynstr.as_ref().expect("dynstr").bytes.clone())
+    };
+
+    img.dynamic
+        .iter()
+        .filter(|e| e.tag == DT_NEEDED)
+        .map(|e| {
+            let off = e.value as usize;
+            let end = dynstr_bytes[off..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| off + p)
+                .unwrap_or(dynstr_bytes.len());
+            std::str::from_utf8(&dynstr_bytes[off..end]).unwrap_or("?").to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn add_library_dependency_on_elf32_armv7_writes_new_dt_needed() {
+    let bytes = libtool_checker_bytes();
+    let container = Container::from_bytes(&bytes).expect("parse");
+    assert_eq!(container.architecture, Architecture::Arm);
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    editor
+        .binary
+        .add_library_dependency("libnew.so")
+        .expect("add_library_dependency");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+
+    let reparsed = Container::from_bytes(&written).expect("re-parse");
+    // Resolve via DT_STRTAB: the rewritten dynstr lives in the
+    // appended segment, not in the original .dynstr section.
+    let names = dt_needed_names_via_strtab(&reparsed, &written);
+    assert!(
+        names.iter().any(|n| n == "libnew.so"),
+        "expected libnew.so in DT_NEEDED list after add_library_dependency, got {names:?}"
+    );
+    // Existing entries must still be present.
+    let originals = dt_needed_names_via_strtab(&container, &bytes);
+    for original in &originals {
+        assert!(
+            names.iter().any(|n| n == original),
+            "original DT_NEEDED entry {original:?} dropped; got {names:?}"
+        );
+    }
+}
+
+#[test]
+fn remove_library_dependency_on_elf32_armv7_drops_dt_needed() {
+    let bytes = libtool_checker_bytes();
+    let container = Container::from_bytes(&bytes).expect("parse");
+    assert_eq!(container.architecture, Architecture::Arm);
+
+    let originals = dt_needed_names_via_strtab(&container, &bytes);
+    // Pick an existing DT_NEEDED to drop. `libm.so` is the
+    // least-likely-to-matter entry for the round-trip parse.
+    let target = originals
+        .iter()
+        .find(|n| n.as_str() == "libm.so")
+        .cloned()
+        .unwrap_or_else(|| originals.first().expect("at least one DT_NEEDED").clone());
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    editor
+        .binary
+        .remove_library_dependency(&target)
+        .expect("remove_library_dependency");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+
+    let reparsed = Container::from_bytes(&written).expect("re-parse after remove");
+    let names = dt_needed_names_via_strtab(&reparsed, &written);
+    assert!(
+        !names.iter().any(|n| n == &target),
+        "DT_NEEDED for {target:?} should have been dropped; got {names:?}"
+    );
+    // Every other original entry must still be there.
+    for original in &originals {
+        if original == &target {
+            continue;
+        }
+        assert!(
+            names.iter().any(|n| n == original),
+            "unrelated DT_NEEDED {original:?} disappeared; got {names:?}"
+        );
+    }
+}
+
+#[test]
+fn add_function_generic_thumb_appends_to_armv7_elf32() {
+    // Stage-C/D end-to-end smoke: build a Thumb body (one
+    // `bx lr` halfword), call add_function_generic::<ThumbIsa>
+    // on the ARMv7 ELF32 fixture, commit, and re-parse. The
+    // new function should appear as a global symbol whose
+    // size matches the body bytes (2).
+    use crate::isa::armv7::operand::{DecodedOperand, Register, RegisterClass};
+    use crate::isa::armv7::table_generated::ThumbMnemonicGenerated;
+    use crate::isa::armv7::ThumbIsa;
+    use crate::rewrite::ir::{RewriteInstruction as RewriteInstructionGeneric, RewriteOperand};
+
+    let bytes = libtool_checker_bytes();
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+
+    let body: Vec<RewriteInstructionGeneric<ThumbIsa>> = vec![RewriteInstructionGeneric {
+        mnemonic: ThumbMnemonicGenerated::Bx,
+        operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(Register {
+            class: RegisterClass::R,
+            index: 14, // lr
+        }))],
+        original_address: None,
+    }];
+
+    let symbol_id = editor
+        .binary
+        .add_function_generic::<ThumbIsa>("my_thumb_fn", body)
+        .expect("add_function_generic");
+
+    // The symbol must be discoverable by name via the editor's
+    // public lookup helper, confirming add_function_generic
+    // registered it in the container.
+    let addr = editor
+        .binary
+        .function_address("my_thumb_fn")
+        .expect("my_thumb_fn registered");
+    assert!(addr > 0, "function vaddr should be non-zero");
+    let _ = symbol_id;
+
+    // Commit produces a valid ELF32 that re-parses. The body
+    // bytes (`bx lr` = 0x4770 in Thumb halfword form) must
+    // appear at the assigned vaddr in the appended segment.
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let reparsed = Container::from_bytes(&written).expect("re-parse");
+    assert_eq!(reparsed.architecture, Architecture::Arm);
+
+    // Locate the PT_LOAD that contains the function vaddr and
+    // read the two bytes at that offset.
+    let img = reparsed.elf_image.as_ref().expect("ElfImage");
+    let body_bytes = img
+        .program_headers
+        .iter()
+        .find_map(|ph| {
+            if ph.p_type == 1 /* PT_LOAD */
+                && addr >= ph.p_vaddr
+                && addr < ph.p_vaddr + ph.p_filesz
+            {
+                let off = (addr - ph.p_vaddr) as usize;
+                let file_off = ph.p_offset as usize + off;
+                Some(written[file_off..file_off + 2].to_vec())
+            } else {
+                None
+            }
+        })
+        .expect("PT_LOAD containing function vaddr");
+    assert_eq!(
+        body_bytes,
+        vec![0x70, 0x47],
+        "function body should be the Thumb `bx lr` halfword (0x4770 LE)"
+    );
+}
+
+#[test]
+fn remove_library_dependency_missing_name_errors_on_elf32() {
+    let bytes = libtool_checker_bytes();
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let result = editor
+        .binary
+        .remove_library_dependency("libnothere.so");
+    assert!(matches!(
+        result,
+        Err(TextEditorError::LibraryDependencyNotFound(_))
+    ));
+}

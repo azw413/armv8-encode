@@ -57,13 +57,14 @@ use crate::rewrite::layout::{lay_out, LayoutError};
 use crate::rewrite::plan::{EditError, RewritePlan as RewritePlanGeneric};
 use crate::rewrite::EmitOutput;
 
-// AArch64-typed aliases for the editor methods that still bake
-// in aarch64-specific instruction templates (add_function,
-// add_initialiser, etc.). The generic `LiftedTextSection<I>`
-// type below works for any ISA; these aliases are kept so the
-// aarch64-only code in this file reads the same as before the
-// generification.
-type RewritePlan = RewritePlanGeneric<Aarch64Isa>;
+// AArch64-typed alias for the editor methods that bake in
+// aarch64-specific instruction templates (add_function_exported,
+// add_initialiser, etc.). The generic
+// `LiftedTextSection<I>` works for any ISA; this alias lives
+// here so the aarch64-only code reads the same as before
+// generification. `add_function` itself is generic
+// (see [`BinaryState::add_function_generic`]) and the
+// aarch64-typed `add_function` is a thin wrapper.
 type RewriteInstruction = RewriteInstructionGeneric<Aarch64Isa>;
 
 /// Errors surfaced by the [`TextEditor`] convenience layer.
@@ -1153,6 +1154,31 @@ impl BinaryState {
         name: &str,
         instructions: Vec<RewriteInstruction>,
     ) -> Result<SymbolId, TextEditorError> {
+        self.add_function_generic::<Aarch64Isa>(name, instructions)
+    }
+
+    /// Generic over the source ISA. Used directly when the
+    /// caller is rewriting ARMv7 (Thumb or ARM-mode) code; the
+    /// aarch64-typed [`Self::add_function`] is a thin wrapper.
+    ///
+    /// Notes for ARMv7 callers:
+    /// - Body sizing uses [`Isa::instruction_source_size`]
+    ///   (which is mnemonic-aware for Thumb: 2 bytes for
+    ///   halfword-only mnemonics, else 4). Mixed-width Thumb
+    ///   bodies pessimistically reserve 4 bytes per instruction
+    ///   at layout time but the encoded output uses the actual
+    ///   row's width.
+    /// - Function entry alignment stays at 4 bytes — Thumb
+    ///   entry points still need 4-byte alignment for the
+    ///   PT_LOAD to be aligned, and BL/BLX targets to Thumb
+    ///   functions encode with the low bit *set* via the
+    ///   symbol address (not the entry vaddr) — that's a
+    ///   caller responsibility.
+    pub fn add_function_generic<I: Isa>(
+        &mut self,
+        name: &str,
+        instructions: Vec<RewriteInstructionGeneric<I>>,
+    ) -> Result<SymbolId, TextEditorError> {
         if instructions.is_empty() {
             return Err(TextEditorError::EmptyFunction(name.to_string()));
         }
@@ -1169,12 +1195,15 @@ impl BinaryState {
             return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
         }
 
-        // Strict mode: bound the cumulative payload to the
-        // chosen intra-`__TEXT` free region. Each instruction
-        // is 4 bytes; up-rounding 3 covers the alignment pad
-        // we may insert for non-multiple-of-4 cumulative
-        // offsets.
-        let new_size = (instructions.len() * 4 + 3) as u64;
+        // Estimate the body's byte size for the intra-`__TEXT`
+        // capacity check. Sum per-mnemonic source sizes via the
+        // Isa trait; on aarch64 / ARM-mode this is uniformly 4,
+        // on Thumb it varies between 2 and 4.
+        let body_bytes: u64 = instructions
+            .iter()
+            .map(|insn| I::instruction_source_size(insn.mnemonic))
+            .sum();
+        let new_size = body_bytes + 3; // 3-byte alignment slop
         self.check_intra_text_capacity(new_size, &format!("add_function({name:?})"))?;
 
         // Allocate vaddr for this function. First call picks the
@@ -1215,7 +1244,7 @@ impl BinaryState {
             id: symbol_id,
             name: name.to_string(),
             address: function_vaddr,
-            size: (instructions.len() * 4) as u64,
+            size: body_bytes,
             kind: SymbolKind::Function,
             binding: crate::container::SymbolBinding::Global,
             section: None,
@@ -1225,11 +1254,11 @@ impl BinaryState {
 
         // Lay out + emit the new function at its assigned vaddr.
         // `from_instructions` runs the same fusion pass `lift`
-        // does, so caller-supplied `adrp + add` pairs against a
+        // does, so caller-supplied macro-shaped pairs against a
         // [`Target::Symbol`] page operand fuse into a
-        // [`MacroKind::LoadAddress`] macro that emit resolves at
-        // the function's final vaddr.
-        let plan = RewritePlan::from_instructions(instructions, Some(&self.container));
+        // [`I::MacroKind`] macro that emit resolves at the
+        // function's final vaddr.
+        let plan = RewritePlanGeneric::<I>::from_instructions(instructions, Some(&self.container));
 
         let layout = lay_out(&plan, function_vaddr, Some(&self.container))?;
         let output = emit(&plan, &layout, Some(&self.container))?;
@@ -2057,7 +2086,7 @@ impl BinaryState {
             ));
         }
 
-        let new_bytes = dx::encode_dynamic(&new_entries);
+        let new_bytes = dx::encode_dynamic(&new_entries, self.container.is_64());
 
         // Mutate the container in place so the writer's
         // section-bytes path emits the new contents.
@@ -2071,7 +2100,8 @@ impl BinaryState {
         // writer's reserve phase assumes section offsets are
         // stable. `remove_dynamic_entries` pads with DT_NULL to
         // keep the entry count, so `new_bytes.len()` already
-        // matches `source.len() * 16` from the input.
+        // matches the source byte length from the input
+        // (entry count × {16 for ELF64, 8 for ELF32}).
         let orig_len = self.container.sections[dynamic_idx].bytes.len();
         debug_assert_eq!(new_bytes.len(), orig_len);
         self.container.sections[dynamic_idx].bytes = new_bytes;
@@ -2306,7 +2336,7 @@ impl BinaryState {
                 &additions,
             );
         }
-        let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries);
+        let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries, container.is_64());
 
         // Stage the .dynamic override. Find its section index in
         // the container.
@@ -2506,7 +2536,7 @@ impl BinaryState {
             .position(|s| s.name == ".dynamic")
             .ok_or(TextEditorError::AppendMissingElfImage)?;
         let starting_dynamic: Vec<crate::container::DynamicEntry> = match overrides.get(&dynamic_index) {
-            Some(bytes) => dx::parse_dynamic(bytes),
+            Some(bytes) => dx::parse_dynamic(bytes, container.is_64()),
             None => image.dynamic.clone(),
         };
         let has_init_array_tag = starting_dynamic
@@ -2536,7 +2566,7 @@ impl BinaryState {
             new_dynamic_entries =
                 dx::insert_dynamic_tags_growing(&new_dynamic_entries, additions);
         }
-        let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries);
+        let new_dynamic_bytes = dx::encode_dynamic(&new_dynamic_entries, container.is_64());
         overrides.insert(dynamic_index, new_dynamic_bytes);
 
         // We've placed a new .rela.dyn in the appended segment
@@ -2631,7 +2661,7 @@ impl BinaryState {
         // without another relocation. 32 spare slots × 16 bytes
         // = 512 extra bytes; small relative to page alignment.
         const HEADROOM_NULL_SLOTS: usize = 32;
-        let entries = dx::parse_dynamic(&override_bytes);
+        let entries = dx::parse_dynamic(&override_bytes, container.is_64());
         // Strip trailing nulls and re-append exactly one
         // terminator plus the headroom slots.
         let mut grown: Vec<crate::container::DynamicEntry> = entries
@@ -2645,7 +2675,7 @@ impl BinaryState {
                 value: 0,
             });
         }
-        let relocated_bytes = dx::encode_dynamic(&grown);
+        let relocated_bytes = dx::encode_dynamic(&grown, container.is_64());
 
         let mut segment_bytes = existing_segment_bytes;
         // .dynamic entries are 8-byte aligned (Elf64_Dyn = 8B

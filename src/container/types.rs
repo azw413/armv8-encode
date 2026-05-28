@@ -340,6 +340,14 @@ pub enum FileFlags {
 }
 
 impl Container {
+    /// Whether the container uses 64-bit class. ELF: `is_64`
+    /// follows the architecture (Aarch64 → 64-bit; ARMv7 →
+    /// 32-bit). Mach-O containers are always 64-bit in this
+    /// crate (no MH_MAGIC support).
+    pub fn is_64(&self) -> bool {
+        matches!(self.architecture, Architecture::Aarch64)
+    }
+
     pub fn section(&self, id: SectionId) -> &Section {
         &self.sections[id.0]
     }
