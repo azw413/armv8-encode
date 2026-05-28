@@ -52,6 +52,7 @@ pub use dispatch::{disassemble_function_at, disassemble_functions, FunctionDisas
 pub use isa_impl::{ThumbIsa, ThumbMacroKind};
 
 pub use operand::{DecodeError, EncodeError, Register, RegisterClass};
+pub use sweep::{disassemble_bytes, ThumbDecodedInstruction, ThumbDisassembleError};
 pub use table::{ThumbMnemonic, ThumbOpcode, ThumbWidth};
 pub use table_generated::{
     iter_opcodes, ThumbMnemonicGenerated, ThumbOpcodeGenerated,
