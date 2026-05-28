@@ -54,6 +54,19 @@ impl Isa for ThumbIsa {
     type Operand = DecodedOperand;
     type EncodeError = EncodeError;
     type MacroKind = ThumbMacroKind;
+    type DecodedInstruction = super::sweep::ThumbDecodedInstruction;
+
+    fn decoded_address(insn: &Self::DecodedInstruction) -> u64 {
+        insn.address
+    }
+
+    fn decoded_mnemonic(insn: &Self::DecodedInstruction) -> Self::Mnemonic {
+        insn.mnemonic
+    }
+
+    fn decoded_operands(insn: &Self::DecodedInstruction) -> &[Self::Operand] {
+        &insn.operands
+    }
 
     fn pcrel_kind(operand: &Self::Operand) -> Option<(PcRelKind, u64)> {
         match operand {

@@ -454,7 +454,7 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
     let function_address = editor
         .binary.function_address("greet_double")
         .expect("greet_double symbol");
-    let text = editor.text.as_ref().expect("text section lifted");
+    let text = editor.text.as_ref().expect("text section lifted").aarch64().expect("aarch64 section");
     let lsl_index = text
         .instructions()
         .iter()
@@ -492,7 +492,7 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
         original_address: Some(lsl_address),
     };
     editor
-        .text.as_mut().unwrap().replace_instruction_at(lsl_address, new_instruction)
+        .text.as_mut().unwrap().aarch64_mut().unwrap().replace_instruction_at(lsl_address, new_instruction)
         .expect("replace_instruction_at");
 
     let written = editor.commit_to_bytes().expect("commit_to_bytes");
@@ -577,7 +577,7 @@ fn et_dyn_appended_function_changes_observable_output() {
         .binary.function_address("greet_double")
         .expect("greet_double symbol");
     editor
-        .text.as_mut().unwrap().replace_instruction_at(
+        .text.as_mut().unwrap().aarch64_mut().unwrap().replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,
@@ -730,7 +730,7 @@ fn et_dyn_appended_function_resolves_extern_via_dlsym() {
         .binary.function_address("greet_double")
         .expect("greet_double symbol");
     editor
-        .text.as_mut().unwrap().replace_instruction_at(
+        .text.as_mut().unwrap().aarch64_mut().unwrap().replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,
@@ -950,7 +950,7 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
         .binary.function_address("greet_double")
         .expect("greet_double symbol");
     editor
-        .text.as_mut().unwrap().replace_instruction_at(
+        .text.as_mut().unwrap().aarch64_mut().unwrap().replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,

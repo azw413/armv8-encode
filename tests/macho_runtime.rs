@@ -217,7 +217,7 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
         .binary
         .function_address("_greet_double")
         .expect("_greet_double symbol present in __text");
-    let text = editor.text.as_ref().expect("text section lifted");
+    let text = editor.text.as_ref().expect("text section lifted").aarch64().expect("aarch64 section");
     let lsl_index = text
         .instructions()
         .iter()
@@ -255,6 +255,8 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
     editor
         .text
         .as_mut()
+        .unwrap()
+        .aarch64_mut()
         .unwrap()
         .replace_instruction_at(lsl_address, new_instruction)
         .expect("replace_instruction_at");
@@ -351,6 +353,8 @@ fn et_dyn_appended_function_changes_observable_output() {
     editor
         .text
         .as_mut()
+        .unwrap()
+        .aarch64_mut()
         .unwrap()
         .replace_instruction_at(
             greet_double_addr,
@@ -478,6 +482,8 @@ fn et_dyn_appended_data_referenced_by_appended_function() {
     editor
         .text
         .as_mut()
+        .unwrap()
+        .aarch64_mut()
         .unwrap()
         .replace_instruction_at(
             greet_double_addr,

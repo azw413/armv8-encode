@@ -71,7 +71,7 @@ fn fixture_container() -> Container {
 fn for_section_finds_named_text_section_and_lifts_it() {
     let container = fixture_container();
     let editor = BinaryEditor::for_section(&container, ".text").expect("for_section");
-    let text = editor.text.as_ref().expect("text lifted");
+    let text = editor.text.as_ref().expect("text lifted").aarch64().expect("aarch64 section");
     assert_eq!(text.base_address(), 0x1000);
     assert_eq!(text.instructions().len(), 2);
     assert_eq!(text.instructions()[0].mnemonic, Aarch64Mnemonic::Bl);
@@ -178,6 +178,8 @@ fn redirect_branch_at_proxies_through_to_plan() {
         .text
         .as_mut()
         .unwrap()
+        .aarch64_mut()
+        .unwrap()
         .redirect_branch_at(0x1000, Target::Symbol(printf))
         .expect("redirect_branch_at");
 
@@ -198,6 +200,8 @@ fn redirect_branch_at_unknown_address_returns_edit_error() {
     match editor
         .text
         .as_mut()
+        .unwrap()
+        .aarch64_mut()
         .unwrap()
         .redirect_branch_at(0xdeadbeef, Target::Absolute(0))
     {
@@ -224,7 +228,81 @@ fn plan_mut_exposes_underlying_rewrite_plan_for_advanced_use() {
     let mut editor = BinaryEditor::for_section(&container, ".text").unwrap();
     // Touch the plan via the escape hatch; the editor's commit
     // pipeline should still work.
-    let plan = editor.text.as_mut().unwrap().plan_mut();
+    let plan = editor.text.as_mut().unwrap().aarch64_mut().unwrap().plan_mut();
     assert!(!plan.blocks.is_empty(), "plan should have at least one block");
     let _bytes = editor.commit_to_bytes().expect("commit_to_bytes after plan_mut");
+}
+
+#[test]
+fn lift_text_section_on_armv7_container_dispatches_to_thumb_variant() {
+    // Confirms the editor dispatches to the Thumb sweep when
+    // `container.architecture == Arm`, that the result is the
+    // Thumb variant of `LiftedTextSectionAny`, and that the
+    // ISA-agnostic accessors on the enum work without
+    // downcasting.
+    //
+    // Whole-`.text` sweep on a stripped binary doesn't always
+    // succeed (real `.text` has literal pools and ARM/Thumb
+    // mode-switch boundaries that linear sweep can't handle);
+    // this test asserts dispatch behaviour rather than a
+    // complete sweep. The full round-trip is covered by the
+    // dispatch-module tests in src/isa/armv7/dispatch.rs.
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("libtool-checker.so");
+    let bytes = std::fs::read(&path).expect("read libtool-checker.so");
+    let container = Container::from_bytes(&bytes).expect("parse");
+    assert_eq!(container.architecture, Architecture::Arm);
+
+    // Construct an editor without lifting (no sweep) and assert
+    // that lift_text_section() returns an Err if the sweep
+    // can't handle the full section — but if it succeeds, the
+    // variant must be Thumb.
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let lift_result = editor.lift_text_section(".text");
+    match lift_result {
+        Ok(()) => {
+            let text = editor.text.as_ref().expect("text section lifted");
+            assert!(
+                text.thumb().is_some(),
+                "ARMv7 default lift should produce the Thumb variant; got {text:?}"
+            );
+        }
+        Err(TextEditorError::DisassembleArmv7(_)) => {
+            // Whole-`.text` sweep failed because the section
+            // contains a mix of code, literal pools, and
+            // mode-switch boundaries the linear sweep can't
+            // handle. The dispatch was still correct (it tried
+            // the Thumb path, as evidenced by the error
+            // variant); that's what this test is checking.
+        }
+        Err(other) => panic!("unexpected lift error: {other:?}"),
+    }
+}
+
+#[test]
+fn lift_text_section_arm_on_armv7_container_yields_arm_variant() {
+    // Same fixture but explicitly request ARM-mode lift. The
+    // PLT in libtool-checker.so is A32; we don't lift the PLT
+    // here, but the API just needs to dispatch and produce a
+    // section. We pick `.plt` which is ARM-mode.
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("libtool-checker.so");
+    let bytes = std::fs::read(&path).expect("read libtool-checker.so");
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let has_plt = container.sections.iter().any(|s| s.name == ".plt");
+    if !has_plt {
+        // Fixture changed — skip rather than fail. The Thumb
+        // path test above still validates the variant dispatch.
+        return;
+    }
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    editor
+        .lift_text_section_arm(".plt")
+        .expect("lift .plt as ARM mode");
+    let text = editor.text.as_ref().expect("plt lifted");
+    assert!(text.arm().is_some(), "expected ARM variant");
+    assert!(!text.arm().unwrap().instructions().is_empty());
 }

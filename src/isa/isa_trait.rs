@@ -70,6 +70,26 @@ pub trait Isa: 'static + Sized + Debug {
     type EncodeError: Debug + 'static;
     /// ISA-specific macro-fusion kinds.
     type MacroKind: Copy + Eq + Hash + Debug + 'static;
+    /// Sweep output — what the per-ISA `disassemble_bytes`
+    /// returns. The rewrite layer caches a `Vec<DecodedInstruction>`
+    /// in `LiftedTextSection` and uses
+    /// [`Isa::decoded_address`] / [`Isa::decoded_mnemonic`] /
+    /// [`Isa::decoded_operands`] to feed the generic lift path
+    /// without knowing the concrete shape.
+    type DecodedInstruction: Clone + Debug + 'static;
+
+    // --- DecodedInstruction accessors ----------------------
+
+    /// Address of the decoded instruction.
+    fn decoded_address(insn: &Self::DecodedInstruction) -> u64;
+
+    /// Mnemonic of the decoded instruction.
+    fn decoded_mnemonic(insn: &Self::DecodedInstruction) -> Self::Mnemonic;
+
+    /// Operand slice of the decoded instruction. Borrowed so
+    /// the rewrite layer can build `DecodedRef`s without
+    /// cloning the operand vec.
+    fn decoded_operands(insn: &Self::DecodedInstruction) -> &[Self::Operand];
 
     // --- Operand introspection -----------------------------
 

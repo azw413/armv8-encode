@@ -41,9 +41,12 @@
 //!   [`Container::with_section_bytes`]).
 
 use crate::container::{
-    Container, ContainerWriteError, SectionId, Symbol, SymbolId, SymbolKind,
+    Architecture, Container, ContainerWriteError, SectionId, Symbol, SymbolId, SymbolKind,
 };
-use crate::isa::aarch64::{self, Aarch64Isa, DecodedInstruction, DisassembleError, EncodeError};
+use crate::isa::aarch64::{self, Aarch64Isa, DisassembleError, EncodeError};
+use crate::isa::armv7::arm::ArmIsa;
+use crate::isa::armv7::ThumbIsa;
+use crate::isa::Isa;
 use crate::mc::{build_cfg, ControlFlowGraph};
 use crate::rewrite::commit::commit_to_container;
 use crate::rewrite::emit::{emit, EmitError};
@@ -54,9 +57,12 @@ use crate::rewrite::layout::{lay_out, LayoutError};
 use crate::rewrite::plan::{EditError, RewritePlan as RewritePlanGeneric};
 use crate::rewrite::EmitOutput;
 
-// Editor.rs is aarch64-only. Expose convenient aliases so the
-// existing function signatures keep their old shape without
-// the `<Aarch64Isa>` suffix sprinkled everywhere.
+// AArch64-typed aliases for the editor methods that still bake
+// in aarch64-specific instruction templates (add_function,
+// add_initialiser, etc.). The generic `LiftedTextSection<I>`
+// type below works for any ISA; these aliases are kept so the
+// aarch64-only code in this file reads the same as before the
+// generification.
 type RewritePlan = RewritePlanGeneric<Aarch64Isa>;
 type RewriteInstruction = RewriteInstructionGeneric<Aarch64Isa>;
 
@@ -75,6 +81,11 @@ pub enum TextEditorError {
     /// be malformed, or it may contain non-instruction data the
     /// linear-sweep disassembler doesn't recognise.
     Disassemble(DisassembleError),
+    /// ARMv7 sweep error (Thumb or ARM mode). Held as a string
+    /// because the per-ISA error types aren't currently `Eq`
+    /// and have shapes that don't make sense to embed in the
+    /// editor's error enum verbatim.
+    DisassembleArmv7(String),
     /// An edit operation failed — see [`EditError`] for cases.
     Edit(EditError),
     /// Layout failed — see [`LayoutError`] for cases.
@@ -151,6 +162,7 @@ impl std::fmt::Display for TextEditorError {
             }
             Self::SymbolNotFound(name) => write!(f, "no symbol named {name:?}"),
             Self::Disassemble(err) => write!(f, "disassembly failed: {err:?}"),
+            Self::DisassembleArmv7(msg) => write!(f, "armv7 disassembly failed: {msg}"),
             Self::Edit(err) => write!(f, "edit failed: {err:?}"),
             Self::Layout(err) => write!(f, "layout failed: {err:?}"),
             Self::Emit(err) => write!(f, "emit failed: {err:?}"),
@@ -244,6 +256,48 @@ impl From<EncodeError> for TextEditorError {
     }
 }
 
+fn thumb_disassemble_error_to_text_editor(
+    err: crate::isa::armv7::sweep::ThumbDisassembleError,
+) -> TextEditorError {
+    TextEditorError::DisassembleArmv7(format!("{err}"))
+}
+
+fn arm_disassemble_error_to_text_editor(
+    err: crate::isa::armv7::arm::sweep::ArmDisassembleError,
+) -> TextEditorError {
+    TextEditorError::DisassembleArmv7(format!("{err}"))
+}
+
+/// Run the lay_out / emit / commit_to_container pipeline for
+/// a single lifted-text section against `container`. Generic
+/// over the ISA so all three variants of
+/// [`LiftedTextSectionAny`] share one code path.
+fn commit_lifted_section<I: Isa>(
+    section: &LiftedTextSection<I>,
+    container: &Container,
+) -> Result<(Container, EmitOutput, SectionId), TextEditorError> {
+    let layout = lay_out(&section.plan, section.base_address, Some(container))?;
+    let output: EmitOutput = emit(&section.plan, &layout, Some(container))?;
+    let updated = commit_to_container(container, section.section_id, output.clone());
+    Ok((updated, output, section.section_id))
+}
+
+/// Run the layout + emit + container-update pipeline for
+/// whichever ISA's section is lifted, returning the updated
+/// container and the EmitOutput for the appended-segment
+/// override path. Used by `commit_to_bytes`'s Some(appended)
+/// branch.
+fn commit_lifted_any(
+    text: &LiftedTextSectionAny,
+    container: &Container,
+) -> Result<(Container, EmitOutput, SectionId), TextEditorError> {
+    match text {
+        LiftedTextSectionAny::Aarch64(s) => commit_lifted_section(s, container),
+        LiftedTextSectionAny::Thumb(s) => commit_lifted_section(s, container),
+        LiftedTextSectionAny::Arm(s) => commit_lifted_section(s, container),
+    }
+}
+
 /// High-level editor for an ELF/Mach-O binary.
 ///
 /// Composes two scopes:
@@ -280,8 +334,12 @@ pub struct BinaryEditor {
     /// The currently-lifted text section, if any. Populated
     /// by [`Self::lift_text_section`]. Section-scoped methods
     /// (e.g. `replace_instruction_at`) live on
-    /// [`LiftedTextSection`] and are accessed via this field.
-    pub text: Option<LiftedTextSection>,
+    /// [`LiftedTextSection`] (now generic over `Isa`); the
+    /// variant enum [`LiftedTextSectionAny`] wraps whichever
+    /// ISA was lifted. Use the helpers
+    /// `text.as_ref()?.aarch64()` etc. to reach the per-ISA
+    /// view.
+    pub text: Option<LiftedTextSectionAny>,
 }
 
 /// Backwards-compatible alias for the old name. New code
@@ -363,19 +421,113 @@ pub struct BinaryState {
 /// [`BinaryEditor::text`] so the parent editor can hold `&mut`
 /// references to both scopes via destructuring.
 #[derive(Debug, Clone)]
-pub struct LiftedTextSection {
+pub struct LiftedTextSection<I: Isa> {
     /// Section id we're rewriting.
     section_id: SectionId,
     /// Base address the section loads at.
     base_address: u64,
     /// Decoded instructions for the section (cached so subsequent
     /// edit operations don't re-disassemble).
-    instructions: Vec<DecodedInstruction>,
+    instructions: Vec<I::DecodedInstruction>,
     /// CFG built from the instructions; lift consumes both.
     cfg: ControlFlowGraph,
     /// The mutable plan. Edit primitives delegate to this.
-    plan: RewritePlan,
+    plan: RewritePlanGeneric<I>,
 }
+
+/// Variant wrapper holding a lifted section for any supported
+/// ISA. `BinaryEditor::text` holds an `Option` of this, so the
+/// editor can dispatch on the container's architecture without
+/// the rest of `BinaryEditor` becoming generic.
+///
+/// Callers that know which ISA they're rewriting downcast via
+/// [`Self::aarch64_mut`] / [`Self::thumb_mut`] / [`Self::arm_mut`]
+/// to reach the per-ISA section-scoped methods (the rewriter's
+/// aarch64-specific helpers like `add_function` /
+/// `add_initialiser` live on `BinaryState` and operate on the
+/// AArch64 path regardless).
+#[derive(Debug, Clone)]
+pub enum LiftedTextSectionAny {
+    Aarch64(LiftedTextSection<Aarch64Isa>),
+    Thumb(LiftedTextSection<ThumbIsa>),
+    Arm(LiftedTextSection<ArmIsa>),
+}
+
+impl LiftedTextSectionAny {
+    /// AArch64-typed view. `None` if the lifted section is a
+    /// different ISA.
+    pub fn aarch64(&self) -> Option<&LiftedTextSection<Aarch64Isa>> {
+        match self {
+            Self::Aarch64(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn aarch64_mut(&mut self) -> Option<&mut LiftedTextSection<Aarch64Isa>> {
+        match self {
+            Self::Aarch64(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn thumb(&self) -> Option<&LiftedTextSection<ThumbIsa>> {
+        match self {
+            Self::Thumb(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn thumb_mut(&mut self) -> Option<&mut LiftedTextSection<ThumbIsa>> {
+        match self {
+            Self::Thumb(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn arm(&self) -> Option<&LiftedTextSection<ArmIsa>> {
+        match self {
+            Self::Arm(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn arm_mut(&mut self) -> Option<&mut LiftedTextSection<ArmIsa>> {
+        match self {
+            Self::Arm(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// ISA-agnostic accessors. Useful for read-only consumers
+    /// that just need the section id or base address (e.g. the
+    /// commit pipeline) without caring which ISA the section
+    /// was lifted as.
+    pub fn section_id(&self) -> SectionId {
+        match self {
+            Self::Aarch64(s) => s.section_id,
+            Self::Thumb(s) => s.section_id,
+            Self::Arm(s) => s.section_id,
+        }
+    }
+
+    pub fn base_address(&self) -> u64 {
+        match self {
+            Self::Aarch64(s) => s.base_address,
+            Self::Thumb(s) => s.base_address,
+            Self::Arm(s) => s.base_address,
+        }
+    }
+}
+
+// Back-compat aliases. Methods on the aarch64 variant — which
+// most existing code calls — now live on
+// `LiftedTextSection<Aarch64Isa>`. Callers using the old
+// `editor.text.as_mut().unwrap().replace_instruction_at(...)`
+// shape get a deref-style helper via
+// [`LiftedTextSectionAny::aarch64_mut`].
+//
+// `BinaryEditor::text` stores [`LiftedTextSectionAny`]; the
+// aarch64 short-form is at [`BinaryEditor::aarch64_text_mut`].
 
 /// Cumulative state for functions appended via
 /// [`TextEditor::add_function`]. Lives behind an `Option` on the
@@ -502,22 +654,104 @@ impl BinaryEditor {
             .ok_or_else(|| TextEditorError::SectionNotText {
                 name: name.to_string(),
             })?;
+        let section_id = section.id;
 
-        let instructions = aarch64::disassemble_bytes(base, code)?;
+        // Dispatch on container architecture. The IR is generic
+        // over `Isa`; per-ISA disassembly + CFG construction
+        // happens here, then the wrapped section is stored in
+        // the enum variant matching the architecture.
+        let lifted = match self.binary.container.architecture {
+            Architecture::Aarch64 => {
+                let instructions = aarch64::disassemble_bytes(base, code)?;
+                let cfg = build_cfg(&instructions);
+                let plan =
+                    RewritePlanGeneric::<Aarch64Isa>::lift_from_decoded_with_container(
+                        &cfg,
+                        &instructions,
+                        &self.binary.container,
+                    );
+                LiftedTextSectionAny::Aarch64(LiftedTextSection {
+                    section_id,
+                    base_address: base,
+                    instructions,
+                    cfg,
+                    plan,
+                })
+            }
+            Architecture::Arm => {
+                // ARMv7 container — Thumb-2 is the more common
+                // case for production code; default to Thumb
+                // sweep. Callers needing ARM-mode (A32) text
+                // lift should use [`Self::lift_text_section_arm`].
+                let instructions =
+                    crate::isa::armv7::sweep::disassemble_bytes(base, code)
+                        .map_err(thumb_disassemble_error_to_text_editor)?;
+                let cfg = build_cfg(&instructions);
+                let plan = RewritePlanGeneric::<ThumbIsa>::lift_from_decoded_with_container(
+                    &cfg,
+                    &instructions,
+                    &self.binary.container,
+                );
+                LiftedTextSectionAny::Thumb(LiftedTextSection {
+                    section_id,
+                    base_address: base,
+                    instructions,
+                    cfg,
+                    plan,
+                })
+            }
+            Architecture::Other => {
+                return Err(TextEditorError::SectionNotText {
+                    name: format!(
+                        "{name} (container architecture is unsupported)"
+                    ),
+                });
+            }
+        };
+        self.text = Some(lifted);
+        Ok(())
+    }
+
+    /// Lift the named text section as ARM-mode (A32) rather
+    /// than Thumb-2. Use this for sections (most commonly the
+    /// PLT) that the linker emits as A32 even in an
+    /// otherwise-Thumb binary. Errors if the container's
+    /// architecture isn't ARMv7.
+    pub fn lift_text_section_arm(&mut self, name: &str) -> Result<(), TextEditorError> {
+        if !matches!(self.binary.container.architecture, Architecture::Arm) {
+            return Err(TextEditorError::SectionNotText {
+                name: format!("{name} (lift_text_section_arm requires ARMv7 container)"),
+            });
+        }
+        let section = self
+            .binary
+            .container
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| TextEditorError::SectionNotFound(name.to_string()))?;
+        let (base, code) = section
+            .for_disassembly()
+            .ok_or_else(|| TextEditorError::SectionNotText {
+                name: name.to_string(),
+            })?;
+        let section_id = section.id;
+        let instructions =
+            crate::isa::armv7::arm::sweep::disassemble_bytes(base, code)
+                .map_err(arm_disassemble_error_to_text_editor)?;
         let cfg = build_cfg(&instructions);
-        let plan = RewritePlan::lift_with_container(
+        let plan = RewritePlanGeneric::<ArmIsa>::lift_from_decoded_with_container(
             &cfg,
             &instructions,
             &self.binary.container,
         );
-
-        self.text = Some(LiftedTextSection {
-            section_id: section.id,
+        self.text = Some(LiftedTextSectionAny::Arm(LiftedTextSection {
+            section_id,
             base_address: base,
             instructions,
             cfg,
             plan,
-        });
+        }));
         Ok(())
     }
 
@@ -539,7 +773,7 @@ impl BinaryEditor {
             .text
             .as_ref()
             .expect("lift_text_section before symbols_in_section")
-            .section_id;
+            .section_id();
         self.binary
             .container
             .symbols
@@ -605,23 +839,23 @@ impl BinaryState {
     }
 }
 
-impl LiftedTextSection {
+impl<I: Isa> LiftedTextSection<I> {
     /// Direct access to the underlying [`RewritePlan`]. Use this
     /// when you need to inspect or mutate the plan beyond what
     /// the editor's proxy methods expose.
-    pub fn plan_mut(&mut self) -> &mut RewritePlan {
+    pub fn plan_mut(&mut self) -> &mut RewritePlanGeneric<I> {
         &mut self.plan
     }
 
     /// Read-only view of the [`RewritePlan`].
-    pub fn plan(&self) -> &RewritePlan {
+    pub fn plan(&self) -> &RewritePlanGeneric<I> {
         &self.plan
     }
 
     /// Decoded instructions for the section, in source order.
     /// Useful when you need to know what's at a given address
     /// before deciding how to rewrite it.
-    pub fn instructions(&self) -> &[DecodedInstruction] {
+    pub fn instructions(&self) -> &[I::DecodedInstruction] {
         &self.instructions
     }
 
@@ -672,14 +906,10 @@ impl LiftedTextSection {
     /// Replace the instruction at `address` with a new one. The
     /// new instruction is provided as a [`RewriteInstruction`] so
     /// callers can express symbolic operands directly.
-    ///
-    /// This wraps the lower-level pattern of locating the op,
-    /// confirming it's a singleton instruction, and overwriting
-    /// it. For macro ops use [`Self::redirect_macro_target_at`].
     pub fn replace_instruction_at(
         &mut self,
         address: u64,
-        new_instruction: RewriteInstruction,
+        new_instruction: RewriteInstructionGeneric<I>,
     ) -> Result<(), TextEditorError> {
         let target = self
             .plan
@@ -694,7 +924,7 @@ impl LiftedTextSection {
     pub fn insert_after_address(
         &mut self,
         address: u64,
-        new_instructions: Vec<RewriteInstruction>,
+        new_instructions: Vec<RewriteInstructionGeneric<I>>,
     ) -> Result<(), TextEditorError> {
         self.plan.insert_after_address(address, new_instructions)?;
         Ok(())
@@ -2517,10 +2747,8 @@ impl BinaryEditor {
             .ok_or_else(|| TextEditorError::SectionNotFound(
                 "<no lifted text section; call lift_text_section before commit>".into(),
             ))?;
-        let layout = lay_out(&text.plan, text.base_address, Some(&self.binary.container))?;
-        let output: EmitOutput =
-            emit(&text.plan, &layout, Some(&self.binary.container))?;
-        let edited = commit_to_container(&self.binary.container, text.section_id, output);
+        let (edited, _output, _section_id) =
+            commit_lifted_any(&text, &self.binary.container)?;
         Ok(edited)
     }
 
@@ -2578,12 +2806,8 @@ impl BinaryEditor {
                 // container as-is.
                 match text {
                     Some(text) => {
-                        let layout =
-                            lay_out(&text.plan, text.base_address, Some(&binary.container))?;
-                        let output: EmitOutput =
-                            emit(&text.plan, &layout, Some(&binary.container))?;
-                        let edited =
-                            commit_to_container(&binary.container, text.section_id, output);
+                        let (edited, _output, _section_id) =
+                            commit_lifted_any(&text, &binary.container)?;
                         edited.to_bytes().map_err(TextEditorError::from)
                     }
                     None => binary.container.to_bytes().map_err(TextEditorError::from),
@@ -2599,13 +2823,10 @@ impl BinaryEditor {
                 let mut overrides = std::collections::HashMap::new();
                 let updated = match text {
                     Some(text) => {
-                        let layout =
-                            lay_out(&text.plan, text.base_address, Some(&binary.container))?;
-                        let output =
-                            emit(&text.plan, &layout, Some(&binary.container))?;
-                        let updated =
-                            commit_to_container(&binary.container, text.section_id, output);
-                        let section_index = text.section_id.0;
+                        let (updated, output, section_id_for_override) =
+                            commit_lifted_any(&text, &binary.container)?;
+                        let _ = output; // emit output captured for section override below
+                        let section_index = section_id_for_override.0;
                         overrides.insert(
                             section_index,
                             updated.sections[section_index].bytes.clone(),

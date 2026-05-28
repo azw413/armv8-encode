@@ -73,41 +73,66 @@ pub struct DecodedRef<'a, I: Isa> {
     pub operands: &'a [I::Operand],
 }
 
-impl RewritePlan<crate::isa::aarch64::Aarch64Isa> {
-    /// Convenience: lift directly from a slice of
-    /// [`crate::isa::aarch64::DecodedInstruction`] without
-    /// the caller having to build a [`DecodedRef`] vec.
-    /// AArch64-specific.
-    pub fn lift(
+impl<I: Isa> RewritePlan<I> {
+    /// Convenience: lift directly from a slice of per-ISA
+    /// `DecodedInstruction`s without the caller having to
+    /// build a [`DecodedRef`] vec. Works for any ISA via the
+    /// [`Isa::decoded_address`] / [`Isa::decoded_mnemonic`] /
+    /// [`Isa::decoded_operands`] accessors.
+    pub fn lift_from_decoded(
         cfg: &ControlFlowGraph,
-        instructions: &[crate::isa::aarch64::DecodedInstruction],
+        instructions: &[I::DecodedInstruction],
     ) -> Self {
-        let refs: Vec<DecodedRef<crate::isa::aarch64::Aarch64Isa>> = instructions
+        let refs: Vec<DecodedRef<I>> = instructions
             .iter()
             .map(|i| DecodedRef {
-                address: i.address,
-                mnemonic: i.mnemonic,
-                operands: &i.operands,
+                address: I::decoded_address(i),
+                mnemonic: I::decoded_mnemonic(i),
+                operands: I::decoded_operands(i),
             })
             .collect();
         Self::lift_inner(cfg, &refs, None)
     }
 
-    /// AArch64 convenience for [`Self::lift_with_container`].
+    /// Like [`Self::lift_from_decoded`] but threads a
+    /// [`Container`] for symbol resolution during lift.
+    pub fn lift_from_decoded_with_container(
+        cfg: &ControlFlowGraph,
+        instructions: &[I::DecodedInstruction],
+        container: &Container,
+    ) -> Self {
+        let refs: Vec<DecodedRef<I>> = instructions
+            .iter()
+            .map(|i| DecodedRef {
+                address: I::decoded_address(i),
+                mnemonic: I::decoded_mnemonic(i),
+                operands: I::decoded_operands(i),
+            })
+            .collect();
+        Self::lift_inner(cfg, &refs, Some(container))
+    }
+}
+
+impl RewritePlan<crate::isa::aarch64::Aarch64Isa> {
+    /// AArch64 convenience alias for
+    /// [`Self::lift_from_decoded`]. Preserved so callers
+    /// migrating from the pre-generic API don't have to
+    /// rename.
+    pub fn lift(
+        cfg: &ControlFlowGraph,
+        instructions: &[crate::isa::aarch64::DecodedInstruction],
+    ) -> Self {
+        Self::lift_from_decoded(cfg, instructions)
+    }
+
+    /// AArch64 convenience alias for
+    /// [`Self::lift_from_decoded_with_container`].
     pub fn lift_with_container(
         cfg: &ControlFlowGraph,
         instructions: &[crate::isa::aarch64::DecodedInstruction],
         container: &Container,
     ) -> Self {
-        let refs: Vec<DecodedRef<crate::isa::aarch64::Aarch64Isa>> = instructions
-            .iter()
-            .map(|i| DecodedRef {
-                address: i.address,
-                mnemonic: i.mnemonic,
-                operands: &i.operands,
-            })
-            .collect();
-        Self::lift_inner(cfg, &refs, Some(container))
+        Self::lift_from_decoded_with_container(cfg, instructions, container)
     }
 }
 

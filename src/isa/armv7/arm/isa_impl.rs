@@ -38,6 +38,19 @@ impl Isa for ArmIsa {
     type Operand = DecodedOperand;
     type EncodeError = EncodeError;
     type MacroKind = ArmMacroKind;
+    type DecodedInstruction = super::sweep::ArmDecodedInstruction;
+
+    fn decoded_address(insn: &Self::DecodedInstruction) -> u64 {
+        insn.address
+    }
+
+    fn decoded_mnemonic(insn: &Self::DecodedInstruction) -> Self::Mnemonic {
+        insn.mnemonic
+    }
+
+    fn decoded_operands(insn: &Self::DecodedInstruction) -> &[Self::Operand] {
+        &insn.operands
+    }
 
     fn pcrel_kind(operand: &Self::Operand) -> Option<(PcRelKind, u64)> {
         match operand {
