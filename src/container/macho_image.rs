@@ -101,6 +101,29 @@ pub struct MachOLayout {
     /// Phase-5 can update the iextdefsym/nextdefsym range
     /// when a new defined external is added.
     pub dysymtab: Option<MachODysymtab>,
+    /// Platform + minimum-OS version, as recorded by an
+    /// `LC_BUILD_VERSION` (preferred) or one of the legacy
+    /// `LC_VERSION_MIN_*` load commands. `platform` is one of
+    /// `object::macho::PLATFORM_*`; `minos` is the version
+    /// packed as `(major << 16) | (minor << 8) | patch`
+    /// (the same encoding used in the file).
+    pub build_version: Option<MachOBuildVersion>,
+}
+
+/// Platform + minimum-OS-version triple captured from either
+/// `LC_BUILD_VERSION` or one of the legacy `LC_VERSION_MIN_*`
+/// commands. The legacy commands don't carry a `platform`
+/// field directly — it's implied by the load-command id and
+/// is mapped to the corresponding `PLATFORM_*` constant here
+/// so consumers don't have to care which form the file uses.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MachOBuildVersion {
+    /// `object::macho::PLATFORM_*` value (1 = macOS, 2 = iOS, …).
+    pub platform: u32,
+    /// Minimum-OS version, packed `(major << 16) | (minor << 8) | patch`.
+    pub minos: u32,
+    /// SDK version with the same packing as `minos`. 0 if absent.
+    pub sdk: u32,
 }
 
 /// `LC_SYMTAB` parameters (offsets, counts) captured at
@@ -371,6 +394,7 @@ impl MachOLayout {
         let mut exports_trie: Option<MachOLinkeditData> = None;
         let mut symtab: Option<MachOSymtab> = None;
         let mut dysymtab: Option<MachODysymtab> = None;
+        let mut build_version: Option<MachOBuildVersion> = None;
 
         let mut cursor = load_commands_offset as usize;
         for _ in 0..ncmds {
@@ -493,6 +517,65 @@ impl MachOLayout {
                         nindirectsyms,
                     });
                 }
+                macho::LC_BUILD_VERSION => {
+                    // build_version_command: u32 cmd, cmdsize,
+                    // platform, minos, sdk, ntools. Tool entries
+                    // follow but we don't need them.
+                    if cmdsize < 24 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_BUILD_VERSION cmdsize < 24".into(),
+                        ));
+                    }
+                    let platform = u32::from_le_bytes(
+                        bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                    );
+                    let minos = u32::from_le_bytes(
+                        bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                    );
+                    let sdk = u32::from_le_bytes(
+                        bytes[cursor + 16..cursor + 20].try_into().unwrap(),
+                    );
+                    // LC_BUILD_VERSION wins over any legacy
+                    // LC_VERSION_MIN_* command if both appear.
+                    build_version = Some(MachOBuildVersion {
+                        platform,
+                        minos,
+                        sdk,
+                    });
+                }
+                macho::LC_VERSION_MIN_MACOSX
+                | macho::LC_VERSION_MIN_IPHONEOS
+                | macho::LC_VERSION_MIN_TVOS
+                | macho::LC_VERSION_MIN_WATCHOS => {
+                    // version_min_command: u32 cmd, cmdsize,
+                    // version (minos), sdk. Platform is implied
+                    // by the command id.
+                    if cmdsize < 16 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_VERSION_MIN_* cmdsize < 16".into(),
+                        ));
+                    }
+                    if build_version.is_none() {
+                        let minos = u32::from_le_bytes(
+                            bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                        );
+                        let sdk = u32::from_le_bytes(
+                            bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                        );
+                        let platform = match cmd {
+                            macho::LC_VERSION_MIN_MACOSX => macho::PLATFORM_MACOS,
+                            macho::LC_VERSION_MIN_IPHONEOS => macho::PLATFORM_IOS,
+                            macho::LC_VERSION_MIN_TVOS => macho::PLATFORM_TVOS,
+                            macho::LC_VERSION_MIN_WATCHOS => macho::PLATFORM_WATCHOS,
+                            _ => unreachable!(),
+                        };
+                        build_version = Some(MachOBuildVersion {
+                            platform,
+                            minos,
+                            sdk,
+                        });
+                    }
+                }
                 _ => {}
             }
             cursor += cmdsize;
@@ -508,6 +591,7 @@ impl MachOLayout {
             exports_trie,
             symtab,
             dysymtab,
+            build_version,
         })
     }
 
@@ -883,6 +967,28 @@ mod tests {
         out
     }
 
+    /// Build an LC_BUILD_VERSION (no tools). 24 bytes total.
+    fn build_version_cmd(platform: u32, minos: u32, sdk: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24);
+        out.extend_from_slice(&macho::LC_BUILD_VERSION.to_le_bytes());
+        out.extend_from_slice(&24u32.to_le_bytes());
+        out.extend_from_slice(&platform.to_le_bytes());
+        out.extend_from_slice(&minos.to_le_bytes());
+        out.extend_from_slice(&sdk.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // ntools
+        out
+    }
+
+    /// Build an LC_VERSION_MIN_MACOSX. 16 bytes total.
+    fn version_min_macosx(minos: u32, sdk: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&macho::LC_VERSION_MIN_MACOSX.to_le_bytes());
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&minos.to_le_bytes());
+        out.extend_from_slice(&sdk.to_le_bytes());
+        out
+    }
+
     /// Build an LC_CODE_SIGNATURE linkedit_data_command. 16
     /// bytes total.
     fn code_signature(dataoff: u32, datasize: u32) -> Vec<u8> {
@@ -969,6 +1075,51 @@ mod tests {
         let sig = layout.code_signature.expect("LC_CODE_SIGNATURE present");
         assert_eq!(sig.dataoff, 0x4000);
         assert_eq!(sig.datasize, 0x1000);
+    }
+
+    #[test]
+    fn parse_captures_build_version() {
+        // platform=PLATFORM_MACOS, minos=14.0.0, sdk=14.5.0.
+        let minos = (14u32 << 16) | (0 << 8) | 0;
+        let sdk = (14u32 << 16) | (5 << 8) | 0;
+        let bytes = synth_macho(&[
+            segment_64("__TEXT", 0x0, 0x4000, 0x0, 0x4000, 5, 5),
+            build_version_cmd(macho::PLATFORM_MACOS, minos, sdk),
+        ]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let bv = layout.build_version.expect("LC_BUILD_VERSION present");
+        assert_eq!(bv.platform, macho::PLATFORM_MACOS);
+        assert_eq!(bv.minos, minos);
+        assert_eq!(bv.sdk, sdk);
+    }
+
+    #[test]
+    fn parse_falls_back_to_legacy_version_min() {
+        let minos = (10u32 << 16) | (14 << 8) | 0;
+        let sdk = (10u32 << 16) | (15 << 8) | 0;
+        let bytes = synth_macho(&[
+            segment_64("__TEXT", 0x0, 0x4000, 0x0, 0x4000, 5, 5),
+            version_min_macosx(minos, sdk),
+        ]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let bv = layout.build_version.expect("LC_VERSION_MIN_MACOSX present");
+        assert_eq!(bv.platform, macho::PLATFORM_MACOS);
+        assert_eq!(bv.minos, minos);
+        assert_eq!(bv.sdk, sdk);
+    }
+
+    #[test]
+    fn lc_build_version_wins_over_legacy_version_min() {
+        let new_minos = (14u32 << 16) | (0 << 8) | 0;
+        let old_minos = (10u32 << 16) | (14 << 8) | 0;
+        let bytes = synth_macho(&[
+            segment_64("__TEXT", 0x0, 0x4000, 0x0, 0x4000, 5, 5),
+            version_min_macosx(old_minos, 0),
+            build_version_cmd(macho::PLATFORM_MACOS, new_minos, 0),
+        ]);
+        let layout = MachOLayout::parse(&bytes).expect("parse");
+        let bv = layout.build_version.expect("build_version present");
+        assert_eq!(bv.minos, new_minos);
     }
 
     #[test]

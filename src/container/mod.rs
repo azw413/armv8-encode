@@ -47,7 +47,10 @@ mod writer;
 pub use elf_image::{
     DynamicEntry, ElfImage, ProgramHeader, RawNoteSection, RawSectionBytes, SectionLayout,
 };
-pub use macho_image::MachOImage;
+pub use macho_image::{
+    MachOBuildVersion, MachODysymtab, MachOFreeRegion, MachOImage, MachOLayout, MachOLinkeditData,
+    MachOSection, MachOSegment, MachOStubEntry, MachOSymtab,
+};
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
     DwarfInfo, FileFlags, Function, FunctionProvenance, Relocation, RelocationId, RelocationKind,
