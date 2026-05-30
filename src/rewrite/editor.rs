@@ -1062,6 +1062,50 @@ impl BinaryState {
         self.macho_raw_byte_overrides.push((file_offset, bytes));
     }
 
+    /// Commit a modified [`crate::container::ChainedFixups`]
+    /// in one call: serialises the blob, stages it via
+    /// [`Self::commit_chained_fixups`], and *also* stages
+    /// every rewritten on-disk pointer slot at its file
+    /// offset via [`Self::stage_macho_raw_bytes`]. The two
+    /// pieces (chain starts in the blob, chain entries in the
+    /// segment bytes) must match for dyld to accept the
+    /// image; this method keeps them coherent.
+    ///
+    /// Use this in preference to manually calling
+    /// `cf.serialize()` + `commit_chained_fixups()` +
+    /// `cf.encode_into_segments()` — the manual sequence is
+    /// what this method runs internally.
+    ///
+    /// Mach-O only.
+    pub fn commit_chained_fixups_full(
+        &mut self,
+        cf: &crate::container::ChainedFixups,
+    ) -> Result<(), TextEditorError> {
+        let image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::NoChainedFixupsCommand)?;
+        let segments = image.layout.segments.clone();
+        // 1. Re-encode chain slots.
+        let slot_bytes = cf
+            .slot_bytes(&segments)
+            .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+        // 2. Serialise the blob.
+        let ser = cf
+            .serialize(&segments)
+            .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+        // 3. Stage the blob (size-check happens inside).
+        self.commit_chained_fixups(&ser.bytes)?;
+        // 4. Stage every slot byte range. Each slot is 8
+        //    bytes; the writer's raw-byte overrides happily
+        //    handle thousands of small entries.
+        for (file_off, raw) in slot_bytes {
+            self.stage_macho_raw_bytes(file_off, raw.to_vec());
+        }
+        Ok(())
+    }
+
     /// Append `payload` to the trailing padding of a Mach-O
     /// segment, returning the vaddr where the bytes will land.
     /// The bytes are staged via [`Self::stage_macho_raw_bytes`]

@@ -502,6 +502,37 @@ impl ChainedFixups {
     pub fn unchanged_imports(&self) -> bool {
         self.imports == self.original_imports
     }
+
+    /// Find every `Rebase` fixup that targets `old_vaddr` and
+    /// repoint it at `new_vaddr`. Returns the number of fixups
+    /// touched.
+    ///
+    /// The common shape for an ObjC rename-to-longer-string is:
+    ///
+    /// ```text
+    /// let new_vaddr = editor.binary.append_macho_segment_padding(
+    ///     "__DATA_CONST", b"longer_name\0")?;
+    /// cf.repoint_fixup(old_string_vaddr, new_vaddr);
+    /// ```
+    ///
+    /// `Bind` fixups are unaffected — they don't carry a vaddr
+    /// target, only an import index + addend. To rename a
+    /// bind, mutate the matching entry in `self.imports`
+    /// instead.
+    pub fn repoint_fixup(&mut self, old_vaddr: u64, new_vaddr: u64) -> usize {
+        let mut hits = 0;
+        for seg in self.segments.iter_mut() {
+            for fx in seg.fixups.iter_mut() {
+                if let FixupTarget::Rebase { target_vaddr } = &mut fx.target {
+                    if *target_vaddr == old_vaddr {
+                        *target_vaddr = new_vaddr;
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        hits
+    }
 }
 
 /// Convenience target shape — same shape as the legacy
@@ -929,6 +960,29 @@ impl ChainedFixups {
         image_bytes: &mut [u8],
         segments: &[crate::container::macho_image::MachOSegment],
     ) -> Result<(), ChainedFixupsError> {
+        for (file_off, raw) in self.slot_bytes(segments)? {
+            let off = file_off as usize;
+            if off + 8 > image_bytes.len() {
+                return Err(ChainedFixupsError::Truncated(format!(
+                    "slot at file offset {off:#x} extends past image bytes"
+                )));
+            }
+            image_bytes[off..off + 8].copy_from_slice(&raw);
+        }
+        Ok(())
+    }
+
+    /// Re-encode every fixup slot and return the resulting
+    /// `(file_offset, 8-byte word)` pairs. Same data
+    /// [`Self::encode_into_segments`] would write into a
+    /// segment buffer, but as a list — convenient for staging
+    /// the rewritten slot bytes via the editor's raw-byte
+    /// override path without holding a mutable file buffer.
+    pub fn slot_bytes(
+        &self,
+        segments: &[crate::container::macho_image::MachOSegment],
+    ) -> Result<Vec<(u64, [u8; 8])>, ChainedFixupsError> {
+        let mut out = Vec::new();
         for sf in &self.segments {
             let seg = segments
                 .get(sf.segment_index)
@@ -940,16 +994,17 @@ impl ChainedFixups {
             fixups.sort_by_key(|f| f.vaddr);
             fixups.dedup_by_key(|f| f.vaddr);
 
-            // Group by page.
+            // Group by page so the `next` delta only reaches
+            // the next fixup within the same page (chains
+            // never cross page boundaries — each page has its
+            // own start in `page_start[]`).
             let page_size = sf.page_size as u64;
             let mut by_page: HashMap<u64, Vec<&Fixup>> = HashMap::new();
             for fx in &fixups {
                 let page = (fx.vaddr - seg.vmaddr) / page_size;
                 by_page.entry(page).or_default().push(fx);
             }
-
-            for (_page, page_fixups) in by_page {
-                let mut page_fixups = page_fixups;
+            for (_page, mut page_fixups) in by_page {
                 page_fixups.sort_by_key(|f| f.vaddr);
                 for (i, fx) in page_fixups.iter().enumerate() {
                     let next_delta_bytes = if i + 1 < page_fixups.len() {
@@ -965,18 +1020,11 @@ impl ChainedFixups {
                         seg.vmaddr,
                     )?;
                     let file_off = seg.fileoff + (fx.vaddr - seg.vmaddr);
-                    let file_off = file_off as usize;
-                    if file_off + 8 > image_bytes.len() {
-                        return Err(ChainedFixupsError::FixupOutsideSegment {
-                            vaddr: fx.vaddr,
-                            segment_index: sf.segment_index,
-                        });
-                    }
-                    image_bytes[file_off..file_off + 8].copy_from_slice(&raw.to_le_bytes());
+                    out.push((file_off, raw.to_le_bytes()));
                 }
             }
         }
-        Ok(())
+        Ok(out)
     }
 }
 

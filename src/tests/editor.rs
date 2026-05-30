@@ -676,6 +676,86 @@ fn append_macho_segment_padding_writes_into_data_const_tail() {
 }
 
 #[test]
+fn commit_chained_fixups_full_round_trips_repointed_rebase() {
+    // End-to-end exercise of the grow-rename path using the
+    // two new convenience methods:
+    //
+    //   1. Read the chained-fixups view.
+    //   2. Pick an arbitrary rebase fixup and append a short
+    //      marker into __DATA_CONST segment padding.
+    //   3. Call `repoint_fixup(old, new_vaddr)` to redirect
+    //      the rebase at the new marker.
+    //   4. Call `commit_chained_fixups_full(&cf)` — the
+    //      method handles serialise + blob stage + slot byte
+    //      stage in one call.
+    //   5. Re-parse and confirm the rebase now points at the
+    //      marker vaddr.
+    use crate::container::ChainedFixups;
+
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let macho = container.macho_image.as_ref().unwrap();
+    let mut cf = ChainedFixups::read(macho).expect("read");
+
+    // Pick the first rebase fixup as the test subject.
+    let (orig_slot_vaddr, orig_target) = cf
+        .segments
+        .iter()
+        .flat_map(|s| s.fixups.iter())
+        .find_map(|fx| match fx.target {
+            crate::container::FixupTarget::Rebase { target_vaddr } => {
+                Some((fx.vaddr, target_vaddr))
+            }
+            _ => None,
+        })
+        .expect("at least one rebase fixup");
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let marker = b"renamed_target\0";
+    let new_vaddr = editor
+        .binary
+        .append_macho_segment_padding("__DATA_CONST", marker)
+        .or_else(|_| editor.binary.append_macho_segment_padding("__DATA", marker))
+        .expect("padding fits in __DATA_CONST or __DATA");
+
+    let hits = cf.repoint_fixup(orig_target, new_vaddr);
+    assert!(
+        hits > 0,
+        "repoint_fixup must touch at least the one rebase we picked"
+    );
+
+    editor
+        .binary
+        .commit_chained_fixups_full(&cf)
+        .expect("commit_chained_fixups_full");
+
+    let out = editor
+        .commit_to_bytes_unsigned()
+        .expect("commit_to_bytes_unsigned");
+    let reparsed = Container::from_bytes(&out).expect("re-parse");
+    let macho2 = reparsed.macho_image.as_ref().unwrap();
+    let cf2 = ChainedFixups::read(macho2).expect("re-read fixups");
+    // The slot that previously pointed at `orig_target` must
+    // now point at `new_vaddr`.
+    let new_target = cf2
+        .segments
+        .iter()
+        .flat_map(|s| s.fixups.iter())
+        .find(|fx| fx.vaddr == orig_slot_vaddr)
+        .map(|fx| match fx.target {
+            crate::container::FixupTarget::Rebase { target_vaddr } => target_vaddr,
+            _ => panic!("slot turned into a bind, expected rebase"),
+        })
+        .expect("slot still present after round-trip");
+    assert_eq!(
+        new_target, new_vaddr,
+        "repointed rebase must survive round-trip"
+    );
+}
+
+#[test]
 fn commit_chained_fixups_rejects_blob_too_large() {
     let Some(bytes) = macho_objc_fixture_bytes() else {
         return;
