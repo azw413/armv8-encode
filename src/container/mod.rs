@@ -37,6 +37,7 @@ mod elf_image;
 pub(crate) mod elf_writer;
 pub(crate) mod gnu_hash;
 pub mod macho_export_trie;
+pub mod chained_fixups;
 mod macho_image;
 pub mod macho_objc;
 pub mod macho_symtab;
@@ -51,6 +52,10 @@ pub use elf_image::{
 pub use macho_image::{
     MachOBuildVersion, MachODysymtab, MachOFreeRegion, MachOImage, MachOLayout, MachOLinkeditData,
     MachOSection, MachOSegment, MachOStubEntry, MachOSymtab,
+};
+pub use chained_fixups::{
+    ChainedFixups, ChainedFixupsError, ChainedImport, Fixup, FixupTarget, PointerFormat,
+    ResolvedTarget, SegmentFixups, SerializedChainedFixups,
 };
 pub use macho_objc::{
     build_chained_fixup_map, read_objc_metadata, ChainedFixupMap, ChainedFixupTarget,
