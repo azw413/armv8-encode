@@ -108,6 +108,14 @@ pub struct MachOLayout {
     /// packed as `(major << 16) | (minor << 8) | patch`
     /// (the same encoding used in the file).
     pub build_version: Option<MachOBuildVersion>,
+    /// `LC_DYLD_CHAINED_FIXUPS` data range, if present. Holds
+    /// the chained-fixups header + import table + symbol
+    /// strings, plus the `starts_in_image` / `starts_in_segment`
+    /// structures dyld follows to walk pointer chains in mapped
+    /// segments. ObjC metadata readers need this to interpret
+    /// pointer fields in `__objc_*` sections (the on-disk u64
+    /// is a packed fixup descriptor, not the pointer itself).
+    pub chained_fixups: Option<MachOLinkeditData>,
 }
 
 /// Platform + minimum-OS-version triple captured from either
@@ -395,6 +403,7 @@ impl MachOLayout {
         let mut symtab: Option<MachOSymtab> = None;
         let mut dysymtab: Option<MachODysymtab> = None;
         let mut build_version: Option<MachOBuildVersion> = None;
+        let mut chained_fixups: Option<MachOLinkeditData> = None;
 
         let mut cursor = load_commands_offset as usize;
         for _ in 0..ncmds {
@@ -517,6 +526,22 @@ impl MachOLayout {
                         nindirectsyms,
                     });
                 }
+                macho::LC_DYLD_CHAINED_FIXUPS => {
+                    // linkedit_data_command: u32 cmd, cmdsize,
+                    // u32 dataoff, u32 datasize.
+                    if cmdsize < 16 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_DYLD_CHAINED_FIXUPS cmdsize < 16".into(),
+                        ));
+                    }
+                    let dataoff =
+                        u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap())
+                            as u64;
+                    let datasize =
+                        u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap())
+                            as u64;
+                    chained_fixups = Some(MachOLinkeditData { dataoff, datasize });
+                }
                 macho::LC_BUILD_VERSION => {
                     // build_version_command: u32 cmd, cmdsize,
                     // platform, minos, sdk, ntools. Tool entries
@@ -592,6 +617,7 @@ impl MachOLayout {
             symtab,
             dysymtab,
             build_version,
+            chained_fixups,
         })
     }
 
@@ -652,6 +678,29 @@ impl MachOLayout {
         self.sections
             .iter()
             .find(|s| s.segname == segname && s.sectname == sectname)
+    }
+
+    /// Lookup the section whose `[vaddr, vaddr+size)` range
+    /// contains `vaddr`. Returns `None` if no section claims it
+    /// (e.g. the address points into segment padding, or into
+    /// `__PAGEZERO`).
+    pub fn section_containing_vaddr(&self, vaddr: u64) -> Option<&MachOSection> {
+        self.sections
+            .iter()
+            .find(|s| s.size != 0 && vaddr >= s.vaddr && vaddr < s.vaddr.saturating_add(s.size))
+    }
+
+    /// Translate a virtual address into a file offset by
+    /// finding the containing section and adding the section-
+    /// relative delta. Returns `None` for vaddrs that don't lie
+    /// inside any non-zerofill section (zerofill sections have
+    /// `file_offset == 0` and no on-disk content to read).
+    pub fn file_offset_for_vaddr(&self, vaddr: u64) -> Option<u64> {
+        let s = self.section_containing_vaddr(vaddr)?;
+        if s.file_offset == 0 {
+            return None;
+        }
+        Some(s.file_offset + (vaddr - s.vaddr))
     }
 
     /// Decode the indirect symbol table referenced by `LC_DYSYMTAB`.

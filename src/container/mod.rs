@@ -38,6 +38,7 @@ pub(crate) mod elf_writer;
 pub(crate) mod gnu_hash;
 pub mod macho_export_trie;
 mod macho_image;
+pub mod macho_objc;
 pub mod macho_symtab;
 pub(crate) mod macho_writer;
 mod reader;
@@ -50,6 +51,11 @@ pub use elf_image::{
 pub use macho_image::{
     MachOBuildVersion, MachODysymtab, MachOFreeRegion, MachOImage, MachOLayout, MachOLinkeditData,
     MachOSection, MachOSegment, MachOStubEntry, MachOSymtab,
+};
+pub use macho_objc::{
+    build_chained_fixup_map, read_objc_metadata, ChainedFixupMap, ChainedFixupTarget,
+    ObjCCategory, ObjCClass, ObjCImageInfo, ObjCIvar, ObjCMetadata, ObjCMethod, ObjCProperty,
+    ObjCProtocol, ObjCReadError,
 };
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
