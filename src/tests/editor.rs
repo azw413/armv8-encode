@@ -539,3 +539,163 @@ fn remove_library_dependency_missing_name_errors_on_elf32() {
         Err(TextEditorError::LibraryDependencyNotFound(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Mach-O chained-fixups commit path
+// ---------------------------------------------------------------------------
+
+fn macho_objc_fixture_bytes() -> Option<Vec<u8>> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/macho_objc_fixture/libgreet_objc.dylib");
+    std::fs::read(path).ok()
+}
+
+#[test]
+fn commit_to_bytes_unsigned_round_trips_macho() {
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        eprintln!("skip: fixture not present");
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let editor = BinaryEditor::new(&container).expect("editor");
+    let out = editor
+        .commit_to_bytes_unsigned()
+        .expect("commit_to_bytes_unsigned");
+    // The unsigned output must still parse as a Mach-O. dyld
+    // will refuse to load it (no valid signature) but we only
+    // care about structural validity here.
+    let _reparsed = Container::from_bytes(&out).expect("re-parse unsigned");
+}
+
+#[test]
+fn commit_chained_fixups_rewrites_objc_import_in_place() {
+    use crate::container::ChainedFixups;
+
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        eprintln!("skip: fixture not present");
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    // 1. Read the chained-fixups blob into the editable view.
+    let macho = container.macho_image.as_ref().expect("MachOImage present");
+    let mut cf = ChainedFixups::read(macho).expect("read fixups");
+
+    // 2. Rename every NSObject reference in the imports table.
+    let mut hits = 0usize;
+    for imp in cf.imports.iter_mut() {
+        if imp.symbol == "_OBJC_CLASS_$_NSObject" {
+            imp.symbol = "_OBJC_CLASS_$_MyNSObject".to_string();
+            hits += 1;
+        }
+    }
+    assert!(hits > 0, "fixture must reference NSObject");
+
+    // 3. Serialise back and stage the blob into the editor.
+    let ser = cf
+        .serialize(&macho.layout.segments)
+        .expect("serialize blob");
+    // Sanity-check the blob fits in the existing data range —
+    // string mutation of equal-length names should produce an
+    // equal-or-smaller blob.
+    let cf_lc = macho.layout.chained_fixups.expect("LC present");
+    assert!(
+        (ser.bytes.len() as u64) <= cf_lc.datasize,
+        "rewritten blob ({} bytes) should fit in existing datasize ({})",
+        ser.bytes.len(),
+        cf_lc.datasize,
+    );
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    editor
+        .binary
+        .commit_chained_fixups(&ser.bytes)
+        .expect("stage chained-fixups blob");
+
+    // 4. Commit unsigned (we're not codesigning in a unit test)
+    //    and re-parse to confirm the rename made it into the
+    //    final byte stream.
+    let out = editor
+        .commit_to_bytes_unsigned()
+        .expect("commit_to_bytes_unsigned");
+    let reparsed = Container::from_bytes(&out).expect("re-parse");
+    let macho2 = reparsed.macho_image.as_ref().expect("MachOImage present");
+    let cf2 = ChainedFixups::read(macho2).expect("read fixups from rewritten image");
+    let renamed = cf2
+        .imports
+        .iter()
+        .filter(|i| i.symbol == "_OBJC_CLASS_$_MyNSObject")
+        .count();
+    assert_eq!(
+        renamed, hits,
+        "all NSObject bind imports should be renamed in the rewritten image",
+    );
+    // Sanity: no leftover unrenamed entries.
+    let leftover = cf2
+        .imports
+        .iter()
+        .filter(|i| i.symbol == "_OBJC_CLASS_$_NSObject")
+        .count();
+    assert_eq!(leftover, 0, "no original NSObject entries should remain");
+}
+
+#[test]
+fn append_macho_segment_padding_writes_into_data_const_tail() {
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    // Append a short marker — small enough to fit in any
+    // segment's trailing padding. The exact segment depends on
+    // the linker; try __DATA_CONST first, fall back to __DATA.
+    let marker = b"_OBJC_CLASS_$_RenameMe\0";
+    let vaddr = editor
+        .binary
+        .append_macho_segment_padding("__DATA_CONST", marker)
+        .or_else(|_| editor.binary.append_macho_segment_padding("__DATA", marker))
+        .expect("at least one __DATA* segment has tail padding");
+    // Commit unsigned and re-parse; the marker must land at the
+    // returned vaddr in the rewritten image.
+    let out = editor
+        .commit_to_bytes_unsigned()
+        .expect("commit_to_bytes_unsigned");
+    let reparsed = Container::from_bytes(&out).expect("re-parse");
+    let macho = reparsed.macho_image.as_ref().unwrap();
+    // Locate the file offset via the containing segment — the
+    // marker is in segment padding, not inside any section, so
+    // file_offset_for_vaddr (which only resolves into section
+    // ranges) wouldn't find it.
+    let seg = macho
+        .layout
+        .segments
+        .iter()
+        .find(|s| vaddr >= s.vmaddr && vaddr < s.vmaddr + s.vmsize)
+        .expect("vaddr inside a segment");
+    let off = (seg.fileoff + (vaddr - seg.vmaddr)) as usize;
+    assert_eq!(&out[off..off + marker.len()], marker);
+}
+
+#[test]
+fn commit_chained_fixups_rejects_blob_too_large() {
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let macho = container.macho_image.as_ref().unwrap();
+    let cf = macho.layout.chained_fixups.unwrap();
+    // A blob one byte bigger than the existing datasize must
+    // be rejected.
+    let oversized = vec![0u8; (cf.datasize as usize) + 1];
+    let err = editor
+        .binary
+        .commit_chained_fixups(&oversized)
+        .expect_err("oversized blob must error");
+    assert!(
+        matches!(
+            err,
+            TextEditorError::ChainedFixupsBlobTooLarge { .. }
+        ),
+        "expected ChainedFixupsBlobTooLarge, got {err:?}",
+    );
+}

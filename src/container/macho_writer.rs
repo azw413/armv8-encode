@@ -76,40 +76,91 @@ impl AppendedSegment {
     }
 }
 
+/// Options for the Mach-O writer. Defaults reproduce the
+/// historical [`write`] behaviour: ad-hoc resign, no extra
+/// byte overrides.
+#[derive(Debug, Clone, Default)]
+pub struct MachOWriteOptions {
+    /// Re-sign the output via `codesign -s - --force`. Set
+    /// false to emit an unsigned binary — useful when the
+    /// caller wants to defer signing or apply a real
+    /// signature out-of-band. macOS will refuse to load an
+    /// unsigned arm64 dylib without an ad-hoc-or-better
+    /// signature; downstream tooling is expected to sign.
+    pub sign: bool,
+    /// Verbatim byte overrides applied after section overrides
+    /// and before signing, at fixed absolute file offsets.
+    /// Each entry is `(file_offset, bytes)`. The writer
+    /// validates the range fits in the output and copies the
+    /// bytes verbatim. Used for caller-managed structures the
+    /// neutral container model doesn't represent — e.g. a
+    /// rewritten `LC_DYLD_CHAINED_FIXUPS` blob.
+    pub raw_byte_overrides: Vec<(u64, Vec<u8>)>,
+}
+
+impl MachOWriteOptions {
+    /// Construct the historical default (sign=true, no
+    /// raw overrides). Equivalent to `MachOWriteOptions {
+    /// sign: true, ..Default::default() }`.
+    pub fn signed_default() -> Self {
+        Self {
+            sign: true,
+            raw_byte_overrides: Vec::new(),
+        }
+    }
+}
+
 /// Build a Mach-O byte stream that round-trips the input,
 /// applying any pending section-byte overrides at their
 /// original file offsets, then re-signing the result ad-hoc
 /// via `codesign`.
 pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
+    write_with_options(container, &MachOWriteOptions::signed_default())
+}
+
+/// Same as [`write`] but with explicit options. Lets callers
+/// skip signing or splice raw-byte overrides into the output
+/// (e.g. a rewritten `LC_DYLD_CHAINED_FIXUPS` blob).
+pub fn write_with_options(
+    container: &Container,
+    options: &MachOWriteOptions,
+) -> Result<Vec<u8>, ContainerWriteError> {
     let image = container
         .macho_image
         .as_ref()
         .ok_or(ContainerWriteError::ElfImageMissing)?;
     let mut bytes = image.raw_bytes.clone();
 
-    // Apply section-byte overrides. For Phase 1 we honour only
-    // sections whose neutral bytes differ from the original
-    // file content — i.e. anything the caller modified via
-    // `with_section_bytes` or the rewriter pipeline. The match
-    // criterion is "the section has a non-zero file offset
-    // and the new bytes are the same length as the captured
-    // ones" — a length mismatch indicates a length-changing
-    // edit which Phase 1 doesn't support.
-    //
-    // We discover original file offsets from the section's
-    // `.address` plus the segment's vmaddr→fileoff mapping —
-    // but the neutral container model doesn't carry that
-    // mapping yet. As a pragmatic stand-in for Phase 1, find
-    // the section's bytes inside the captured raw file by
-    // scanning the load commands for matching vmaddrs.
     apply_section_overrides(container, image, &mut bytes)?;
+    apply_raw_byte_overrides(&mut bytes, &options.raw_byte_overrides)?;
 
-    // Re-sign via `codesign -s -`. The command operates on a
-    // file path, so we round-trip through a tempfile in the
-    // OS temp dir.
-    sign_ad_hoc(&mut bytes)?;
+    if options.sign {
+        sign_ad_hoc(&mut bytes)?;
+    }
 
     Ok(bytes)
+}
+
+/// Apply caller-staged absolute-file-offset byte overrides.
+/// Each override must fit entirely within the current output.
+fn apply_raw_byte_overrides(
+    out: &mut Vec<u8>,
+    overrides: &[(u64, Vec<u8>)],
+) -> Result<(), ContainerWriteError> {
+    for (offset, payload) in overrides {
+        let start = *offset as usize;
+        let end = start + payload.len();
+        if end > out.len() {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "Mach-O raw_byte_override at file offset {offset:#x} ({} bytes) \
+                 extends past output size ({} bytes)",
+                payload.len(),
+                out.len(),
+            )));
+        }
+        out[start..end].copy_from_slice(payload);
+    }
+    Ok(())
 }
 
 /// For each container section whose bytes differ from the
@@ -272,6 +323,27 @@ pub fn write_with_appended_segment(
     section_overrides: &[(usize, Vec<u8>)],
     exports: &[MachOExportRequest],
     library_deps: &[String],
+) -> Result<Vec<u8>, ContainerWriteError> {
+    write_with_appended_segment_opts(
+        container,
+        appended,
+        section_overrides,
+        exports,
+        library_deps,
+        &MachOWriteOptions::signed_default(),
+    )
+}
+
+/// Same as [`write_with_appended_segment`] but with explicit
+/// options. Lets callers skip signing or splice raw-byte
+/// overrides into the output past the append-segment writer.
+pub fn write_with_appended_segment_opts(
+    container: &Container,
+    appended: AppendedSegment,
+    section_overrides: &[(usize, Vec<u8>)],
+    exports: &[MachOExportRequest],
+    library_deps: &[String],
+    options: &MachOWriteOptions,
 ) -> Result<Vec<u8>, ContainerWriteError> {
     let image = container
         .macho_image
@@ -498,7 +570,10 @@ pub fn write_with_appended_segment(
     // (e.g. "appended segments must come from the linker"),
     // and the resulting signature is still cryptographically
     // valid; dyld accepts it and `codesign --verify` passes.
-    sign_ad_hoc(&mut bytes)?;
+    apply_raw_byte_overrides(&mut bytes, &options.raw_byte_overrides)?;
+    if options.sign {
+        sign_ad_hoc(&mut bytes)?;
+    }
 
     Ok(bytes)
 }
@@ -843,6 +918,22 @@ pub fn write_with_intra_text_append(
     appended: IntraTextAppend,
     section_overrides: &[(usize, Vec<u8>)],
 ) -> Result<Vec<u8>, ContainerWriteError> {
+    write_with_intra_text_append_opts(
+        container,
+        appended,
+        section_overrides,
+        &MachOWriteOptions::signed_default(),
+    )
+}
+
+/// Same as [`write_with_intra_text_append`] but with explicit
+/// options.
+pub fn write_with_intra_text_append_opts(
+    container: &Container,
+    appended: IntraTextAppend,
+    section_overrides: &[(usize, Vec<u8>)],
+    options: &MachOWriteOptions,
+) -> Result<Vec<u8>, ContainerWriteError> {
     let image = container
         .macho_image
         .as_ref()
@@ -924,7 +1015,10 @@ pub fn write_with_intra_text_append(
     // existing signature blob; segment offsets and __LINKEDIT
     // are unchanged, so it's the simple case (same as the
     // round-trip path).
-    sign_ad_hoc(&mut bytes)?;
+    apply_raw_byte_overrides(&mut bytes, &options.raw_byte_overrides)?;
+    if options.sign {
+        sign_ad_hoc(&mut bytes)?;
+    }
 
     Ok(bytes)
 }

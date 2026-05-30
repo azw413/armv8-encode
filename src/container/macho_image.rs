@@ -262,6 +262,54 @@ impl MachOLayout {
         out
     }
 
+    /// Same shape as [`Self::text_free_regions`] but for any
+    /// segment by name (`"__DATA_CONST"`, `"__DATA"`, etc.).
+    /// Used by callers that want to splice short payloads into
+    /// segment padding rather than appending a fresh segment
+    /// — e.g. growing `__objc_classname` for a longer class
+    /// name. Returns an empty vec if the segment has no
+    /// declared free space or doesn't exist.
+    pub fn segment_free_regions(&self, segname: &str) -> Vec<MachOFreeRegion> {
+        let Some(seg) = self.segments.iter().find(|s| s.name == segname) else {
+            return Vec::new();
+        };
+        let mut sections: Vec<&MachOSection> = self
+            .sections
+            .iter()
+            .filter(|s| s.segname == segname && s.file_offset > 0)
+            .collect();
+        sections.sort_by_key(|s| s.file_offset);
+
+        let mut out = Vec::new();
+        let mut cursor_file = seg.fileoff;
+        let mut cursor_vaddr = seg.vmaddr;
+        for section in &sections {
+            if section.file_offset > cursor_file {
+                let gap = section.file_offset - cursor_file;
+                if cursor_file > seg.fileoff {
+                    out.push(MachOFreeRegion {
+                        vaddr: cursor_vaddr,
+                        file_offset: cursor_file,
+                        size: gap,
+                        segment_name: segname.to_string(),
+                    });
+                }
+            }
+            cursor_file = section.file_offset + section.size;
+            cursor_vaddr = section.vaddr + section.size;
+        }
+        let seg_file_end = seg.fileoff + seg.filesize;
+        if cursor_file < seg_file_end {
+            out.push(MachOFreeRegion {
+                vaddr: cursor_vaddr,
+                file_offset: cursor_file,
+                size: seg_file_end - cursor_file,
+                segment_name: segname.to_string(),
+            });
+        }
+        out
+    }
+
     /// Best-fit allocate `bytes_needed` (aligned to
     /// `align_to`) inside `__TEXT`'s free regions. Returns
     /// the chosen `(vaddr, file_offset)`, or `None` if no

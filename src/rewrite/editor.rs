@@ -146,6 +146,16 @@ pub enum TextEditorError {
     /// rejection so callers can identify which add_*
     /// invocation crossed the line.
     WouldCreateNewSegment { reason: String },
+    /// `commit_chained_fixups` was called against an input
+    /// that doesn't have an `LC_DYLD_CHAINED_FIXUPS` load
+    /// command, so there's nowhere to land the blob.
+    NoChainedFixupsCommand,
+    /// `commit_chained_fixups` was called with a blob that
+    /// doesn't fit in the existing `LC_DYLD_CHAINED_FIXUPS`
+    /// data range. Growing the range requires moving every
+    /// later `__LINKEDIT` chunk plus a resign; deferred to a
+    /// future grow path.
+    ChainedFixupsBlobTooLarge { new_size: u64, capacity: u64 },
     /// `remove_library_dependency` was called with a name that
     /// isn't present in the input's dependency list (no
     /// `DT_NEEDED` tag on ELF / no `LC_LOAD_DYLIB` on Mach-O
@@ -214,6 +224,18 @@ impl std::fmt::Display for TextEditorError {
                 f,
                 "remove_library_dependency: no DT_NEEDED / LC_LOAD_DYLIB \
                  entry matches {name:?}",
+            ),
+            Self::NoChainedFixupsCommand => write!(
+                f,
+                "commit_chained_fixups: input has no LC_DYLD_CHAINED_FIXUPS \
+                 load command — nothing to overwrite",
+            ),
+            Self::ChainedFixupsBlobTooLarge { new_size, capacity } => write!(
+                f,
+                "commit_chained_fixups: new blob is {new_size} bytes but the \
+                 existing LC_DYLD_CHAINED_FIXUPS reserves only {capacity}; \
+                 growing the range requires a __LINKEDIT shift which this \
+                 path doesn't yet support",
             ),
         }
     }
@@ -412,6 +434,15 @@ pub struct BinaryState {
     /// for ELF, where appended PT_LOAD is the standard
     /// pattern, the flag is silently ignored.
     no_new_segments: bool,
+    /// Caller-staged absolute-file-offset byte overrides
+    /// passed to the Mach-O writer verbatim. Used by
+    /// [`Self::commit_chained_fixups`] (and similar future
+    /// methods) to splice a freshly-serialised blob into the
+    /// output at a known file offset without going through the
+    /// neutral container model — there's no Container concept
+    /// for "the LC_DYLD_CHAINED_FIXUPS blob," so this is the
+    /// least-invasive way to land it.
+    macho_raw_byte_overrides: Vec<(u64, Vec<u8>)>,
 }
 
 /// A text section lifted into editable IR form.
@@ -628,6 +659,7 @@ impl BinaryEditor {
                 pending_library_deps: Vec::new(),
                 force_segment_placement: false,
                 no_new_segments: false,
+                macho_raw_byte_overrides: Vec::new(),
             },
             text: None,
         })
@@ -970,6 +1002,111 @@ impl BinaryState {
     /// editor should construct a fresh one.
     pub fn prohibit_new_segments(&mut self) {
         self.no_new_segments = true;
+    }
+
+    /// Stage a freshly-serialised `LC_DYLD_CHAINED_FIXUPS`
+    /// blob to be written into the output at commit time.
+    ///
+    /// The new blob is placed at the existing load command's
+    /// `dataoff`, overwriting the original. The blob must fit
+    /// in the existing data range — i.e. `blob.len() <=
+    /// LC_DYLD_CHAINED_FIXUPS.datasize`. Smaller blobs are
+    /// fine: the tail is zero-padded by the serialiser.
+    /// Larger blobs return
+    /// [`TextEditorError::ChainedFixupsBlobTooLarge`].
+    ///
+    /// The companion in-segment chain entries (the on-disk
+    /// pointer slots themselves) must be rewritten separately
+    /// by the caller via
+    /// [`crate::container::ChainedFixups::encode_into_segments`],
+    /// applied as section-byte overrides on the segments whose
+    /// fixup slots changed. The blob and the slots have to
+    /// match for dyld to accept the binary.
+    ///
+    /// Mach-O only — ELF doesn't have chained fixups.
+    pub fn commit_chained_fixups(
+        &mut self,
+        blob: &[u8],
+    ) -> Result<(), TextEditorError> {
+        let image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::NoChainedFixupsCommand)?;
+        let cf = image
+            .layout
+            .chained_fixups
+            .ok_or(TextEditorError::NoChainedFixupsCommand)?;
+        if blob.len() as u64 > cf.datasize {
+            return Err(TextEditorError::ChainedFixupsBlobTooLarge {
+                new_size: blob.len() as u64,
+                capacity: cf.datasize,
+            });
+        }
+        // Pad with zeros up to the original datasize so the
+        // unused tail bytes don't carry stale chain data.
+        let mut padded = blob.to_vec();
+        padded.resize(cf.datasize as usize, 0);
+        self.macho_raw_byte_overrides.push((cf.dataoff, padded));
+        Ok(())
+    }
+
+    /// Stage a verbatim byte override at an absolute file
+    /// offset in the Mach-O output. Lower-level than
+    /// [`Self::commit_chained_fixups`]; the caller is
+    /// responsible for ensuring the bytes are well-formed and
+    /// fit at the offset. Used to splice rewritten on-disk
+    /// pointer slots (the chain entries themselves) into the
+    /// segment bytes after editing a `ChainedFixups`.
+    pub fn stage_macho_raw_bytes(&mut self, file_offset: u64, bytes: Vec<u8>) {
+        self.macho_raw_byte_overrides.push((file_offset, bytes));
+    }
+
+    /// Append `payload` to the trailing padding of a Mach-O
+    /// segment, returning the vaddr where the bytes will land.
+    /// The bytes are staged via [`Self::stage_macho_raw_bytes`]
+    /// and committed on the next `commit_to_bytes*` call.
+    ///
+    /// Useful for adding small payloads (e.g. new entries to
+    /// `__objc_classname` / `__objc_methname` when renaming to
+    /// a longer string) without growing the segment or adding
+    /// a fresh `LC_SEGMENT_64`. The caller is responsible for
+    /// updating any references to point at the returned vaddr
+    /// — this method only reserves the bytes.
+    ///
+    /// Returns
+    /// [`TextEditorError::ChainedFixupsBlobTooLarge`]-style
+    /// error if no padding region in `segname` can hold
+    /// `payload.len()` bytes; the caller should fall back to
+    /// the appended-segment writer path (via existing
+    /// machinery like `add_function`) for larger payloads.
+    ///
+    /// Mach-O only.
+    pub fn append_macho_segment_padding(
+        &mut self,
+        segname: &str,
+        payload: &[u8],
+    ) -> Result<u64, TextEditorError> {
+        let image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let regions = image.layout.segment_free_regions(segname);
+        // Best-fit: smallest region that holds the payload.
+        let region = regions
+            .iter()
+            .filter(|r| r.size >= payload.len() as u64)
+            .min_by_key(|r| r.size)
+            .ok_or_else(|| TextEditorError::ChainedFixupsBlobTooLarge {
+                new_size: payload.len() as u64,
+                capacity: regions.iter().map(|r| r.size).max().unwrap_or(0),
+            })?;
+        let vaddr = region.vaddr;
+        let file_offset = region.file_offset;
+        self.macho_raw_byte_overrides
+            .push((file_offset, payload.to_vec()));
+        Ok(vaddr)
     }
 
     /// Check whether placing `additional_bytes` in the
@@ -2795,7 +2932,25 @@ impl BinaryEditor {
     /// [`BinaryState::add_library_dependency`]) without lifting a
     /// text section can call this directly — the in-section
     /// rewrite phase is skipped when no text section is present.
-    pub fn commit_to_bytes(mut self) -> Result<Vec<u8>, TextEditorError> {
+    pub fn commit_to_bytes(self) -> Result<Vec<u8>, TextEditorError> {
+        self.commit_to_bytes_with_sign(true)
+    }
+
+    /// Like [`Self::commit_to_bytes`] but emits an unsigned
+    /// Mach-O. Useful when the caller wants to apply a real
+    /// codesign identity out-of-band (the default `codesign
+    /// -s - --force` produces an ad-hoc signature that macOS
+    /// loads but Gatekeeper rejects). For ELF this is
+    /// equivalent to [`Self::commit_to_bytes`] — there's no
+    /// signing step.
+    ///
+    /// The output won't load on macOS 10.15+ without
+    /// post-processing signing.
+    pub fn commit_to_bytes_unsigned(self) -> Result<Vec<u8>, TextEditorError> {
+        self.commit_to_bytes_with_sign(false)
+    }
+
+    fn commit_to_bytes_with_sign(mut self, sign: bool) -> Result<Vec<u8>, TextEditorError> {
         // Dispatch on container format up-front for the
         // appended-segment case. ELF and Mach-O have separate
         // append-segment writers; only ELF uses the
@@ -2834,13 +2989,30 @@ impl BinaryEditor {
                 // `remove_library_dependency`); fall through
                 // to the in-place writer with the mutated
                 // container as-is.
-                match text {
+                let edited = match text {
                     Some(text) => {
                         let (edited, _output, _section_id) =
                             commit_lifted_any(&text, &binary.container)?;
-                        edited.to_bytes().map_err(TextEditorError::from)
+                        edited
                     }
-                    None => binary.container.to_bytes().map_err(TextEditorError::from),
+                    None => binary.container.clone(),
+                };
+                // On Mach-O, route through the writer's
+                // options-aware entry point when the caller
+                // wants an unsigned build or staged raw
+                // overrides (e.g. a rewritten chained-fixups
+                // blob). For ELF, `sign` is meaningless and
+                // raw overrides aren't supported through this
+                // path — fall through to `Container::to_bytes`.
+                if is_macho && (!sign || !binary.macho_raw_byte_overrides.is_empty()) {
+                    let opts = crate::container::macho_writer::MachOWriteOptions {
+                        sign,
+                        raw_byte_overrides: binary.macho_raw_byte_overrides.clone(),
+                    };
+                    crate::container::macho_writer::write_with_options(&edited, &opts)
+                        .map_err(TextEditorError::from)
+                } else {
+                    edited.to_bytes().map_err(TextEditorError::from)
                 }
             }
             Some(mut appended) => {
@@ -2923,8 +3095,12 @@ impl BinaryEditor {
                             file_offset,
                             bytes: appended.bytes,
                         };
-                        return crate::container::macho_writer::write_with_intra_text_append(
-                            &updated, intra, &all_overrides,
+                        let opts = crate::container::macho_writer::MachOWriteOptions {
+                            sign,
+                            raw_byte_overrides: binary.macho_raw_byte_overrides.clone(),
+                        };
+                        return crate::container::macho_writer::write_with_intra_text_append_opts(
+                            &updated, intra, &all_overrides, &opts,
                         )
                         .map_err(TextEditorError::from);
                     }
@@ -2953,12 +3129,17 @@ impl BinaryEditor {
                         appended.segment_vaddr,
                         appended.bytes,
                     );
-                    return crate::container::macho_writer::write_with_appended_segment(
+                    let opts = crate::container::macho_writer::MachOWriteOptions {
+                        sign,
+                        raw_byte_overrides: binary.macho_raw_byte_overrides.clone(),
+                    };
+                    return crate::container::macho_writer::write_with_appended_segment_opts(
                         &updated,
                         segment,
                         &all_overrides,
                         &macho_exports,
                         &binary.pending_library_deps,
+                        &opts,
                     )
                     .map_err(TextEditorError::from);
                 }
