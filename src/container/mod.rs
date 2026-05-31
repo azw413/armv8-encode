@@ -40,6 +40,7 @@ pub mod macho_export_trie;
 pub mod chained_fixups;
 mod macho_image;
 pub mod macho_objc;
+pub mod macho_swift;
 pub mod macho_symtab;
 pub(crate) mod macho_writer;
 mod reader;
@@ -61,6 +62,10 @@ pub use macho_objc::{
     build_chained_fixup_map, read_objc_metadata, ChainedFixupMap, ChainedFixupTarget,
     ObjCCategory, ObjCClass, ObjCImageInfo, ObjCIvar, ObjCMetadata, ObjCMethod, ObjCProperty,
     ObjCProtocol, ObjCReadError,
+};
+pub use macho_swift::{
+    read_swift_metadata, SwiftConformance, SwiftField, SwiftMetadata, SwiftProtocol, SwiftReadError,
+    SwiftRef, SwiftType, SwiftTypeKind, SwiftVTableEntry,
 };
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
