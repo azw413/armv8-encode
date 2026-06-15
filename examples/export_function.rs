@@ -90,6 +90,7 @@ fn main() -> ExitCode {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Add,
@@ -102,11 +103,13 @@ fn main() -> ExitCode {
                 })),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
 

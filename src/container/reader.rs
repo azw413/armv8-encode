@@ -24,6 +24,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
     let format = match file.format() {
         object::BinaryFormat::MachO => BinaryFormat::Macho,
         object::BinaryFormat::Elf => BinaryFormat::Elf,
+        object::BinaryFormat::Pe | object::BinaryFormat::Coff => BinaryFormat::Pe,
         _ => return Err(ContainerError::UnsupportedFormat),
     };
 
@@ -34,12 +35,12 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
     };
     // Don't error on unknown arch — the container is still inspectable;
     // analysis layers will refuse to disassemble.
-    let _ = architecture;
 
     let (mut sections, section_index_to_id) = lift_sections(&file);
     populate_elf_raw_sh_type(bytes, &mut sections);
     let (symbols, symbol_index_to_id) = lift_symbols(&file, &section_index_to_id);
-    let relocations = lift_relocations(&file, &section_index_to_id, &symbol_index_to_id);
+    let relocations =
+        lift_relocations(&file, &section_index_to_id, &symbol_index_to_id, architecture);
     let dwarf = crate::container::dwarf::parse(&file);
     let file_flags = lift_file_flags(&file);
     let kind = classify_container(&file, bytes);
@@ -83,6 +84,17 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         _ => None,
     };
 
+    // For linked PE inputs, snapshot the raw bytes plus each section's
+    // on-disk placement so the PE writer can round-trip the image and
+    // apply in-place section overrides at their original file offsets.
+    let pe_image = match (format, kind) {
+        (
+            BinaryFormat::Pe,
+            ContainerKind::SharedObject | ContainerKind::Executable,
+        ) => Some(lift_pe_image(&file, bytes)),
+        _ => None,
+    };
+
     Ok(Container {
         format,
         architecture,
@@ -93,8 +105,33 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         file_flags,
         elf_image,
         macho_image,
+        pe_image,
         dwarf,
     })
+}
+
+/// Capture a linked PE image for round-trip + in-place section
+/// overrides: the raw bytes plus each section's on-disk placement
+/// (`PointerToRawData` / `SizeOfRawData`), read straight off
+/// `object`'s `file_range()`.
+fn lift_pe_image(file: &File<'_>, bytes: &[u8]) -> crate::container::pe_image::PeImage {
+    use crate::container::pe_image::{PeImage, PeSectionFile};
+    let sections = file
+        .sections()
+        .filter_map(|section| {
+            let name = section.name().ok()?.to_string();
+            let (file_offset, file_size) = section.file_range()?;
+            Some(PeSectionFile {
+                name,
+                file_offset,
+                file_size,
+            })
+        })
+        .collect();
+    PeImage {
+        raw_bytes: bytes.to_vec(),
+        sections,
+    }
 }
 
 /// Capture every ELF-specific blob the neutral types don't model.
@@ -605,6 +642,21 @@ fn classify_container(file: &File<'_>, bytes: &[u8]) -> crate::container::Contai
     match file.format() {
         object::BinaryFormat::Elf => classify_elf(bytes),
         object::BinaryFormat::MachO => classify_macho(bytes),
+        object::BinaryFormat::Pe | object::BinaryFormat::Coff => classify_pe(file),
+        _ => ContainerKind::Other,
+    }
+}
+
+/// Classify a PE/COFF input. COFF objects (`.obj`) are relocatable;
+/// linked PE images are an executable or a DLL (shared object). We
+/// read this off `object`'s already-parsed `ObjectKind` rather than
+/// re-parsing the headers.
+fn classify_pe(file: &File<'_>) -> crate::container::ContainerKind {
+    use crate::container::ContainerKind;
+    match file.kind() {
+        object::ObjectKind::Relocatable => ContainerKind::Relocatable,
+        object::ObjectKind::Dynamic => ContainerKind::SharedObject,
+        object::ObjectKind::Executable => ContainerKind::Executable,
         _ => ContainerKind::Other,
     }
 }
@@ -832,6 +884,7 @@ fn lift_relocations(
     file: &File<'_>,
     section_index_to_id: &HashMap<object::SectionIndex, SectionId>,
     symbol_index_to_id: &HashMap<object::SymbolIndex, SymbolId>,
+    architecture: Architecture,
 ) -> Vec<Relocation> {
     let mut relocations = Vec::new();
 
@@ -843,7 +896,7 @@ fn lift_relocations(
             continue;
         };
         for (offset, reloc) in section.relocations() {
-            let kind = map_relocation_kind(&reloc);
+            let kind = map_relocation_kind(&reloc, architecture);
             let symbol = match reloc.target() {
                 RelocationTarget::Symbol(index) => symbol_index_to_id.get(&index).copied(),
                 _ => None,
@@ -875,7 +928,7 @@ fn lift_relocations(
             })
             .collect();
         for (vaddr, reloc) in dyn_relocs {
-            let kind = map_relocation_kind(&reloc);
+            let kind = map_relocation_kind(&reloc, architecture);
             let symbol = match reloc.target() {
                 RelocationTarget::Symbol(index) => symbol_index_to_id.get(&index).copied(),
                 _ => None,
@@ -935,10 +988,11 @@ fn map_symbol_kind(kind: object::SymbolKind) -> SymbolKind {
     }
 }
 
-fn map_relocation_kind(reloc: &object::Relocation) -> RelocationKind {
+fn map_relocation_kind(reloc: &object::Relocation, architecture: Architecture) -> RelocationKind {
     match reloc.flags() {
-        RelocationFlags::Elf { r_type } => map_elf_relocation(r_type),
-        RelocationFlags::MachO { r_type, .. } => map_macho_relocation(r_type),
+        RelocationFlags::Elf { r_type } => map_elf_relocation(r_type, architecture),
+        RelocationFlags::MachO { r_type, .. } => map_macho_relocation(r_type, architecture),
+        RelocationFlags::Coff { typ } => map_coff_relocation(typ, architecture),
         _ => match reloc.kind() {
             object::RelocationKind::Absolute => RelocationKind::Absolute,
             _ => RelocationKind::Other(0),
@@ -946,8 +1000,16 @@ fn map_relocation_kind(reloc: &object::Relocation) -> RelocationKind {
     }
 }
 
-fn map_elf_relocation(r_type: u32) -> RelocationKind {
+fn map_elf_relocation(r_type: u32, architecture: Architecture) -> RelocationKind {
     use object::elf;
+    // x86 ELF reloc codes occupy disjoint ABI code spaces that share
+    // small numeric values (e.g. R_386_32 == R_X86_64_64 == 1), so we
+    // must dispatch on the architecture before matching them.
+    match architecture {
+        Architecture::X86_64 => return map_elf_x86_64_relocation(r_type),
+        Architecture::X86 => return map_elf_i386_relocation(r_type),
+        _ => {}
+    }
     match r_type {
         elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => RelocationKind::Branch26,
         elf::R_AARCH64_CONDBR19 => RelocationKind::Branch19,
@@ -994,8 +1056,73 @@ fn map_elf_relocation(r_type: u32) -> RelocationKind {
     }
 }
 
-fn map_macho_relocation(r_type: u8) -> RelocationKind {
+/// x86_64 ELF relocations (`R_X86_64_*`).
+fn map_elf_x86_64_relocation(r_type: u32) -> RelocationKind {
+    use object::elf;
+    match r_type {
+        elf::R_X86_64_PC32 => RelocationKind::X86Pc32,
+        elf::R_X86_64_PLT32 => RelocationKind::X86Plt32,
+        elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX => {
+            RelocationKind::X86GotPcRel
+        }
+        elf::R_X86_64_32 | elf::R_X86_64_32S => RelocationKind::X86Abs32,
+        elf::R_X86_64_64 => RelocationKind::X86Abs64,
+        other => RelocationKind::Other(other),
+    }
+}
+
+/// i386 ELF relocations (`R_386_*`).
+fn map_elf_i386_relocation(r_type: u32) -> RelocationKind {
+    use object::elf;
+    match r_type {
+        elf::R_386_PC32 => RelocationKind::X86Pc32,
+        elf::R_386_PLT32 => RelocationKind::X86Plt32,
+        elf::R_386_GOTPC => RelocationKind::X86GotPcRel,
+        elf::R_386_32 => RelocationKind::X86Abs32,
+        other => RelocationKind::Other(other),
+    }
+}
+
+/// COFF relocations for PE inputs, dispatched on bitness
+/// (`IMAGE_REL_AMD64_*` vs `IMAGE_REL_I386_*`).
+fn map_coff_relocation(typ: u16, architecture: Architecture) -> RelocationKind {
+    use object::pe;
+    match architecture {
+        Architecture::X86 => match typ {
+            pe::IMAGE_REL_I386_REL32 => RelocationKind::X86Pc32,
+            pe::IMAGE_REL_I386_DIR32 => RelocationKind::X86Abs32,
+            other => RelocationKind::Other(other as u32),
+        },
+        // Default to the AMD64 code space for x86_64 (and as a
+        // best-effort for unspecified architectures on a PE input).
+        _ => match typ {
+            pe::IMAGE_REL_AMD64_REL32 => RelocationKind::X86Pc32,
+            pe::IMAGE_REL_AMD64_ADDR32 | pe::IMAGE_REL_AMD64_ADDR32NB => RelocationKind::X86Abs32,
+            pe::IMAGE_REL_AMD64_ADDR64 => RelocationKind::X86Abs64,
+            other => RelocationKind::Other(other as u32),
+        },
+    }
+}
+
+fn map_macho_relocation(r_type: u8, architecture: Architecture) -> RelocationKind {
     use object::macho;
+    // x86_64 and ARM64 Mach-O relocations share r_type values
+    // (e.g. UNSIGNED == 0, BRANCH(26) == 2), so dispatch on arch.
+    if architecture == Architecture::X86_64 {
+        return match r_type {
+            // Width (4 vs 8) lives in r_length, which the neutral
+            // model drops at this layer; default UNSIGNED to the
+            // 64-bit absolute form (the common pointer case).
+            macho::X86_64_RELOC_UNSIGNED => RelocationKind::X86Abs64,
+            macho::X86_64_RELOC_BRANCH => RelocationKind::X86Pc32,
+            macho::X86_64_RELOC_SIGNED
+            | macho::X86_64_RELOC_SIGNED_1
+            | macho::X86_64_RELOC_SIGNED_2
+            | macho::X86_64_RELOC_SIGNED_4 => RelocationKind::X86Pc32,
+            macho::X86_64_RELOC_GOT | macho::X86_64_RELOC_GOT_LOAD => RelocationKind::X86GotPcRel,
+            other => RelocationKind::Other(other as u32),
+        };
+    }
     match r_type {
         macho::ARM64_RELOC_UNSIGNED => RelocationKind::Absolute,
         macho::ARM64_RELOC_BRANCH26 => RelocationKind::Branch26,
@@ -1019,6 +1146,8 @@ impl Architecture {
         match arch {
             object::Architecture::Aarch64 => Architecture::Aarch64,
             object::Architecture::Arm => Architecture::Arm,
+            object::Architecture::X86_64 => Architecture::X86_64,
+            object::Architecture::I386 => Architecture::X86,
             _ => Architecture::Other,
         }
     }

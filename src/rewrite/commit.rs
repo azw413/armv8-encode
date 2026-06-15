@@ -79,6 +79,12 @@ fn relocation_size_bits(kind: RelocationKind) -> u8 {
         RelocationKind::ThumbCall | RelocationKind::ThumbJump24 => 24,
         RelocationKind::ThumbJump19 => 19,
         RelocationKind::ThumbMovwAbsNc | RelocationKind::ThumbMovtAbs => 16,
+        // x86 relocation widths.
+        RelocationKind::X86Pc32
+        | RelocationKind::X86Plt32
+        | RelocationKind::X86GotPcRel
+        | RelocationKind::X86Abs32 => 32,
+        RelocationKind::X86Abs64 => 64,
         RelocationKind::Other(_) => 32,
     }
 }

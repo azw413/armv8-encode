@@ -74,6 +74,7 @@ fn main() -> ExitCode {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {

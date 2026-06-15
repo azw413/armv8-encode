@@ -43,6 +43,8 @@ pub mod macho_objc;
 pub mod macho_swift;
 pub mod macho_symtab;
 pub(crate) mod macho_writer;
+pub mod pe_image;
+pub(crate) mod pe_writer;
 mod reader;
 mod types;
 mod writer;
@@ -67,6 +69,7 @@ pub use macho_swift::{
     read_swift_metadata, SwiftConformance, SwiftField, SwiftMetadata, SwiftProtocol, SwiftReadError,
     SwiftRef, SwiftType, SwiftTypeKind, SwiftVTableEntry,
 };
+pub use pe_image::{PeImage, PeSectionFile};
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
     DwarfInfo, FileFlags, Function, FunctionProvenance, Relocation, RelocationId, RelocationKind,
@@ -107,6 +110,9 @@ impl Container {
             }
             (BinaryFormat::Macho, ContainerKind::SharedObject | ContainerKind::Executable) => {
                 macho_writer::write(self)
+            }
+            (BinaryFormat::Pe, ContainerKind::SharedObject | ContainerKind::Executable) => {
+                pe_writer::write(self)
             }
             _ => Err(ContainerWriteError::UnsupportedKind { kind: self.kind }),
         }

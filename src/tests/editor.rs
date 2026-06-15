@@ -63,6 +63,7 @@ fn fixture_container() -> Container {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     }
 }
@@ -476,6 +477,7 @@ fn add_function_generic_thumb_appends_to_armv7_elf32() {
             index: 14, // lr
         }))],
         original_address: None,
+        source_size: None,
     }];
 
     let symbol_id = editor

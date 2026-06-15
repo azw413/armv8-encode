@@ -17,6 +17,8 @@ pub struct RelocationId(pub usize);
 pub enum BinaryFormat {
     Macho,
     Elf,
+    /// Portable Executable / COFF (Windows `.obj`, `.exe`, `.dll`).
+    Pe,
 }
 
 /// Architecture exposed by the container's header.
@@ -30,6 +32,12 @@ pub enum Architecture {
     /// address = 1 means Thumb; interworking branches like
     /// `bx`/`blx` switch modes at runtime).
     Arm,
+    /// 64-bit x86 (AMD64 / x86-64). Decoded in 64-bit mode by
+    /// the `isa::x86` layer.
+    X86_64,
+    /// 32-bit x86 (i386 / IA-32). Decoded in 32-bit mode by
+    /// the `isa::x86` layer.
+    X86,
     /// Some other architecture — the container parses but
     /// the ISA layer can't decode the text sections.
     Other,
@@ -206,6 +214,27 @@ pub enum RelocationKind {
     /// `R_ARM_THM_MOVT_ABS` — Thumb-2 movt of absolute high-16.
     ThumbMovtAbs,
 
+    // --- x86 / x86_64 relocation kinds ---
+    /// 32-bit PC-relative reference (`R_X86_64_PC32`,
+    /// `IMAGE_REL_AMD64_REL32` / `IMAGE_REL_I386_REL32`,
+    /// `X86_64_RELOC_BRANCH` / `X86_64_RELOC_SIGNED`). Used by
+    /// `call`/`jmp rel32` and RIP-relative data references.
+    X86Pc32,
+    /// 32-bit PC-relative reference to a symbol's PLT entry
+    /// (`R_X86_64_PLT32`). Treated like `X86Pc32` for direct
+    /// calls when the PLT is collapsed.
+    X86Plt32,
+    /// 32-bit PC-relative GOT reference (`R_X86_64_GOTPCREL` /
+    /// `R_X86_64_REX_GOTPCRELX`, `X86_64_RELOC_GOT` /
+    /// `X86_64_RELOC_GOT_LOAD`).
+    X86GotPcRel,
+    /// 32-bit absolute pointer (`R_X86_64_32` / `R_X86_64_32S`,
+    /// `IMAGE_REL_I386_DIR32`, `X86_64_RELOC_UNSIGNED` width 4).
+    X86Abs32,
+    /// 64-bit absolute pointer (`R_X86_64_64`,
+    /// `IMAGE_REL_AMD64_ADDR64`, `X86_64_RELOC_UNSIGNED` width 8).
+    X86Abs64,
+
     /// Format-specific kind not yet mapped. Carries the raw type code so
     /// callers can still distinguish them.
     Other(u32),
@@ -322,6 +351,13 @@ pub struct Container {
     /// the Mach-O writer for round-trip output. `None` for
     /// MH_OBJECT inputs and for non-Mach-O formats.
     pub macho_image: Option<crate::container::macho_image::MachOImage>,
+    /// Format-specific data captured for linked PE inputs (`.exe` /
+    /// `.dll`). Populated by the reader for
+    /// [`ContainerKind::Executable`] / [`ContainerKind::SharedObject`]
+    /// PE inputs; consumed by the PE writer for layout-preserving
+    /// round-trip + in-place section edits. `None` for COFF (`.obj`)
+    /// inputs and for non-PE formats.
+    pub pe_image: Option<crate::container::pe_image::PeImage>,
     /// DWARF debug info, populated when the container has `.debug_info` /
     /// `__debug_info` sections that parse cleanly. `None` when no DWARF is
     /// present or parsing failed (best-effort — DWARF is metadata, not

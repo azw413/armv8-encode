@@ -61,6 +61,10 @@ pub enum ContainerWriteError {
     /// indicates a reader bug or a hand-built container that lacks
     /// the necessary metadata.
     ElfImageMissing,
+    /// PE writer invoked on a container with no attached
+    /// [`super::pe_image::PeImage`]. The reader populates it for
+    /// linked PE (`.exe`/`.dll`) inputs.
+    PeImageMissing,
     /// A rewrite grew an ELF section past its source extent. The
     /// in-place writer can't accommodate this; an
     /// append-PT_LOAD-with-trampolines layout is needed. This
@@ -107,6 +111,10 @@ impl std::fmt::Display for ContainerWriteError {
                 f,
                 "container kind requires an ElfImage companion but none is attached",
             ),
+            ContainerWriteError::PeImageMissing => write!(
+                f,
+                "container kind requires a PeImage companion but none is attached",
+            ),
             ContainerWriteError::ElfTextGrewBeyondExtent {
                 section_name,
                 original_extent,
@@ -144,10 +152,15 @@ pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
     let format = match container.format {
         BinaryFormat::Elf => ObjFormat::Elf,
         BinaryFormat::Macho => ObjFormat::MachO,
+        // Relocatable PE is a COFF object (`.obj`); `object::write`
+        // emits COFF for `BinaryFormat::Coff`.
+        BinaryFormat::Pe => ObjFormat::Coff,
     };
     let architecture = match container.architecture {
         Architecture::Aarch64 => ObjArch::Aarch64,
         Architecture::Arm => ObjArch::Arm,
+        Architecture::X86_64 => ObjArch::X86_64,
+        Architecture::X86 => ObjArch::I386,
         Architecture::Other => return Err(ContainerWriteError::UnsupportedArchitecture),
     };
 
@@ -191,7 +204,8 @@ fn add_sections(
         }
         let segment = match container.format {
             BinaryFormat::Macho => macho_segment_for(section).to_vec(),
-            BinaryFormat::Elf => Vec::new(),
+            // ELF and COFF have no Mach-O-style segment names.
+            BinaryFormat::Elf | BinaryFormat::Pe => Vec::new(),
         };
         // Pick the kind passed to `add_section`. For ELF inputs whose
         // neutral kind is `Other` and we captured a raw `sh_type`, fall
@@ -308,7 +322,7 @@ fn add_relocations(
                     .or_insert_with(|| obj.section_symbol(section_id))
             }
         };
-        let flags = relocation_flags(relocation.kind, container.format)?;
+        let flags = relocation_flags(relocation.kind, container.format, container.architecture)?;
         obj.add_relocation(
             section_id,
             WriteRelocation {
@@ -396,15 +410,19 @@ fn macho_segment_for(section: &Section) -> &'static [u8] {
 fn relocation_flags(
     kind: RelocationKind,
     format: BinaryFormat,
+    architecture: Architecture,
 ) -> Result<RelocationFlags, ContainerWriteError> {
     match format {
-        BinaryFormat::Elf => Ok(elf_flags(kind)),
+        BinaryFormat::Elf => Ok(elf_flags(kind, architecture)),
         BinaryFormat::Macho => macho_flags(kind),
+        BinaryFormat::Pe => coff_flags(kind, architecture),
     }
 }
 
-fn elf_flags(kind: RelocationKind) -> RelocationFlags {
+fn elf_flags(kind: RelocationKind, architecture: Architecture) -> RelocationFlags {
     use object::elf;
+    // x86 ELF relocation codes differ by bitness (R_X86_64_* vs R_386_*).
+    let is_64 = !matches!(architecture, Architecture::X86);
     let r_type = match kind {
         RelocationKind::Branch26 => elf::R_AARCH64_CALL26,
         RelocationKind::Branch19 => elf::R_AARCH64_CONDBR19,
@@ -438,9 +456,73 @@ fn elf_flags(kind: RelocationKind) -> RelocationFlags {
         RelocationKind::ThumbJump19 => elf::R_ARM_THM_JUMP19,
         RelocationKind::ThumbMovwAbsNc => elf::R_ARM_THM_MOVW_ABS_NC,
         RelocationKind::ThumbMovtAbs => elf::R_ARM_THM_MOVT_ABS,
+        // x86 / x86_64. The 32-bit i386 ABI uses a disjoint code space.
+        RelocationKind::X86Pc32 => {
+            if is_64 {
+                elf::R_X86_64_PC32
+            } else {
+                elf::R_386_PC32
+            }
+        }
+        RelocationKind::X86Plt32 => {
+            if is_64 {
+                elf::R_X86_64_PLT32
+            } else {
+                elf::R_386_PLT32
+            }
+        }
+        RelocationKind::X86GotPcRel => {
+            if is_64 {
+                elf::R_X86_64_GOTPCREL
+            } else {
+                elf::R_386_GOTPC
+            }
+        }
+        RelocationKind::X86Abs32 => {
+            if is_64 {
+                elf::R_X86_64_32
+            } else {
+                elf::R_386_32
+            }
+        }
+        // No 32-bit absolute-64 relocation exists on i386; fall back to
+        // the 64-bit code (only meaningful on x86_64 anyway).
+        RelocationKind::X86Abs64 => elf::R_X86_64_64,
         RelocationKind::Other(raw) => raw,
     };
     RelocationFlags::Elf { r_type }
+}
+
+/// COFF relocation flags for relocatable PE (`.obj`) output. The
+/// `IMAGE_REL_AMD64_*` and `IMAGE_REL_I386_*` code spaces are disjoint,
+/// so dispatch on bitness.
+fn coff_flags(
+    kind: RelocationKind,
+    architecture: Architecture,
+) -> Result<RelocationFlags, ContainerWriteError> {
+    use object::pe;
+    let is_64 = !matches!(architecture, Architecture::X86);
+    let typ = match kind {
+        RelocationKind::X86Pc32 | RelocationKind::X86Plt32 => {
+            if is_64 {
+                pe::IMAGE_REL_AMD64_REL32
+            } else {
+                pe::IMAGE_REL_I386_REL32
+            }
+        }
+        RelocationKind::X86Abs32 | RelocationKind::Absolute if !is_64 => pe::IMAGE_REL_I386_DIR32,
+        RelocationKind::X86Abs32 => pe::IMAGE_REL_AMD64_ADDR32,
+        RelocationKind::X86Abs64 | RelocationKind::Absolute => pe::IMAGE_REL_AMD64_ADDR64,
+        RelocationKind::Other(raw) => raw as u16,
+        // No COFF mapping for ARM/AArch64 kinds (we don't write ARM PE).
+        other => {
+            return Err(ContainerWriteError::UnsupportedRelocation {
+                format: BinaryFormat::Pe,
+                kind: other,
+            });
+        }
+    };
+    Ok(RelocationFlags::Coff { typ })
 }
 
 fn macho_flags(kind: RelocationKind) -> Result<RelocationFlags, ContainerWriteError> {
@@ -463,6 +545,13 @@ fn macho_flags(kind: RelocationKind) -> Result<RelocationFlags, ContainerWriteEr
             (macho::ARM64_RELOC_PAGEOFF12, false, r_length)
         }
         RelocationKind::Absolute => (macho::ARM64_RELOC_UNSIGNED, false, 3),
+        // x86_64 Mach-O. `r_length` is log2(width): 2 → 4 bytes, 3 → 8.
+        RelocationKind::X86Pc32 | RelocationKind::X86Plt32 => {
+            (macho::X86_64_RELOC_BRANCH, true, 2)
+        }
+        RelocationKind::X86GotPcRel => (macho::X86_64_RELOC_GOT_LOAD, true, 2),
+        RelocationKind::X86Abs32 => (macho::X86_64_RELOC_UNSIGNED, false, 2),
+        RelocationKind::X86Abs64 => (macho::X86_64_RELOC_UNSIGNED, false, 3),
         RelocationKind::Other(raw) => (raw as u8, false, 2),
         // Mach-O's standard ARM64 relocation set has no Branch19 /
         // Branch14: the assembler resolves these locally before emitting

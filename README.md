@@ -11,21 +11,37 @@ fresh PT_LOAD segment that call existing PLT-bound externs (and, via a
 single `dlsym` anchor, any dynamic symbol the process can see), and
 produce a runnable byte stream the dynamic linker accepts.
 
-The primary architectural target is AArch64; the rest of the layering
-(`container`, `mc`, `rewrite`) stays format- and architecture-neutral
-so other ISAs can plug in later.
+The primary architectural target is AArch64; ARMv7 (ARM + Thumb) and
+**x86 / x86_64** also plug into the same layering. The rest of the stack
+(`container`, `mc`, `rewrite`) stays format- and architecture-neutral.
 
 ## What you can do today
 
-- **Decode** any AArch64 instruction word the imported opcode table covers.
-- **Encode** new instructions from typed templates.
+- **Decode** any AArch64 instruction word the imported opcode table
+  covers. The same analysis stack also decodes ARMv7 (ARM + Thumb) and
+  **x86 / x86_64** — the x86 layer is backed by the `iced-x86`
+  decoder/encoder.
+- **Encode** new instructions from typed templates (AArch64/ARMv7) or via
+  `iced-x86` (x86).
 - **Linear-sweep** or **recursive-descent** disassemble a code region.
-- **Build a CFG** and reason about basic blocks and control flow.
-- **Read** ELF (`.o`, `.so`, executables) and Mach-O (`.o`) into a neutral
-  container model. ET_DYN/ET_EXEC inputs preserve the full ELF surface
-  needed to round-trip them.
+- **Build a CFG** and reason about basic blocks and control flow — the
+  classifier is architecture-neutral and covers x86 control flow
+  (`jmp`/`jcc`/`call`/`ret`/indirect) too.
+- **Read** ELF (`.o`, `.so`, executables), Mach-O (`.o`, dylib), and
+  **PE / COFF** (`.obj`, `.exe`, `.dll`) into a neutral container model.
+  Relocations are mapped to a neutral enum across all three formats and
+  both x86 widths (`R_X86_64_*` / `R_386_*` / `IMAGE_REL_*` /
+  `X86_64_RELOC_*`). ET_DYN/ET_EXEC and linked-PE inputs preserve the
+  surface needed to round-trip them.
 - **Write** ELF ET_REL (`.o`) and ET_DYN (`.so`/PIE executable) byte
-  streams that the system linker / dynamic linker accept.
+  streams that the system linker / dynamic linker accept; relocatable
+  **COFF (`.obj`)** output for x86; and layout-preserving **PE
+  (`.exe`/`.dll`)** output with in-place section edits (byte-identical
+  round-trip apart from edited sections).
+- **Rewrite x86 code** via `iced-x86`'s `BlockEncoder`: lift a text
+  section to an editable instruction list, redirect branches / replace
+  instructions, and re-assemble — branch sizing (rel8↔rel32) and
+  RIP-relative fix-ups are handled automatically.
 - **Rewrite a section symbolically**: lift instructions to an editable
   IR with `Target::Symbol` / `Target::Block` operands, mutate, lay
   out (with conditional-branch widening), emit, splice back.
@@ -91,11 +107,14 @@ rewrite. Each layer only knows about the ones below it.
 
 Path: `src/container`
 
-Reads Mach-O and ELF object files into a neutral, format-agnostic
-model: sections, symbols, relocations, optional DWARF debug info, and
-`Function` views derived from both. The `object` crate handles format
-parsing and `gimli` handles DWARF; the container layer hides both so
-the rest of the crate sees one shape regardless of source.
+Reads Mach-O, ELF, and PE/COFF object files into a neutral,
+format-agnostic model: sections, symbols, relocations, optional DWARF
+debug info, and `Function` views derived from both. The `object` crate
+handles format parsing and `gimli` handles DWARF; the container layer
+hides both so the rest of the crate sees one shape regardless of
+source. Linked PE images carry a [`PeImage`](src/container/pe_image.rs)
+companion (raw bytes + per-section file placement) so the PE writer can
+round-trip them with in-place section edits.
 
 The layer's input is `&[u8]`; the output is a
 [`Container`](src/container/types.rs) ready to feed into disassembly
@@ -151,7 +170,20 @@ operands, branch/page targets, vector registers, vector elements,
 system operands), implements
 [`InstructionInfo`](src/mc/control_flow.rs) for control-flow
 classification, and exposes table-driven encoding alongside helpers
-used by the rewrite layer.
+used by the rewrite layer. ARMv7 (ARM + Thumb) lives under
+`src/isa/armv7` with the same shape.
+
+The x86 / x86_64 implementation lives under `src/isa/x86` and is backed
+by [`iced-x86`](https://crates.io/crates/iced-x86) rather than a
+hand-imported table: [`disassemble_bytes`](src/isa/x86/sweep.rs) wraps
+iced's decoder (selecting 32- vs 64-bit mode via `Bitness`),
+[`X86DecodedInstruction`](src/isa/x86/sweep.rs) implements
+`InstructionInfo`, and [`encode`](src/isa/x86/encode.rs) re-encodes
+single instructions or assembles whole edited sections through iced's
+`BlockEncoder` (which owns branch-size selection and RIP-relative
+fix-ups). Because x86 branch layout is handled by `BlockEncoder`, the
+x86 rewrite path bypasses the fixed-width ISAs' symbolic layout/widening
+pipeline.
 
 Two disassembler entry points live here:
 [`disassemble_bytes`](src/isa/aarch64/sweep.rs) does fail-fast linear

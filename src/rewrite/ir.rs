@@ -76,6 +76,31 @@ pub struct RewriteInstruction<I: Isa> {
     pub mnemonic: I::Mnemonic,
     pub operands: Vec<RewriteOperand<I>>,
     pub original_address: Option<u64>,
+    /// Encoded byte length of the instruction as decoded from the
+    /// source, when known. Populated at lift time from
+    /// [`Isa::decoded_size`] so variable-width ISAs (x86, Thumb)
+    /// reserve their true footprint during layout. `None` for
+    /// synthesized instructions with no decoded origin; the layout
+    /// pass then falls back to [`Isa::instruction_source_size`].
+    pub source_size: Option<u64>,
+}
+
+impl<I: Isa> RewriteInstruction<I> {
+    /// Construct a synthesized instruction (no decoded origin).
+    /// `source_size` is left `None` so layout uses the ISA's
+    /// mnemonic-derived size estimate.
+    pub fn new(
+        mnemonic: I::Mnemonic,
+        operands: Vec<RewriteOperand<I>>,
+        original_address: Option<u64>,
+    ) -> Self {
+        Self {
+            mnemonic,
+            operands,
+            original_address,
+            source_size: None,
+        }
+    }
 }
 
 impl<I: Isa> Clone for RewriteInstruction<I> {
@@ -84,6 +109,7 @@ impl<I: Isa> Clone for RewriteInstruction<I> {
             mnemonic: self.mnemonic,
             operands: self.operands.clone(),
             original_address: self.original_address,
+            source_size: self.source_size,
         }
     }
 }
@@ -93,6 +119,7 @@ impl<I: Isa> PartialEq for RewriteInstruction<I> {
         self.mnemonic == other.mnemonic
             && self.operands == other.operands
             && self.original_address == other.original_address
+            && self.source_size == other.source_size
     }
 }
 
@@ -104,6 +131,7 @@ impl<I: Isa> Debug for RewriteInstruction<I> {
             .field("mnemonic", &self.mnemonic)
             .field("operands", &self.operands)
             .field("original_address", &self.original_address)
+            .field("source_size", &self.source_size)
             .finish()
     }
 }
@@ -221,7 +249,12 @@ impl<I: Isa> Debug for MacroOp<I> {
 impl<I: Isa> RewriteOp<I> {
     pub fn source_byte_size(&self) -> u64 {
         match self {
-            Self::Instruction(insn) => I::instruction_source_size(insn.mnemonic),
+            // Prefer the true decoded length recorded at lift time;
+            // fall back to the ISA's mnemonic-derived estimate for
+            // synthesized instructions.
+            Self::Instruction(insn) => insn
+                .source_size
+                .unwrap_or_else(|| I::instruction_source_size(insn.mnemonic)),
             Self::Macro(macro_op) => I::macro_source_size(&macro_op.original_instructions),
         }
     }

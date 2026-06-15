@@ -14,6 +14,23 @@ object = { version = "0.36", default-features = false, features = [
     "write_std",
     "macho",
     "elf",
+    "pe",
+    "coff",
+    "std",
+] }
+
+# x86 / x86_64 instruction decode + encode for the `isa::x86` layer.
+# Default features pull in every formatter (gas/masm/nasm/fast_fmt) and the
+# block encoder we don't use — we drive layout/widening through the crate's
+# own rewrite pipeline, same as AArch64/ARMv7. Keep only decoder + encoder,
+# instruction-info (for CFG flow-control classification), and the Intel
+# formatter (for the `dump` example).
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "decoder",
+    "encoder",
+    "block_encoder",
+    "instr_info",
+    "intel",
     "std",
 ] }
 

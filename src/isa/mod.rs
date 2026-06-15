@@ -6,6 +6,7 @@
 
 pub mod aarch64;
 pub mod armv7;
+pub mod x86;
 
 mod isa_trait;
 pub use isa_trait::{

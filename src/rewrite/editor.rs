@@ -46,6 +46,7 @@ use crate::container::{
 use crate::isa::aarch64::{self, Aarch64Isa, DisassembleError, EncodeError};
 use crate::isa::armv7::arm::ArmIsa;
 use crate::isa::armv7::ThumbIsa;
+use crate::isa::x86;
 use crate::isa::Isa;
 use crate::mc::{build_cfg, ControlFlowGraph};
 use crate::rewrite::commit::commit_to_container;
@@ -87,6 +88,13 @@ pub enum TextEditorError {
     /// and have shapes that don't make sense to embed in the
     /// editor's error enum verbatim.
     DisassembleArmv7(String),
+    /// x86 sweep/disassembly error. Held as a string (the iced-backed
+    /// error type isn't embedded in the editor enum verbatim).
+    DisassembleX86(String),
+    /// x86 encode/assemble error (from `BlockEncoder` / `Encoder`).
+    X86Encode(String),
+    /// No instruction at the requested address in the lifted section.
+    AddressNotFound(u64),
     /// An edit operation failed — see [`EditError`] for cases.
     Edit(EditError),
     /// Layout failed — see [`LayoutError`] for cases.
@@ -174,6 +182,11 @@ impl std::fmt::Display for TextEditorError {
             Self::SymbolNotFound(name) => write!(f, "no symbol named {name:?}"),
             Self::Disassemble(err) => write!(f, "disassembly failed: {err:?}"),
             Self::DisassembleArmv7(msg) => write!(f, "armv7 disassembly failed: {msg}"),
+            Self::DisassembleX86(msg) => write!(f, "x86 disassembly failed: {msg}"),
+            Self::X86Encode(msg) => write!(f, "x86 encode failed: {msg}"),
+            Self::AddressNotFound(addr) => {
+                write!(f, "no instruction at address {addr:#x} in lifted section")
+            }
             Self::Edit(err) => write!(f, "edit failed: {err:?}"),
             Self::Layout(err) => write!(f, "layout failed: {err:?}"),
             Self::Emit(err) => write!(f, "emit failed: {err:?}"),
@@ -318,6 +331,83 @@ fn commit_lifted_any(
         LiftedTextSectionAny::Aarch64(s) => commit_lifted_section(s, container),
         LiftedTextSectionAny::Thumb(s) => commit_lifted_section(s, container),
         LiftedTextSectionAny::Arm(s) => commit_lifted_section(s, container),
+        LiftedTextSectionAny::X86(s) => commit_lifted_x86(s, container),
+    }
+}
+
+/// x86 commit: assemble the (possibly edited) instruction list via
+/// iced's `BlockEncoder` and splice the result back into the section.
+/// Unlike the fixed-width ISAs, x86 doesn't go through the generic
+/// `lay_out`/`emit` pipeline — `BlockEncoder` owns branch sizing and
+/// RIP-relative fix-up. In-place text edits produce no new relocations.
+fn commit_lifted_x86(
+    section: &X86LiftedTextSection,
+    container: &Container,
+) -> Result<(Container, EmitOutput, SectionId), TextEditorError> {
+    let assembled = x86::assemble(&section.instructions, section.base_address, section.bitness)
+        .map_err(|e| TextEditorError::X86Encode(e.to_string()))?;
+    let output = EmitOutput {
+        bytes: assembled.bytes,
+        relocations: Vec::new(),
+    };
+    let updated = commit_to_container(container, section.section_id, output.clone());
+    Ok((updated, output, section.section_id))
+}
+
+/// A lifted x86 / x86_64 text section.
+///
+/// Distinct from [`LiftedTextSection<I>`]: x86 isn't driven through the
+/// `Isa`-generic rewrite plan (its branch layout is handled by
+/// `BlockEncoder` at emit time, not the fixed-width widening pass), so
+/// it keeps a plain editable list of `iced_x86::Instruction`s. Edit
+/// primitives mutate that list; [`commit_lifted_x86`] re-assembles it.
+#[derive(Debug, Clone)]
+pub struct X86LiftedTextSection {
+    section_id: SectionId,
+    base_address: u64,
+    bitness: x86::Bitness,
+    /// Editable instruction list. Each instruction's `ip()` is its
+    /// current source address, which `BlockEncoder` uses to resolve
+    /// intra-section branch targets.
+    instructions: Vec<iced_x86::Instruction>,
+}
+
+impl X86LiftedTextSection {
+    /// Index of the instruction whose address is `address`.
+    fn index_at(&self, address: u64) -> Result<usize, TextEditorError> {
+        self.instructions
+            .iter()
+            .position(|i| i.ip() == address)
+            .ok_or(TextEditorError::AddressNotFound(address))
+    }
+
+    /// Retarget the direct branch/call at `address` to point at the
+    /// absolute address `target`. If `target` is inside this section,
+    /// `BlockEncoder` fixes up the displacement (and resizes the branch
+    /// if needed); otherwise it's encoded as the reaching form to the
+    /// absolute target (e.g. a PLT stub).
+    pub fn redirect_branch_at(&mut self, address: u64, target: u64) -> Result<(), TextEditorError> {
+        let index = self.index_at(address)?;
+        self.instructions[index].set_near_branch64(target);
+        Ok(())
+    }
+
+    /// Replace the instruction at `address` with `new`. The replacement
+    /// keeps the slot's source IP so surrounding branches still resolve.
+    pub fn replace_instruction_at(
+        &mut self,
+        address: u64,
+        mut new: iced_x86::Instruction,
+    ) -> Result<(), TextEditorError> {
+        let index = self.index_at(address)?;
+        new.set_ip(address);
+        self.instructions[index] = new;
+        Ok(())
+    }
+
+    /// The decoded instruction list (read-only).
+    pub fn instructions(&self) -> &[iced_x86::Instruction] {
+        &self.instructions
     }
 }
 
@@ -483,6 +573,7 @@ pub enum LiftedTextSectionAny {
     Aarch64(LiftedTextSection<Aarch64Isa>),
     Thumb(LiftedTextSection<ThumbIsa>),
     Arm(LiftedTextSection<ArmIsa>),
+    X86(X86LiftedTextSection),
 }
 
 impl LiftedTextSectionAny {
@@ -530,6 +621,22 @@ impl LiftedTextSectionAny {
         }
     }
 
+    /// x86 / x86_64-typed view. `None` if the lifted section is a
+    /// different ISA.
+    pub fn x86(&self) -> Option<&X86LiftedTextSection> {
+        match self {
+            Self::X86(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn x86_mut(&mut self) -> Option<&mut X86LiftedTextSection> {
+        match self {
+            Self::X86(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// ISA-agnostic accessors. Useful for read-only consumers
     /// that just need the section id or base address (e.g. the
     /// commit pipeline) without caring which ISA the section
@@ -539,6 +646,7 @@ impl LiftedTextSectionAny {
             Self::Aarch64(s) => s.section_id,
             Self::Thumb(s) => s.section_id,
             Self::Arm(s) => s.section_id,
+            Self::X86(s) => s.section_id,
         }
     }
 
@@ -547,6 +655,7 @@ impl LiftedTextSectionAny {
             Self::Aarch64(s) => s.base_address,
             Self::Thumb(s) => s.base_address,
             Self::Arm(s) => s.base_address,
+            Self::X86(s) => s.base_address,
         }
     }
 }
@@ -731,6 +840,19 @@ impl BinaryEditor {
                     instructions,
                     cfg,
                     plan,
+                })
+            }
+            Architecture::X86_64 | Architecture::X86 => {
+                let bitness = x86::bitness_for_architecture(self.binary.container.architecture)
+                    .expect("x86 architecture maps to a bitness");
+                let decoded = x86::disassemble_bytes(base, code, bitness)
+                    .map_err(|e| TextEditorError::DisassembleX86(e.to_string()))?;
+                let instructions = decoded.into_iter().map(|d| d.instr).collect();
+                LiftedTextSectionAny::X86(X86LiftedTextSection {
+                    section_id,
+                    base_address: base,
+                    bitness,
+                    instructions,
                 })
             }
             Architecture::Other => {
@@ -1289,6 +1411,10 @@ impl BinaryState {
                 let aligned = (max_input_vaddr + GAP + PAGE - 1) & !(PAGE - 1);
                 Ok(aligned.max(PAGE))
             }
+            // PE append-segment placement is not implemented yet.
+            crate::container::BinaryFormat::Pe => {
+                Err(TextEditorError::AppendUnsupportedKind(self.container.kind))
+            }
         }
     }
 
@@ -1794,6 +1920,7 @@ impl BinaryState {
                     .map(RewriteOperand::Decoded)
                     .collect(),
                 original_address: None,
+                source_size: None,
             }
         };
         let symbolic_bl = |word: u32, target: Target| -> Result<RewriteInstruction, TextEditorError> {
@@ -1955,6 +2082,7 @@ impl BinaryState {
                     .map(RewriteOperand::Decoded)
                     .collect(),
                 original_address: None,
+                source_size: None,
             }
         };
         let symbolic_bl = |word: u32, target: Target| -> Result<RewriteInstruction, TextEditorError> {
@@ -2228,6 +2356,10 @@ impl BinaryState {
             }
             crate::container::BinaryFormat::Macho => {
                 self.remove_library_dependency_macho(library_name)
+            }
+            // PE import-table editing is not implemented yet.
+            crate::container::BinaryFormat::Pe => {
+                Err(TextEditorError::AppendUnsupportedKind(self.container.kind))
             }
         }
     }

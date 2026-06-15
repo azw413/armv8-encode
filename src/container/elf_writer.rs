@@ -429,6 +429,8 @@ fn build_file_header(container: &Container, image: &ElfImage) -> FileHeader {
     let e_machine = match container.architecture {
         Architecture::Aarch64 => elf::EM_AARCH64,
         Architecture::Arm => elf::EM_ARM,
+        Architecture::X86_64 => elf::EM_X86_64,
+        Architecture::X86 => elf::EM_386,
         Architecture::Other => elf::EM_AARCH64, // best-effort default
     };
 
@@ -1007,7 +1009,11 @@ fn build_original_extent_stub(
         Architecture::Arm => {
             build_original_extent_stub_arm(section, original_extent, new_seg_vaddr, container)
         }
-        Architecture::Other => Err(ContainerWriteError::UnsupportedArchitecture),
+        // x86 ELF append-segment stubs are not implemented yet; the
+        // relocatable and in-place edit paths don't need them.
+        Architecture::X86_64 | Architecture::X86 | Architecture::Other => {
+            Err(ContainerWriteError::UnsupportedArchitecture)
+        }
     }
 }
 
@@ -1236,6 +1242,8 @@ fn emit_nop_padding(writer: &mut Writer<'_>, count: usize, arch: Architecture) {
         // (0xbf00bf00 = nop;nop in either mode if the
         // section gets reinterpreted).
         Architecture::Arm => &[0x00, 0xbf, 0x00, 0xbf],
+        // x86 NOP is the single byte 0x90; the fill loop repeats it.
+        Architecture::X86_64 | Architecture::X86 => &[0x90],
         Architecture::Other => &[0; 4],
     };
     let mut padding = Vec::with_capacity(count);

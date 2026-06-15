@@ -190,6 +190,7 @@ fn replace_terminator_swaps_block_exit() {
         mnemonic: Aarch64Mnemonic::Bne,
         operands: vec![RewriteOperand::Branch(target)],
         original_address: None,
+        source_size: None,
     };
     plan.replace_terminator(head_block_id, new_terminator).unwrap();
 
@@ -213,11 +214,13 @@ fn insert_after_address_recomputes_downstream_branch_targets() {
             mnemonic: Aarch64Mnemonic::Nop,
             operands: Vec::new(),
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Nop,
             operands: Vec::new(),
             original_address: None,
+            source_size: None,
         },
     ])
     .unwrap();
@@ -319,6 +322,7 @@ fn layout_errors_on_symbol_without_container() {
                 crate::rewrite::SymbolId(0),
             ))],
             original_address: None,
+            source_size: None,
         })],
     });
 
@@ -403,6 +407,7 @@ fn container_with_function(name: &str, address: u64) -> Container {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     }
 }
@@ -428,6 +433,7 @@ fn container_with_undefined_function(name: &str) -> Container {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     }
 }
@@ -543,6 +549,7 @@ fn undefined_symbol_target_emits_relocation_instead_of_erroring() {
             mnemonic: Aarch64Mnemonic::Bl,
             operands: vec![RewriteOperand::Branch(Target::Symbol(SymbolId(0)))],
             original_address: None,
+            source_size: None,
         })],
     });
 
@@ -647,6 +654,7 @@ fn cbz_to_undefined_symbol_emits_branch19_relocation() {
                 RewriteOperand::Branch(Target::Symbol(SymbolId(0))),
             ],
             original_address: None,
+            source_size: None,
         })],
     });
 
@@ -718,6 +726,7 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     };
 
@@ -729,11 +738,13 @@ fn defined_and_undefined_targets_coexist_in_one_emit() {
                 mnemonic: Aarch64Mnemonic::Bl,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(SymbolId(0)))],
                 original_address: None,
+                source_size: None,
             }),
             crate::rewrite::RewriteOp::Instruction(RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::Bl,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(SymbolId(1)))],
                 original_address: None,
+                source_size: None,
             }),
         ],
     });
@@ -1398,6 +1409,7 @@ mod relocation_lift {
             file_flags: None,
             elf_image: None,
         macho_image: None,
+        pe_image: None,
             dwarf: None,
         }
     }
@@ -1504,6 +1516,7 @@ mod relocation_lift {
             file_flags: None,
             elf_image: None,
         macho_image: None,
+        pe_image: None,
             dwarf: None,
         };
 
@@ -1593,6 +1606,7 @@ mod relocation_lift {
             file_flags: None,
             elf_image: None,
         macho_image: None,
+        pe_image: None,
             dwarf: None,
         };
 
@@ -1709,6 +1723,7 @@ mod relocation_lift {
             file_flags: None,
             elf_image: None,
         macho_image: None,
+        pe_image: None,
             dwarf: None,
         };
 

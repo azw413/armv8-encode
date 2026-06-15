@@ -71,6 +71,10 @@ pub struct DecodedRef<'a, I: Isa> {
     pub address: u64,
     pub mnemonic: I::Mnemonic,
     pub operands: &'a [I::Operand],
+    /// Encoded byte length of the source instruction. Threaded into
+    /// the lifted [`RewriteInstruction::source_size`] so variable-
+    /// width ISAs lay out at their true footprint.
+    pub size: u64,
 }
 
 impl<I: Isa> RewritePlan<I> {
@@ -89,6 +93,7 @@ impl<I: Isa> RewritePlan<I> {
                 address: I::decoded_address(i),
                 mnemonic: I::decoded_mnemonic(i),
                 operands: I::decoded_operands(i),
+                size: I::decoded_size(i),
             })
             .collect();
         Self::lift_inner(cfg, &refs, None)
@@ -107,6 +112,7 @@ impl<I: Isa> RewritePlan<I> {
                 address: I::decoded_address(i),
                 mnemonic: I::decoded_mnemonic(i),
                 operands: I::decoded_operands(i),
+                size: I::decoded_size(i),
             })
             .collect();
         Self::lift_inner(cfg, &refs, Some(container))
@@ -378,6 +384,7 @@ fn lift_instruction<'a, I: Isa>(
         mnemonic: insn.mnemonic,
         operands,
         original_address: Some(insn.address),
+        source_size: Some(insn.size),
     }
 }
 

@@ -177,8 +177,11 @@ fn print_header(container: &Container, path: &str, byte_size: usize) {
     println!("Size:      {byte_size} bytes");
     println!("Format:    {:?}", container.format);
     println!("Arch:      {:?}", container.architecture);
-    if container.architecture != Architecture::Aarch64 {
-        println!("Note:      disassembly only works for AArch64; other listings still apply.");
+    if !matches!(
+        container.architecture,
+        Architecture::Aarch64 | Architecture::X86_64 | Architecture::X86
+    ) {
+        println!("Note:      disassembly only works for AArch64 and x86; other listings still apply.");
     }
     println!();
 }
@@ -346,9 +349,16 @@ fn print_relocation_summary(container: &Container) {
 }
 
 fn print_disassembly(container: &Container) {
-    if container.architecture != Architecture::Aarch64 {
-        println!("Disassembly: skipped (architecture is not AArch64).");
-        return;
+    match container.architecture {
+        Architecture::Aarch64 => {}
+        Architecture::X86_64 | Architecture::X86 => {
+            print_disassembly_x86(container);
+            return;
+        }
+        _ => {
+            println!("Disassembly: skipped (architecture is not AArch64 or x86).");
+            return;
+        }
     }
 
     let symbol_map: HashMap<u64, String> = container
@@ -433,6 +443,73 @@ fn print_disassembly(container: &Container) {
                 aarch64::TimelineEntry::Data(range) => {
                     print_data_range(range);
                 }
+            }
+        }
+        println!();
+    }
+}
+
+/// x86 / x86_64 disassembly: linear sweep per text section, rendered
+/// with iced's Intel-syntax formatter. Simpler than the AArch64 path
+/// (no recursive-descent timeline) — the variable-length stream is
+/// decoded straight through and labelled with any symbol at each
+/// address.
+fn print_disassembly_x86(container: &Container) {
+    use armv8_encode::isa::x86;
+    use iced_x86::{Formatter, IntelFormatter};
+
+    let bitness = match x86::bitness_for_architecture(container.architecture) {
+        Some(b) => b,
+        None => return,
+    };
+
+    let symbol_map: HashMap<u64, String> = container
+        .symbols
+        .iter()
+        .filter(|symbol| !symbol.is_undefined && !symbol.name.is_empty())
+        .map(|symbol| (symbol.address, symbol.name.clone()))
+        .collect();
+
+    let text_sections: Vec<_> = container.text_sections().collect();
+    if text_sections.is_empty() {
+        println!("Disassembly: no text sections present.");
+        return;
+    }
+
+    let mut formatter = IntelFormatter::new();
+    for section in text_sections {
+        let Some((base, bytes)) = section.for_disassembly() else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+
+        match x86::disassemble_bytes(base, bytes, bitness) {
+            Ok(instructions) => {
+                println!(
+                    "Disassembly of {} ({} bytes at {:#x}, {} instructions):",
+                    section.name,
+                    bytes.len(),
+                    base,
+                    instructions.len(),
+                );
+                for decoded in &instructions {
+                    if let Some(label) = symbol_map.get(&decoded.address) {
+                        println!("\n{label}:");
+                    }
+                    let mut text = String::new();
+                    formatter.format(&decoded.instr, &mut text);
+                    println!("  {:>10x}: {text}", decoded.address);
+                }
+            }
+            Err(err) => {
+                println!(
+                    "Disassembly of {} ({} bytes at {:#x}): failed — {err}",
+                    section.name,
+                    bytes.len(),
+                    base,
+                );
             }
         }
         println!();
@@ -752,6 +829,11 @@ fn relocation_kind_label(kind: RelocationKind) -> String {
         RelocationKind::ThumbJump19 => "ThumbJump19".into(),
         RelocationKind::ThumbMovwAbsNc => "ThumbMovwAbsNc".into(),
         RelocationKind::ThumbMovtAbs => "ThumbMovtAbs".into(),
+        RelocationKind::X86Pc32 => "X86Pc32".into(),
+        RelocationKind::X86Plt32 => "X86Plt32".into(),
+        RelocationKind::X86GotPcRel => "X86GotPcRel".into(),
+        RelocationKind::X86Abs32 => "X86Abs32".into(),
+        RelocationKind::X86Abs64 => "X86Abs64".into(),
         RelocationKind::Other(code) => format!("Other(0x{code:x})"),
     }
 }

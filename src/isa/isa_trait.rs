@@ -86,6 +86,15 @@ pub trait Isa: 'static + Sized + Debug {
     /// Mnemonic of the decoded instruction.
     fn decoded_mnemonic(insn: &Self::DecodedInstruction) -> Self::Mnemonic;
 
+    /// Encoded byte length of the decoded instruction. Fixed-width
+    /// ISAs (AArch64, A32) get the right answer from the default,
+    /// which defers to [`Self::instruction_source_size`]; variable-
+    /// width ISAs (x86, Thumb) must override to report the actual
+    /// decoded length so the layout pass reserves the correct space.
+    fn decoded_size(insn: &Self::DecodedInstruction) -> u64 {
+        Self::instruction_source_size(Self::decoded_mnemonic(insn))
+    }
+
     /// Operand slice of the decoded instruction. Borrowed so
     /// the rewrite layer can build `DecodedRef`s without
     /// cloning the operand vec.
@@ -197,7 +206,10 @@ pub trait Isa: 'static + Sized + Debug {
     ) -> u64 {
         original_instructions
             .iter()
-            .map(|i| Self::instruction_source_size(i.mnemonic))
+            .map(|i| {
+                i.source_size
+                    .unwrap_or_else(|| Self::instruction_source_size(i.mnemonic))
+            })
             .sum()
     }
 

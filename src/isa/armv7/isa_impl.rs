@@ -68,6 +68,14 @@ impl Isa for ThumbIsa {
         &insn.operands
     }
 
+    fn decoded_size(insn: &Self::DecodedInstruction) -> u64 {
+        // Thumb is variable-width (2 or 4 bytes); report the true
+        // decoded width so layout reserves the exact footprint
+        // instead of the conservative-large estimate from
+        // `instruction_source_size`.
+        insn.size_bytes()
+    }
+
     fn pcrel_kind(operand: &Self::Operand) -> Option<(PcRelKind, u64)> {
         match operand {
             DecodedOperand::BranchTarget(addr) => Some((PcRelKind::Branch, *addr)),
@@ -461,6 +469,7 @@ mod tests {
                 address: i.address,
                 mnemonic: i.mnemonic,
                 operands: &i.operands,
+                size: i.size_bytes(),
             })
             .collect();
         let plan = RewritePlan::<ThumbIsa>::lift_refs(&cfg, &refs);

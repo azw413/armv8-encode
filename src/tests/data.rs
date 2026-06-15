@@ -104,6 +104,7 @@ fn vtable_container() -> Container {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     }
 }
@@ -189,6 +190,7 @@ fn lift_emits_bytes_around_pointers() {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     };
 
@@ -257,6 +259,7 @@ fn lift_passes_unhandled_relocation_kinds_through() {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     };
 
@@ -451,6 +454,7 @@ fn commit_to_data_container_preserves_unhandled_relocations() {
         file_flags: None,
         elf_image: None,
         macho_image: None,
+        pe_image: None,
         dwarf: None,
     };
 

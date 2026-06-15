@@ -444,6 +444,8 @@ mod tests {
                 address: i.address,
                 mnemonic: i.mnemonic,
                 operands: &i.operands,
+                // A32 is fixed 4-byte width.
+                size: 4,
             })
             .collect();
         let plan = RewritePlan::<ArmIsa>::lift_refs(&cfg, &refs);
