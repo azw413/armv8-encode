@@ -91,7 +91,7 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
         (
             BinaryFormat::Pe,
             ContainerKind::SharedObject | ContainerKind::Executable,
-        ) => Some(lift_pe_image(&file, bytes)),
+        ) => Some(lift_pe_image(&file, bytes, architecture)),
         _ => None,
     };
 
@@ -114,7 +114,11 @@ pub fn parse(bytes: &[u8]) -> Result<Container, ContainerError> {
 /// overrides: the raw bytes plus each section's on-disk placement
 /// (`PointerToRawData` / `SizeOfRawData`), read straight off
 /// `object`'s `file_range()`.
-fn lift_pe_image(file: &File<'_>, bytes: &[u8]) -> crate::container::pe_image::PeImage {
+fn lift_pe_image(
+    file: &File<'_>,
+    bytes: &[u8],
+    architecture: Architecture,
+) -> crate::container::pe_image::PeImage {
     use crate::container::pe_image::{PeImage, PeSectionFile};
     let sections = file
         .sections()
@@ -128,10 +132,154 @@ fn lift_pe_image(file: &File<'_>, bytes: &[u8]) -> crate::container::pe_image::P
             })
         })
         .collect();
+
+    // The neutral container doesn't model the PE import/export/reloc
+    // directories or the optional header, so re-parse the bytes with the
+    // typed `object::read::pe` view. PE32 vs PE32+ is keyed off the
+    // architecture (i386/ARMv7 are PE32; x86-64/AArch64 are PE32+).
+    let meta = match architecture {
+        Architecture::X86 | Architecture::Arm => {
+            lift_pe_metadata::<object::pe::ImageNtHeaders32>(bytes)
+        }
+        _ => lift_pe_metadata::<object::pe::ImageNtHeaders64>(bytes),
+    }
+    .unwrap_or_default();
+
     PeImage {
         raw_bytes: bytes.to_vec(),
         sections,
+        image_base: meta.image_base,
+        entry_point: meta.entry_point,
+        imports: meta.imports,
+        exports: meta.exports,
+        base_relocs: meta.base_relocs,
     }
+}
+
+#[derive(Default)]
+struct PeMetadata {
+    image_base: u64,
+    entry_point: u64,
+    imports: Vec<crate::container::pe_image::PeImport>,
+    exports: Vec<crate::container::pe_image::PeExport>,
+    base_relocs: Vec<crate::container::pe_image::PeBaseReloc>,
+}
+
+/// Lift the PE directories the neutral model omits — imports, exports,
+/// base relocations — plus the optional header's image base and entry
+/// point, as virtual addresses. Best-effort: a directory that fails to
+/// parse contributes nothing rather than failing the whole read.
+fn lift_pe_metadata<Pe: object::read::pe::ImageNtHeaders>(bytes: &[u8]) -> Option<PeMetadata> {
+    use crate::container::pe_image::{PeBaseReloc, PeExport, PeImport};
+    use object::read::pe::{ImageOptionalHeader, PeFile};
+    use object::{pe, LittleEndian as LE};
+
+    let file = PeFile::<Pe>::parse(bytes).ok()?;
+    let image_base = file.relative_address_base();
+    let entry_rva = file.nt_headers().optional_header().address_of_entry_point();
+    let entry_point = if entry_rva == 0 {
+        0
+    } else {
+        image_base.wrapping_add(entry_rva as u64)
+    };
+
+    let mut meta = PeMetadata {
+        image_base,
+        entry_point,
+        ..PeMetadata::default()
+    };
+
+    let thunk_size = core::mem::size_of::<Pe::ImageThunkData>() as u64;
+
+    // --- imports ---
+    if let Ok(Some(import_table)) = file.import_table() {
+        if let Ok(mut descriptors) = import_table.descriptors() {
+            while let Ok(Some(descriptor)) = descriptors.next() {
+                let library = import_table
+                    .name(descriptor.name.get(LE))
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .unwrap_or_default();
+                let first_thunk = descriptor.first_thunk.get(LE);
+                let original = descriptor.original_first_thunk.get(LE);
+                // Walk the lookup table (original first thunk) when present —
+                // it survives binding — but the IAT slot address always comes
+                // from `first_thunk`.
+                let lookup = if original != 0 { original } else { first_thunk };
+                let Ok(mut thunks) = import_table.thunks(lookup) else {
+                    continue;
+                };
+                let mut iat_rva = first_thunk as u64;
+                while let Ok(Some(thunk)) = thunks.next::<Pe>() {
+                    if let Ok(import) = import_table.import::<Pe>(thunk) {
+                        let (name, ordinal) = match import {
+                            object::read::pe::Import::Ordinal(o) => (None, Some(o)),
+                            object::read::pe::Import::Name(_hint, n) => {
+                                (Some(String::from_utf8_lossy(n).into_owned()), None)
+                            }
+                        };
+                        meta.imports.push(PeImport {
+                            library: library.clone(),
+                            name,
+                            ordinal,
+                            iat_address: image_base.wrapping_add(iat_rva),
+                        });
+                    }
+                    iat_rva += thunk_size;
+                }
+            }
+        }
+    }
+
+    // --- exports ---
+    if let Ok(Some(export_table)) = file.export_table() {
+        if let Ok(exports) = export_table.exports() {
+            for export in exports {
+                let name = export.name.map(|n| String::from_utf8_lossy(n).into_owned());
+                let (address, forward) = match export.target {
+                    object::read::pe::ExportTarget::Address(rva) => {
+                        (image_base.wrapping_add(rva as u64), None)
+                    }
+                    object::read::pe::ExportTarget::ForwardByName(dll, name) => (
+                        0,
+                        Some(format!(
+                            "{}.{}",
+                            String::from_utf8_lossy(dll),
+                            String::from_utf8_lossy(name)
+                        )),
+                    ),
+                    object::read::pe::ExportTarget::ForwardByOrdinal(dll, ord) => {
+                        (0, Some(format!("{}.#{}", String::from_utf8_lossy(dll), ord)))
+                    }
+                };
+                meta.exports.push(PeExport {
+                    name,
+                    ordinal: export.ordinal,
+                    address,
+                    forward,
+                });
+            }
+        }
+    }
+
+    // --- base relocations ---
+    if let Ok(Some(mut blocks)) = file
+        .data_directories()
+        .relocation_blocks(bytes, &file.section_table())
+    {
+        while let Ok(Some(block)) = blocks.next() {
+            for reloc in block {
+                if reloc.typ == pe::IMAGE_REL_BASED_ABSOLUTE {
+                    continue; // padding
+                }
+                meta.base_relocs.push(PeBaseReloc {
+                    address: image_base.wrapping_add(reloc.virtual_address as u64),
+                    typ: reloc.typ,
+                });
+            }
+        }
+    }
+
+    Some(meta)
 }
 
 /// Capture every ELF-specific blob the neutral types don't model.

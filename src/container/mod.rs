@@ -69,7 +69,7 @@ pub use macho_swift::{
     read_swift_metadata, SwiftConformance, SwiftField, SwiftMetadata, SwiftProtocol, SwiftReadError,
     SwiftRef, SwiftType, SwiftTypeKind, SwiftVTableEntry,
 };
-pub use pe_image::{PeImage, PeSectionFile};
+pub use pe_image::{PeBaseReloc, PeExport, PeImage, PeImport, PeSectionFile};
 pub use types::{
     Architecture, BinaryFormat, Container, ContainerError, ContainerKind, DwarfFunction,
     DwarfInfo, FileFlags, Function, FunctionProvenance, Relocation, RelocationId, RelocationKind,

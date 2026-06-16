@@ -25,6 +25,11 @@ fn fake_pe(text: Vec<u8>) -> Container {
             file_offset: 8,
             file_size: 4,
         }],
+        image_base: 0x1_4000_0000,
+        entry_point: 0,
+        imports: Vec::new(),
+        exports: Vec::new(),
+        base_relocs: Vec::new(),
     };
     Container {
         format: BinaryFormat::Pe,
