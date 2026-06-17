@@ -1581,6 +1581,89 @@ impl BinaryState {
         Ok(symbol_id)
     }
 
+    /// Append a function from a pre-built rewrite plan into a fresh `PT_LOAD`
+    /// segment, returning its symbol.
+    ///
+    /// Like [`Self::add_function`], but the caller supplies a (possibly
+    /// multi-block) [`RewritePlan`](crate::rewrite::RewritePlan) instead of a
+    /// flat instruction list. Intra-function `Target::Block` branches in the
+    /// plan are resolved against the function's own layout, so this can relocate
+    /// a branching function (e.g. one lifted via
+    /// [`RewritePlan::lift_from_decoded`](crate::rewrite::RewritePlan::lift_from_decoded))
+    /// with its control flow intact. Same ET_DYN/ET_EXEC requirement as
+    /// `add_function`.
+    pub fn add_function_from_plan<I: Isa>(
+        &mut self,
+        name: &str,
+        plan: RewritePlanGeneric<I>,
+    ) -> Result<SymbolId, TextEditorError> {
+        if plan.blocks.iter().all(|b| b.ops.is_empty()) {
+            return Err(TextEditorError::EmptyFunction(name.to_string()));
+        }
+        if !matches!(
+            self.container.kind,
+            crate::container::ContainerKind::SharedObject
+                | crate::container::ContainerKind::Executable,
+        ) {
+            return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
+        }
+
+        // Conservative capacity estimate (a fused macro op can be >1
+        // instruction); the real size is taken from the emitted bytes.
+        let op_count: u64 = plan.blocks.iter().map(|b| b.ops.len() as u64).sum();
+        self.check_intra_text_capacity(
+            op_count * 8 + 3,
+            &format!("add_function_from_plan({name:?})"),
+        )?;
+
+        let segment_vaddr = match &self.appended {
+            Some(state) => state.segment_vaddr,
+            None => self.pick_append_vaddr()?,
+        };
+        let raw_cumulative = self
+            .appended
+            .as_ref()
+            .map(|s| s.bytes.len() as u64)
+            .unwrap_or(0);
+        let cumulative_offset = (raw_cumulative + 3) & !3;
+        if cumulative_offset > raw_cumulative {
+            let state = self.appended.get_or_insert(AppendedFunctionsState {
+                segment_vaddr,
+                bytes: Vec::new(),
+                exports: Vec::new(),
+            });
+            state.bytes.resize(cumulative_offset as usize, 0);
+        }
+        let function_vaddr = segment_vaddr + cumulative_offset;
+
+        // Register the symbol before layout so the body can self-reference.
+        let symbol_id = SymbolId(self.container.symbols.len());
+        self.container.symbols.push(crate::container::Symbol {
+            id: symbol_id,
+            name: name.to_string(),
+            address: function_vaddr,
+            size: 0,
+            kind: SymbolKind::Function,
+            binding: crate::container::SymbolBinding::Global,
+            section: None,
+            is_undefined: false,
+            flags: None,
+        });
+
+        let layout = lay_out(&plan, function_vaddr, Some(&self.container))?;
+        let output = emit(&plan, &layout, Some(&self.container))?;
+        self.container.symbols[symbol_id.0].size = output.bytes.len() as u64;
+
+        let state = self.appended.get_or_insert(AppendedFunctionsState {
+            segment_vaddr,
+            bytes: Vec::new(),
+            exports: Vec::new(),
+        });
+        state.bytes.extend_from_slice(&output.bytes);
+
+        Ok(symbol_id)
+    }
+
     /// Append a new function to the binary *and* expose it as a
     /// dynamic export.
     ///
