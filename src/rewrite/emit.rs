@@ -238,12 +238,17 @@ pub(crate) fn symbol_needs_relocation(
             .unwrap_or(false);
         return !has_plt_stub;
     }
-    if symbol.kind == SymbolKind::Section {
-        return true;
-    }
+    // Appended code (e.g. via `add_function_from_plan`) has no owning section:
+    // it's being folded into a final, fully-linked image with no subsequent
+    // linker, so every defined reference — including section-relative ones like
+    // an `adrp` into `.rodata` — must be folded to its address, not emitted as a
+    // relocation that nothing will apply.
     let Some(current) = current_section else {
         return false;
     };
+    if symbol.kind == SymbolKind::Section {
+        return true;
+    }
     let Some(symbol_section) = symbol.section else {
         return false;
     };
