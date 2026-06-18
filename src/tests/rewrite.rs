@@ -1747,6 +1747,99 @@ mod relocation_lift {
     }
 
     #[test]
+    fn macro_in_final_image_is_folded_verbatim_not_relocated() {
+        // Same section-symbol `adrp+add` macro, but in a *final* image
+        // (ContainerKind::Executable) emitted in place. There is no linker to
+        // apply a relocation, so the unmodified macro must be copied verbatim
+        // from the source bytes (preserving the real page reference) rather than
+        // re-expanded to `adrp #0` + an unapplied relocation. Regression for the
+        // computed-goto callee that branched to a bad address after rewrite.
+        use crate::rewrite::{emit, lay_out};
+
+        let adrp_word = 0x90000000_u32;
+        let add_word = 0x91000000_u32;
+        let mut text_bytes = Vec::new();
+        text_bytes.extend_from_slice(&adrp_word.to_le_bytes());
+        text_bytes.extend_from_slice(&add_word.to_le_bytes());
+        text_bytes.extend_from_slice(&0xd65f03c0_u32.to_le_bytes()); // ret
+
+        let container = Container {
+            format: BinaryFormat::Elf,
+            architecture: Architecture::Aarch64,
+            kind: ContainerKind::Executable,
+            sections: vec![
+                Section {
+                    id: SectionId(0),
+                    name: ".text".to_string(),
+                    address: 0,
+                    size: text_bytes.len() as u64,
+                    bytes: text_bytes.clone(),
+                    kind: SectionKind::Text,
+                    align: 4,
+                    flags: None,
+                    raw_sh_type: None,
+                },
+                Section {
+                    id: SectionId(1),
+                    name: ".rodata".to_string(),
+                    address: 0,
+                    size: 16,
+                    bytes: vec![0; 16],
+                    kind: SectionKind::Rodata,
+                    align: 1,
+                    flags: None,
+                    raw_sh_type: None,
+                },
+            ],
+            symbols: vec![Symbol {
+                id: SymbolId(0),
+                name: "".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Section,
+                binding: SymbolBinding::Local,
+                section: Some(SectionId(1)),
+                is_undefined: false,
+                flags: None,
+            }],
+            relocations: vec![
+                Relocation {
+                    id: RelocationId(0),
+                    section: SectionId(0),
+                    offset: 0,
+                    kind: RelocationKind::AdrpPage21,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+                Relocation {
+                    id: RelocationId(1),
+                    section: SectionId(0),
+                    offset: 4,
+                    kind: RelocationKind::AddPageOffset12,
+                    size: 32,
+                    addend: 0,
+                    symbol: Some(SymbolId(0)),
+                },
+            ],
+            file_flags: None,
+            elf_image: None,
+            macho_image: None,
+            pe_image: None,
+            dwarf: None,
+        };
+
+        let instructions = aarch64::disassemble_bytes(0, &text_bytes).unwrap();
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlan::lift_with_container(&cfg, &instructions, &container);
+        let layout = lay_out(&plan, 0, Some(&container)).unwrap();
+        let output = emit(&plan, &layout, Some(&container)).unwrap();
+
+        assert!(output.relocations.is_empty(), "final-image macro must not relocate");
+        assert_eq!(output.bytes, text_bytes, "macro must be copied verbatim in a final image");
+    }
+
+    #[test]
     fn lift_emits_relocation_when_no_op_rewrite_round_trips_extern_call() {
         // End-to-end: read → lift → layout → emit, no edits. The output
         // must carry a Branch26 relocation, not a literal displacement.

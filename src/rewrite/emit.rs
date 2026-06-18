@@ -132,24 +132,29 @@ fn emit_instruction<I: Isa>(
     current_section: Option<SectionId>,
     output: &mut EmitOutput,
 ) -> Result<(), EmitError> {
+    let reloc = needs_relocation::<I>(instruction, container, current_section);
+
     // An unmodified instruction re-emitted in its own section at its original
     // address is copied verbatim from the source bytes rather than re-encoded.
     // Re-encoding from operands is lossy (extended-register addressing, some
     // FP/SIMD forms, alias encodings), and an unchanged PC-relative reference
     // (e.g. an `adrp` into another section) must not be turned into a relocation
-    // the final image has no linker to apply — so this runs *before* the
-    // relocation check and only fires when the instruction provably didn't
-    // change.
-    if let Some(raw) =
-        verbatim_bytes::<I>(instruction, instr_layout.address, block_addresses, container)
-    {
-        output.bytes.extend_from_slice(&raw);
-        return Ok(());
+    // the final image has no linker to apply. In a *relocatable* object, though,
+    // a reference that needs a relocation must keep it (the object gets
+    // relinked), so only skip verbatim for that case.
+    let is_relocatable = container.is_some_and(|c| {
+        matches!(c.kind, crate::container::ContainerKind::Relocatable)
+    });
+    if !(is_relocatable && reloc.is_some()) {
+        if let Some(raw) =
+            verbatim_bytes::<I>(instruction, instr_layout.address, block_addresses, container)
+        {
+            output.bytes.extend_from_slice(&raw);
+            return Ok(());
+        }
     }
 
-    if let Some((symbol_id, kind)) =
-        needs_relocation::<I>(instruction, container, current_section)
-    {
+    if let Some((symbol_id, kind)) = reloc {
         return emit_with_relocation::<I>(instruction, instr_layout.address, symbol_id, kind, output);
     }
 

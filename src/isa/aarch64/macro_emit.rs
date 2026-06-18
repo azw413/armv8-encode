@@ -19,6 +19,15 @@ pub(super) fn emit_macro(
     bytes: &mut Vec<u8>,
     relocations: &mut Vec<MacroEmittedRelocation>,
 ) -> Result<(), MacroEmitError<EncodeError>> {
+    // A fused macro (e.g. `adrp+add` to materialize an address) that wasn't
+    // modified and is emitted at its original location is copied verbatim from
+    // the source bytes. Re-expanding it routes a cross-section reference through
+    // a relocation the final image can't apply (→ `adrp #0`), or otherwise
+    // re-encodes lossily; the original bytes already encode the right thing.
+    if let Some(raw) = verbatim_macro(macro_op, here, block_addresses, container, current_section) {
+        bytes.extend_from_slice(&raw);
+        return Ok(());
+    }
     match macro_op.kind {
         AarchMacroKind::LoadAddress => emit_load_address(
             macro_op,
@@ -225,6 +234,66 @@ fn build_add_immediate_template(rd: &Register, immediate: i64) -> InstructionTem
             DecodedOperand::Immediate(immediate),
         ],
     }
+}
+
+/// If `macro_op` is unmodified — emitted at its original address, in a text
+/// section, with bytes that still decode to its `original_instructions` (plain
+/// operands equal; a symbolic page/branch still resolves to the original
+/// target) — return those original bytes to copy verbatim. `None` otherwise, so
+/// the caller re-expands the macro.
+fn verbatim_macro(
+    macro_op: &MacroOp<Aarch64Isa>,
+    here: u64,
+    block_addresses: &[u64],
+    container: Option<&Container>,
+    current_section: Option<SectionId>,
+) -> Option<Vec<u8>> {
+    let first = *macro_op.original_addresses.first()?;
+    if here != first {
+        return None; // only when relocated in place (PC-relative fields stay valid)
+    }
+    let container = container?;
+    // In a relocatable object a reference that needs a relocation must keep it
+    // (the object will be relinked); only fold to verbatim bytes in final images.
+    if matches!(container.kind, crate::container::ContainerKind::Relocatable) {
+        if let Target::Symbol(id) = macro_op.target {
+            if symbol_needs_relocation(container, id, current_section) {
+                return None;
+            }
+        }
+    }
+    let sid = container.section_for_address(first)?;
+    let section = container.section(sid);
+    if section.kind != crate::container::SectionKind::Text {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(macro_op.original_instructions.len() * 4);
+    let mut addr = first;
+    for insn in &macro_op.original_instructions {
+        let off = usize::try_from(addr.checked_sub(section.address)?).ok()?;
+        let raw = section.bytes.get(off..off + 4)?; // AArch64 is fixed 4-byte
+        let word = u32::from_le_bytes(raw.try_into().ok()?);
+        let decoded = super::decode_instruction(addr, word).ok()?;
+        if decoded.mnemonic != insn.mnemonic || decoded.operands.len() != insn.operands.len() {
+            return None;
+        }
+        for (d, r) in decoded.operands.iter().zip(&insn.operands) {
+            let matches = match r {
+                RewriteOperand::Decoded(o) => o == d,
+                RewriteOperand::Branch(t) => matches!(d, DecodedOperand::BranchTarget(a)
+                    if resolve_target(*t, block_addresses, Some(container)) == Some(*a)),
+                RewriteOperand::Page(t) => matches!(d, DecodedOperand::PageTarget(a)
+                    if resolve_target(*t, block_addresses, Some(container)) == Some(*a)),
+            };
+            if !matches {
+                return None;
+            }
+        }
+        out.extend_from_slice(raw);
+        addr += 4;
+    }
+    Some(out)
 }
 
 fn resolve_target(
