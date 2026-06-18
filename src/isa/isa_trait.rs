@@ -100,6 +100,17 @@ pub trait Isa: 'static + Sized + Debug {
     /// cloning the operand vec.
     fn decoded_operands(insn: &Self::DecodedInstruction) -> &[Self::Operand];
 
+    /// Decode one instruction from raw little-endian bytes at `address`.
+    /// Used by the emitter to copy an unmodified instruction's original
+    /// bytes verbatim instead of re-encoding it from operands — re-encoding
+    /// is lossy (e.g. it cannot reproduce extended-register addressing or
+    /// every FP/SIMD form, and picks a different-but-equivalent encoding for
+    /// aliases). Returns `None` if the bytes don't decode or the ISA opts out
+    /// (the default), in which case the emitter re-encodes from operands.
+    fn decode(_address: u64, _bytes: &[u8]) -> Option<Self::DecodedInstruction> {
+        None
+    }
+
     // --- Operand introspection -----------------------------
 
     /// If `operand` carries a PC-relative target, return the

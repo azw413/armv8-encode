@@ -3,12 +3,12 @@
 //! Generic over [`Isa`] — encoding, widening sequences, and
 //! macro emission all delegate to the trait.
 
-use crate::container::{Container, RelocationKind, SectionId, SymbolId};
+use crate::container::{Container, RelocationKind, SectionId, SectionKind, SymbolId};
 use crate::isa::{Isa, MacroEmitError, MacroEmittedRelocation, PcRelKind};
 use crate::rewrite::ir::{
     MacroOp, RewriteInstruction, RewriteOp, RewriteOperand, Target,
 };
-use crate::rewrite::layout::{EmitStrategy, Layout, LayoutError};
+use crate::rewrite::layout::{resolve_target, EmitStrategy, Layout, LayoutError};
 use crate::rewrite::plan::RewritePlan;
 
 /// A fix-up the rewriter wants the linker to apply.
@@ -132,6 +132,21 @@ fn emit_instruction<I: Isa>(
     current_section: Option<SectionId>,
     output: &mut EmitOutput,
 ) -> Result<(), EmitError> {
+    // An unmodified instruction re-emitted in its own section at its original
+    // address is copied verbatim from the source bytes rather than re-encoded.
+    // Re-encoding from operands is lossy (extended-register addressing, some
+    // FP/SIMD forms, alias encodings), and an unchanged PC-relative reference
+    // (e.g. an `adrp` into another section) must not be turned into a relocation
+    // the final image has no linker to apply — so this runs *before* the
+    // relocation check and only fires when the instruction provably didn't
+    // change.
+    if let Some(raw) =
+        verbatim_bytes::<I>(instruction, instr_layout.address, block_addresses, container)
+    {
+        output.bytes.extend_from_slice(&raw);
+        return Ok(());
+    }
+
     if let Some((symbol_id, kind)) =
         needs_relocation::<I>(instruction, container, current_section)
     {
@@ -167,6 +182,70 @@ fn emit_instruction<I: Isa>(
         }
     }
     Ok(())
+}
+
+/// If `instruction` is unmodified — its IR matches the original bytes at
+/// `original_address`, which lie in the section currently being re-emitted —
+/// return those original bytes for the emitter to copy verbatim. Returns `None`
+/// when the instruction was changed, originates elsewhere, or can't be placed at
+/// `emit_addr` without invalidating a PC-relative field; the caller then
+/// re-encodes from operands.
+fn verbatim_bytes<I: Isa>(
+    instruction: &RewriteInstruction<I>,
+    emit_addr: u64,
+    block_addresses: &[u64],
+    container: Option<&Container>,
+) -> Option<Vec<u8>> {
+    let orig_addr = instruction.original_address?;
+    let container = container?;
+    // Source bytes must come from an executable section — guards against a
+    // synthesized instruction whose (bogus, often low) original address happens
+    // to resolve into some data section. Code copied from another text address
+    // (e.g. a relocated function body) is fine: the decode + operand check below
+    // confirms the bytes really are this instruction.
+    let sid = container.section_for_address(orig_addr)?;
+    let section = container.section(sid);
+    if section.kind != SectionKind::Text {
+        return None;
+    }
+    let off = usize::try_from(orig_addr.checked_sub(section.address)?).ok()?;
+    let tail = section.bytes.get(off..)?;
+    let decoded = I::decode(orig_addr, tail)?;
+
+    // Unmodified: same mnemonic and every operand still matches the original.
+    if I::decoded_mnemonic(&decoded) != instruction.mnemonic {
+        return None;
+    }
+    let decoded_ops = I::decoded_operands(&decoded);
+    if decoded_ops.len() != instruction.operands.len() {
+        return None;
+    }
+    for (d, r) in decoded_ops.iter().zip(&instruction.operands) {
+        let matches = match r {
+            // A plain operand must be byte-for-byte the same as decoded.
+            RewriteOperand::Decoded(o) => o == d,
+            // A symbolic branch/page is unmodified iff it still points where the
+            // original instruction did — the lift symbolized it from this very
+            // PC-relative target. (A pass that retargeted it, e.g. a trampoline
+            // `b stub`, resolves elsewhere and falls through to re-encode.)
+            RewriteOperand::Branch(t) => matches!(I::pcrel_kind(d), Some((PcRelKind::Branch, abs))
+                if resolve_target(*t, block_addresses, Some(container)).ok() == Some(abs)),
+            RewriteOperand::Page(t) => matches!(I::pcrel_kind(d), Some((PcRelKind::Page, abs))
+                if resolve_target(*t, block_addresses, Some(container)).ok() == Some(abs)),
+        };
+        if !matches {
+            return None;
+        }
+    }
+
+    // Same address: the original encoding (PC-relative or not) is still valid.
+    // Relocated: only position-independent instructions are safe to copy as-is.
+    if orig_addr != emit_addr && decoded_ops.iter().any(|o| I::pcrel_kind(o).is_some()) {
+        return None;
+    }
+
+    let size = I::decoded_size(&decoded) as usize;
+    tail.get(..size).map(<[u8]>::to_vec)
 }
 
 fn emit_macro<I: Isa>(

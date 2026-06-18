@@ -49,6 +49,11 @@ impl Isa for Aarch64Isa {
         &insn.operands
     }
 
+    fn decode(address: u64, bytes: &[u8]) -> Option<Self::DecodedInstruction> {
+        let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+        super::decode_instruction(address, word).ok()
+    }
+
     fn pcrel_kind(operand: &Self::Operand) -> Option<(PcRelKind, u64)> {
         match operand {
             DecodedOperand::BranchTarget(addr) => Some((PcRelKind::Branch, *addr)),

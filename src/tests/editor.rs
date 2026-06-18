@@ -80,6 +80,29 @@ fn for_section_finds_named_text_section_and_lifts_it() {
 }
 
 #[test]
+fn unmodified_instructions_are_copied_verbatim_not_re_encoded() {
+    // `ldrh w0, [x0, w20, uxtw #1]` round-trips lossily: the decoder drops the
+    // `uxtw` extend (it surfaces as `lsl`), so re-encoding from operands would
+    // flip the option bits and change the instruction. Committing a section that
+    // wasn't edited must reproduce the original bytes exactly — the emitter
+    // copies unmodified instructions verbatim instead of re-encoding them.
+    let ldrh: u32 = 0x7874_5800; // ldrh w0, [x0, w20, uxtw #1]
+    let ret: u32 = 0xd65f_03c0;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ldrh.to_le_bytes());
+    bytes.extend_from_slice(&ret.to_le_bytes());
+
+    let mut container = fixture_container();
+    container.sections[0].bytes = bytes.clone();
+    container.symbols[0].size = 8;
+
+    let editor = BinaryEditor::for_section(&container, ".text").expect("for_section");
+    let edited = editor.commit().expect("commit");
+    let text = edited.sections.iter().find(|s| s.name == ".text").expect(".text");
+    assert_eq!(&text.bytes[..8], &bytes[..], "unmodified .text must round-trip byte-exact");
+}
+
+#[test]
 fn for_section_reports_missing_section_cleanly() {
     let container = fixture_container();
     match BinaryEditor::for_section(&container, ".no_such_section") {
