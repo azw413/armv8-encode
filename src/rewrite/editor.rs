@@ -54,7 +54,7 @@ use crate::rewrite::emit::{emit, EmitError};
 use crate::rewrite::ir::{
     RewriteInstruction as RewriteInstructionGeneric, Target,
 };
-use crate::rewrite::layout::{lay_out, LayoutError};
+use crate::rewrite::layout::{lay_out, lay_out_scattered, LayoutError};
 use crate::rewrite::plan::{EditError, RewritePlan as RewritePlanGeneric};
 use crate::rewrite::EmitOutput;
 
@@ -1011,6 +1011,76 @@ impl BinaryEditor {
         let section = text.section_id();
         text.overlay_bytes(va, output.bytes);
         Ok(Some(self.binary.define_text_symbol(name, va, size, true, section)))
+    }
+
+    /// Place a position-independent AArch64 code `plan` SCATTERED across several
+    /// freed `.text` holes: assign each basic block to its own best-fit hole,
+    /// lay out at the fixed per-block addresses, emit, and overlay each block's
+    /// bytes at its hole. The blocks stay correct because they are connected by
+    /// the plan's own inter-block branches; this only works when every such
+    /// branch lands in range (PC-relative `b`/`b.cond`) and the plan emits no
+    /// relocations. Returns `None` (holes unchanged) if it cannot be placed this
+    /// way — the caller should try a whole-hole placement or append instead.
+    ///
+    /// Requires every block to be non-empty (a branch to an empty block has no
+    /// well-defined scattered address); plans with an empty block fall back.
+    pub fn place_plan_scattered(
+        &mut self,
+        name: &str,
+        plan: &RewritePlanGeneric<Aarch64Isa>,
+        holes: &mut Vec<(u64, u64)>,
+    ) -> Result<Option<SymbolId>, TextEditorError> {
+        if plan.blocks.is_empty() {
+            return Ok(None);
+        }
+        // Per-block byte size = sum of each op's source byte size. lay_out_scattered
+        // forbids widening, so emitted block sizes match these exactly.
+        let block_sizes: Vec<u64> = plan
+            .blocks
+            .iter()
+            .map(|b| b.ops.iter().map(|op| op.source_byte_size()).sum())
+            .collect();
+        if block_sizes.iter().any(|&s| s == 0) {
+            return Ok(None);
+        }
+        // Tentatively allocate each block into a hole using a clone of the pool,
+        // so a partial failure leaves the caller's holes untouched.
+        let mut tentative = holes.clone();
+        let mut addrs: Vec<u64> = Vec::with_capacity(block_sizes.len());
+        for &sz in &block_sizes {
+            match take_hole(&mut tentative, sz) {
+                Some(va) => addrs.push(va),
+                None => return Ok(None),
+            }
+        }
+        let layout = match lay_out_scattered(plan, &addrs, Some(&self.binary.container)) {
+            Ok(l) => l,
+            Err(LayoutError::DisplacementTooLarge { .. }) | Err(LayoutError::DidNotConverge) => {
+                return Ok(None);
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let output = emit(plan, &layout, Some(&self.binary.container))?;
+        if !output.relocations.is_empty() {
+            return Ok(None);
+        }
+        // Commit the hole allocation now that placement is guaranteed.
+        *holes = tentative;
+        let total: u64 = block_sizes.iter().sum();
+        let text = self
+            .text
+            .as_mut()
+            .and_then(|t| t.aarch64_mut())
+            .ok_or_else(|| TextEditorError::SectionNotFound("<no aarch64 .text>".into()))?;
+        let section = text.section_id();
+        // emit() produces block bytes in block order, contiguous per block.
+        let mut off = 0usize;
+        for (bi, &sz) in block_sizes.iter().enumerate() {
+            let end = off + sz as usize;
+            text.overlay_bytes(addrs[bi], output.bytes[off..end].to_vec());
+            off = end;
+        }
+        Ok(Some(self.binary.define_text_symbol(name, addrs[0], total, true, section)))
     }
 
     /// Iterate over symbols defined in the lifted text section.

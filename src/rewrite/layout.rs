@@ -98,6 +98,57 @@ pub fn lay_out<I: Isa>(
     Err(LayoutError::DidNotConverge)
 }
 
+/// Lay out `plan` with each block placed at a caller-chosen address
+/// (`block_addresses[i]`), e.g. scattered across freed `.text` holes. Every
+/// block must end with an explicit branch (no implicit fallthrough across the
+/// gaps). Returns `Err(DidNotConverge)` if any PC-relative branch ends up out of
+/// range (the caller should fall back to a contiguous placement), since widening
+/// would change sizes and break the fixed hole assignment.
+pub fn lay_out_scattered<I: Isa>(
+    plan: &RewritePlan<I>,
+    block_addresses: &[u64],
+    container: Option<&Container>,
+) -> Result<Layout, LayoutError> {
+    let mut instruction_layouts: Vec<Vec<InstructionLayout>> = plan
+        .blocks
+        .iter()
+        .map(|block| {
+            block
+                .ops
+                .iter()
+                .map(|op| InstructionLayout {
+                    address: 0,
+                    size: op.source_byte_size(),
+                    strategy: EmitStrategy::Normal,
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut total_size = 0u64;
+    for (bi, block) in plan.blocks.iter().enumerate() {
+        let mut current = block_addresses[bi];
+        for oi in 0..block.ops.len() {
+            instruction_layouts[bi][oi].address = current;
+            current = current.wrapping_add(instruction_layouts[bi][oi].size);
+            total_size += instruction_layouts[bi][oi].size;
+        }
+    }
+
+    // No widening for a fixed placement — if anything is out of range, bail.
+    let grew = widen_out_of_range::<I>(plan, &mut instruction_layouts, block_addresses, container)?;
+    if grew {
+        return Err(LayoutError::DidNotConverge);
+    }
+
+    Ok(Layout {
+        base_address: block_addresses.first().copied().unwrap_or(0),
+        total_size,
+        block_addresses: block_addresses.to_vec(),
+        instruction_layouts,
+    })
+}
+
 fn assign_addresses<I: Isa>(
     plan: &RewritePlan<I>,
     instruction_layouts: &mut [Vec<InstructionLayout>],

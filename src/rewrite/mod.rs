@@ -80,7 +80,9 @@ pub use RewriteOpAArch64 as RewriteOp;
 pub use RewriteOperandAArch64 as RewriteOperand;
 pub use RewritePlanAArch64 as RewritePlan;
 pub use MacroOpAArch64 as MacroOp;
-pub use layout::{lay_out, EmitStrategy, InstructionLayout, Layout, LayoutError};
+pub use layout::{
+    lay_out, lay_out_scattered, EmitStrategy, InstructionLayout, Layout, LayoutError,
+};
 pub use plan::EditError;
 
 pub use crate::mc::ControlFlowGraph;
