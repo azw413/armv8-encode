@@ -313,7 +313,14 @@ fn commit_lifted_section<I: Isa>(
     container: &Container,
 ) -> Result<(Container, EmitOutput, SectionId), TextEditorError> {
     let layout = lay_out(&section.plan, section.base_address, Some(container))?;
-    let output: EmitOutput = emit(&section.plan, &layout, Some(container))?;
+    let mut output: EmitOutput = emit(&section.plan, &layout, Some(container))?;
+    // Drop raw overlays (hole-placed code/data) onto the emitted bytes.
+    for (va, bytes) in &section.overlays {
+        let off = va.wrapping_sub(section.base_address) as usize;
+        if let Some(slot) = output.bytes.get_mut(off..off + bytes.len()) {
+            slot.copy_from_slice(bytes);
+        }
+    }
     let updated = commit_to_container(container, section.section_id, output.clone());
     Ok((updated, output, section.section_id))
 }
@@ -555,6 +562,11 @@ pub struct LiftedTextSection<I: Isa> {
     cfg: ControlFlowGraph,
     /// The mutable plan. Edit primitives delegate to this.
     plan: RewritePlanGeneric<I>,
+    /// Raw byte overlays applied to the emitted section after layout/emit, keyed
+    /// by virtual address. Used to drop pre-assembled, position-independent code
+    /// or data into freed regions ("holes") of the section without routing it
+    /// through the per-instruction plan.
+    overlays: Vec<(u64, Vec<u8>)>,
 }
 
 /// Variant wrapper holding a lifted section for any supported
@@ -818,6 +830,7 @@ impl BinaryEditor {
                     instructions,
                     cfg,
                     plan,
+                    overlays: Vec::new(),
                 })
             }
             Architecture::Arm => {
@@ -840,6 +853,7 @@ impl BinaryEditor {
                     instructions,
                     cfg,
                     plan,
+                    overlays: Vec::new(),
                 })
             }
             Architecture::X86_64 | Architecture::X86 => {
@@ -906,6 +920,7 @@ impl BinaryEditor {
             instructions,
             cfg,
             plan,
+            overlays: Vec::new(),
         }));
         Ok(())
     }
@@ -1024,6 +1039,17 @@ impl<I: Isa> LiftedTextSection<I> {
     /// Base virtual address of the edited section.
     pub fn base_address(&self) -> u64 {
         self.base_address
+    }
+
+    /// Overlay `bytes` onto the section at virtual address `va`, applied after
+    /// layout/emit at commit time (so it overwrites whatever the plan emitted
+    /// there). Use it to place pre-assembled, position-independent code or data
+    /// into a freed region of this section — e.g. reusing the hole left by a
+    /// destroyed function body instead of appending a new segment. The caller is
+    /// responsible for keeping `[va, va+len)` inside the section and not
+    /// overlapping live instructions or other overlays.
+    pub fn overlay_bytes(&mut self, va: u64, bytes: Vec<u8>) {
+        self.overlays.push((va, bytes));
     }
 
     /// The section id this view edits. Lets callers correlate

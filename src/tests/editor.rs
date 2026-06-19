@@ -103,6 +103,25 @@ fn unmodified_instructions_are_copied_verbatim_not_re_encoded() {
 }
 
 #[test]
+fn overlay_bytes_lands_in_the_committed_section() {
+    // Overlaying raw bytes at a VA in the lifted section must overwrite whatever
+    // the plan emitted there (used to drop hole-placed code/data into .text).
+    let container = fixture_container();
+    let mut editor = BinaryEditor::for_section(&container, ".text").expect("for_section");
+    let poke = [0xde, 0xad, 0xbe, 0xef];
+    editor
+        .text
+        .as_mut()
+        .and_then(|t| t.aarch64_mut())
+        .expect("aarch64")
+        .overlay_bytes(0x1004, poke.to_vec()); // over the second instruction
+    let edited = editor.commit().expect("commit");
+    let text = edited.sections.iter().find(|s| s.name == ".text").expect(".text");
+    assert_eq!(&text.bytes[4..8], &poke, "overlay did not land");
+    assert_eq!(&text.bytes[0..4], &0x9400_0001u32.to_le_bytes(), "first insn clobbered");
+}
+
+#[test]
 fn for_section_reports_missing_section_cleanly() {
     let container = fixture_container();
     match BinaryEditor::for_section(&container, ".no_such_section") {
