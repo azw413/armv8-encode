@@ -49,7 +49,8 @@ pub use data::{
     DataLift, DataLiftError, DataPayload, DataSection,
 };
 pub use editor::{
-    BinaryEditor, BinaryState, InitialiserPosition, LiftedTextSection, TextEditorError,
+    BinaryEditor, BinaryState, InitialiserPosition, LiftedTextSection, ScatterPlacement,
+    TextEditorError,
 };
 #[allow(deprecated)]
 pub use editor::TextEditor;

@@ -788,6 +788,20 @@ fn take_hole(holes: &mut Vec<(u64, u64)>, need: u64) -> Option<u64> {
     Some(va)
 }
 
+/// Where each block of a plan landed after [`BinaryEditor::place_plan_scattered`].
+///
+/// `block_vas[i]` is the scattered virtual address of block `i`; `block_offsets[i]`
+/// is that block's offset in the original contiguous blob (a prefix sum of block
+/// sizes). Together they map any byte offset `o` in the original blob to its
+/// scattered address: find the block `b` with the greatest `block_offsets[b] <= o`,
+/// then the address is `block_vas[b] + (o - block_offsets[b])`.
+#[derive(Debug, Clone)]
+pub struct ScatterPlacement {
+    pub symbol: SymbolId,
+    pub block_vas: Vec<u64>,
+    pub block_offsets: Vec<u64>,
+}
+
 impl BinaryEditor {
     /// Construct a new editor over `container` without lifting any
     /// text section. Use this when the only edits are
@@ -1024,12 +1038,17 @@ impl BinaryEditor {
     ///
     /// Requires every block to be non-empty (a branch to an empty block has no
     /// well-defined scattered address); plans with an empty block fall back.
+    ///
+    /// On success returns a [`ScatterPlacement`] describing where each block
+    /// landed (its scattered VA plus its contiguous 0-based offset), so callers
+    /// that need per-instruction addresses (e.g. a computed-goto dispatch table)
+    /// can map a byte offset in the original blob to its scattered address.
     pub fn place_plan_scattered(
         &mut self,
         name: &str,
         plan: &RewritePlanGeneric<Aarch64Isa>,
         holes: &mut Vec<(u64, u64)>,
-    ) -> Result<Option<SymbolId>, TextEditorError> {
+    ) -> Result<Option<ScatterPlacement>, TextEditorError> {
         if plan.blocks.is_empty() {
             return Ok(None);
         }
@@ -1075,12 +1094,15 @@ impl BinaryEditor {
         let section = text.section_id();
         // emit() produces block bytes in block order, contiguous per block.
         let mut off = 0usize;
+        let mut block_offsets: Vec<u64> = Vec::with_capacity(block_sizes.len());
         for (bi, &sz) in block_sizes.iter().enumerate() {
+            block_offsets.push(off as u64);
             let end = off + sz as usize;
             text.overlay_bytes(addrs[bi], output.bytes[off..end].to_vec());
             off = end;
         }
-        Ok(Some(self.binary.define_text_symbol(name, addrs[0], total, true, section)))
+        let symbol = self.binary.define_text_symbol(name, addrs[0], total, true, section);
+        Ok(Some(ScatterPlacement { symbol, block_vas: addrs, block_offsets }))
     }
 
     /// Iterate over symbols defined in the lifted text section.
