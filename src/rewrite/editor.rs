@@ -2029,6 +2029,20 @@ impl BinaryState {
     /// The [`SymbolId`] of the user `body` function (not the
     /// wrapper). Callers can pass it to other editor methods if
     /// they want to call the same code from elsewhere.
+    ///
+    /// Multiple `add_initialiser` calls compose: a later hijack of the same (or
+    /// another) `.init_array` slot reads the *effective* `.rela.dyn` (honouring
+    /// earlier staged overrides), so its wrapper chain-tails to the previously
+    /// installed wrapper instead of orphaning it.
+    fn effective_section_bytes(&self, idx: usize) -> &[u8] {
+        self.section_overrides
+            .iter()
+            .rev()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, b)| b.as_slice())
+            .unwrap_or(&self.container.sections[idx].bytes)
+    }
+
     pub fn add_initialiser(
         &mut self,
         name: &str,
@@ -2127,7 +2141,7 @@ impl BinaryState {
             .ok_or(TextEditorError::NoMatchingRelaDynEntry {
                 init_array_vaddr: slot_vaddr,
             })?;
-        let rela_dyn_bytes = &self.container.sections[rela_dyn_idx].bytes;
+        let rela_dyn_bytes = self.effective_section_bytes(rela_dyn_idx);
         // Each Elf64_Rela is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).
         // We want the entry whose r_offset == slot_vaddr and
         // whose relocation type is R_AARCH64_RELATIVE (1027 / 0x403).
@@ -2269,7 +2283,7 @@ impl BinaryState {
         // don't need changing — R_AARCH64_RELATIVE writes
         // `load_bias + addend` into the slot at load time,
         // ignoring the slot's static contents.
-        let mut new_rela_dyn = self.container.sections[rela_dyn_idx].bytes.clone();
+        let mut new_rela_dyn = self.effective_section_bytes(rela_dyn_idx).to_vec();
         new_rela_dyn[rela_entry_off + 16..rela_entry_off + 24]
             .copy_from_slice(&(wrapper_vaddr as i64).to_le_bytes());
         self.section_overrides.push((rela_dyn_idx, new_rela_dyn));
