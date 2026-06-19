@@ -765,6 +765,29 @@ struct ExportedSymbol {
     size: u64,
 }
 
+/// Best-fit allocate `need` (rounded up to 4) bytes from `holes` (each
+/// `(vaddr, size)`): pick the smallest hole that fits, return its start, shrink
+/// it, and drop a remainder smaller than one instruction. `None` if none fit.
+fn take_hole(holes: &mut Vec<(u64, u64)>, need: u64) -> Option<u64> {
+    let need = (need + 3) & !3;
+    if need == 0 {
+        return None;
+    }
+    let idx = holes
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, size))| size >= need)
+        .min_by_key(|(_, &(_, size))| size)
+        .map(|(i, _)| i)?;
+    let va = holes[idx].0;
+    holes[idx].0 += need;
+    holes[idx].1 -= need;
+    if holes[idx].1 < 4 {
+        holes.remove(idx);
+    }
+    Some(va)
+}
+
 impl BinaryEditor {
     /// Construct a new editor over `container` without lifting any
     /// text section. Use this when the only edits are
@@ -935,6 +958,61 @@ impl BinaryEditor {
         Ok(editor)
     }
 
+    /// Place raw `data` (e.g. a constant pool or encrypted blob) into a freed
+    /// `.text` hole instead of appending: best-fit `data.len()` bytes from
+    /// `holes` (each `(vaddr, size)`), overlay the bytes there, and define an
+    /// Object symbol at that address. Returns the symbol, or `None` (the hole
+    /// list unchanged) when nothing fits — the caller should append instead.
+    /// AArch64 lifted text only.
+    pub fn place_data_in_holes(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        holes: &mut Vec<(u64, u64)>,
+    ) -> Option<SymbolId> {
+        let Some(va) = take_hole(holes, data.len() as u64) else {
+            return None;
+        };
+        let text = self.text.as_mut()?.aarch64_mut()?;
+        let section = text.section_id();
+        text.overlay_bytes(va, data.to_vec());
+        Some(self.binary.define_text_symbol(name, va, data.len() as u64, false, section))
+    }
+
+    /// Place a position-independent AArch64 code `plan` into a freed `.text`
+    /// hole: best-fit it, emit at the hole's address, overlay the bytes, and
+    /// define a Function symbol there. Returns `None` (holes unchanged) if it
+    /// doesn't fit or would require a relocation (which an overlay can't carry) —
+    /// the caller appends instead.
+    pub fn place_plan_in_holes(
+        &mut self,
+        name: &str,
+        plan: &RewritePlanGeneric<Aarch64Isa>,
+        holes: &mut Vec<(u64, u64)>,
+    ) -> Result<Option<SymbolId>, TextEditorError> {
+        // Probe at base 0 for the size and to confirm it emits no relocations
+        // (both are base-independent for a self-contained, non-widening blob).
+        let probe_layout = lay_out(plan, 0, Some(&self.binary.container))?;
+        let probe = emit(plan, &probe_layout, Some(&self.binary.container))?;
+        if !probe.relocations.is_empty() {
+            return Ok(None);
+        }
+        let size = probe.bytes.len() as u64;
+        let Some(va) = take_hole(holes, size) else {
+            return Ok(None);
+        };
+        let layout = lay_out(plan, va, Some(&self.binary.container))?;
+        let output = emit(plan, &layout, Some(&self.binary.container))?;
+        let text = self
+            .text
+            .as_mut()
+            .and_then(|t| t.aarch64_mut())
+            .ok_or_else(|| TextEditorError::SectionNotFound("<no aarch64 .text>".into()))?;
+        let section = text.section_id();
+        text.overlay_bytes(va, output.bytes);
+        Ok(Some(self.binary.define_text_symbol(name, va, size, true, section)))
+    }
+
     /// Iterate over symbols defined in the lifted text section.
     /// Useful for "edit every function in `.text`" workflows.
     /// Panics if no text section has been lifted.
@@ -953,6 +1031,36 @@ impl BinaryEditor {
 }
 
 impl BinaryState {
+    /// Define a local symbol at `addr` in `section` (Function if `func`, else
+    /// Object) and return its id. Used to label artifacts placed into `.text`
+    /// holes so other edits can reference them by symbol.
+    fn define_text_symbol(
+        &mut self,
+        name: &str,
+        addr: u64,
+        size: u64,
+        func: bool,
+        section: SectionId,
+    ) -> SymbolId {
+        let id = SymbolId(self.container.symbols.len());
+        self.container.symbols.push(crate::container::Symbol {
+            id,
+            name: name.to_string(),
+            address: addr,
+            size,
+            kind: if func {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Object
+            },
+            binding: crate::container::SymbolBinding::Local,
+            section: Some(section),
+            is_undefined: false,
+            flags: None,
+        });
+        id
+    }
+
     /// Look up a symbol by name. Returns the first defined or
     /// undefined symbol whose name matches exactly.
     ///
