@@ -10,3 +10,4 @@ tests/macho_runtime/fixtures/lib_demo/host_dlopen
 tests/macho_runtime/fixtures/lib_demo/host_dlopen.dSYM/
 tests/macho_runtime/fixtures/lib_demo/libdep.dylib
 tests/macho_runtime/fixtures/lib_demo/libdep.dylib.dSYM/
+.claude/
