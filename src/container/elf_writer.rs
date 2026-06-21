@@ -212,7 +212,7 @@ pub fn write(container: &Container) -> Result<Vec<u8>, ContainerWriteError> {
     // ELF bitness: aarch64 → 64-bit, ARMv7 → 32-bit. Set
     // by container.architecture; the existing aarch64 paths
     // continue to use 64-bit unchanged.
-    let is_64 = matches!(container.architecture, Architecture::Aarch64);
+    let is_64 = matches!(container.architecture, Architecture::Aarch64 | Architecture::X86_64);
 
     let mut buffer = Vec::new();
     let mut writer = Writer::new(Endianness::Little, is_64, &mut buffer);
@@ -631,7 +631,7 @@ pub(crate) fn write_with_appended_segment_inner(
     // the appended segment's bytes follow the section header table.
     // ---------------------------------------------------------------
 
-    let is_64 = matches!(container.architecture, Architecture::Aarch64);
+    let is_64 = matches!(container.architecture, Architecture::Aarch64 | Architecture::X86_64);
     let mut buffer = Vec::new();
     let mut writer = Writer::new(Endianness::Little, is_64, &mut buffer);
 
@@ -1087,12 +1087,61 @@ fn build_original_extent_stub(
         Architecture::Arm => {
             build_original_extent_stub_arm(section, original_extent, new_seg_vaddr, container)
         }
-        // x86 ELF append-segment stubs are not implemented yet; the
-        // relocatable and in-place edit paths don't need them.
-        Architecture::X86_64 | Architecture::X86 | Architecture::Other => {
-            Err(ContainerWriteError::UnsupportedArchitecture)
+        // x86 / x86-64: same `jmp rel32` trampoline (E9 + 32-bit displacement).
+        Architecture::X86_64 | Architecture::X86 => {
+            build_original_extent_stub_x86(section, original_extent, new_seg_vaddr, container)
         }
+        Architecture::Other => Err(ContainerWriteError::UnsupportedArchitecture),
     }
+}
+
+/// x86/x86-64 trampoline builder. The dead original body is filled with `0x90`
+/// (NOP); each `STT_FUNC` entry in the grown section is overwritten with a 5-byte
+/// near jump (`E9` + `rel32`) to the function's relocated copy in the appended
+/// segment. `rel32` reaches ±2 GiB, so the appended segment is always in range
+/// (no widening needed), and x86 has no instruction-alignment requirement.
+fn build_original_extent_stub_x86(
+    section: &Section,
+    original_extent: u64,
+    new_seg_vaddr: u64,
+    container: &Container,
+) -> Result<Vec<u8>, ContainerWriteError> {
+    let mut bytes = vec![0x90u8; original_extent as usize];
+
+    for symbol in &container.symbols {
+        use crate::container::SymbolKind;
+        if symbol.kind != SymbolKind::Function || symbol.section != Some(section.id) {
+            continue;
+        }
+        if symbol.address < section.address
+            || symbol.address >= section.address + original_extent
+        {
+            continue;
+        }
+        let symbol_offset = symbol.address - section.address;
+        let trampoline_address = section.address + symbol_offset;
+        let target_address = new_seg_vaddr + symbol_offset;
+
+        // `jmp rel32`: displacement is relative to the END of the 5-byte jump.
+        let displacement = target_address as i64 - (trampoline_address as i64 + 5);
+        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&displacement) {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "x86 trampoline displacement for {} ({displacement}) exceeds rel32 range",
+                symbol.name,
+            )));
+        }
+        let dst = symbol_offset as usize;
+        if dst + 5 > bytes.len() {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "function {} at offset {dst:#x} doesn't fit (needs 5 bytes) in original extent {original_extent}",
+                symbol.name,
+            )));
+        }
+        bytes[dst] = 0xE9;
+        bytes[dst + 1..dst + 5].copy_from_slice(&(displacement as i32).to_le_bytes());
+    }
+
+    Ok(bytes)
 }
 
 fn build_original_extent_stub_aarch64(

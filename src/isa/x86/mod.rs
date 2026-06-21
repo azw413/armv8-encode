@@ -24,9 +24,11 @@
 
 pub mod control_flow;
 pub mod encode;
+pub mod isa_impl;
 pub mod sweep;
 
 pub use encode::{assemble, encode_instruction, Assembled, EncodeError};
+pub use isa_impl::{X86Isa, X86Operand};
 pub use sweep::{disassemble_bytes, Bitness, DisassembleError, X86DecodedInstruction};
 
 use crate::container::Architecture;
