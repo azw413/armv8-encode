@@ -492,6 +492,12 @@ pub struct BinaryState {
     /// only do in-place edits keep going through the cheaper
     /// in-place writer path.
     appended: Option<AppendedFunctionsState>,
+    /// Runtime-WRITABLE appended data ([`Self::add_writable_data`]),
+    /// emitted at commit as a separate `PF_R | PF_W` PT_LOAD at its own
+    /// vaddr (picked BELOW the code append region so buffer addresses
+    /// are stable before any referencing function is appended). `None`
+    /// until the first `add_writable_data` call.
+    appended_writable: Option<WritableState>,
     /// Whole-section byte overrides queued by editor methods
     /// (e.g. [`Self::add_initialiser`] queues a rewritten
     /// `.rela.dyn`). Applied at commit time on the
@@ -704,6 +710,15 @@ struct AppendedFunctionsState {
     exports: Vec<ExportedSymbol>,
 }
 
+/// Accumulated runtime-writable appended data (see
+/// [`BinaryState::add_writable_data`]). Concatenated in addition order
+/// at `segment_vaddr`; emitted as a separate R+W PT_LOAD at commit.
+#[derive(Debug, Clone)]
+struct WritableState {
+    segment_vaddr: u64,
+    bytes: Vec<u8>,
+}
+
 /// Where in the existing `.init_array` chain a freshly-appended
 /// initialiser should be inserted, controlling whether it runs
 /// before or after the library's own constructors.
@@ -812,6 +827,7 @@ impl BinaryEditor {
             binary: BinaryState {
                 container: container.clone(),
                 appended: None,
+                appended_writable: None,
                 section_overrides: Vec::new(),
                 pending_appended_init_slots: Vec::new(),
                 pending_library_deps: Vec::new(),
@@ -1572,15 +1588,24 @@ impl BinaryState {
                     .elf_image
                     .as_ref()
                     .ok_or(TextEditorError::AppendMissingElfImage)?;
-                let max_input_vaddr = image
+                let mut floor = image
                     .program_headers
                     .iter()
                     .filter(|p| p.p_type == object::elf::PT_LOAD)
                     .map(|p| p.p_vaddr.saturating_add(p.p_memsz))
                     .max()
                     .unwrap_or(0);
+                // Sit above any already-placed appended region so the
+                // code and writable segments never overlap (whichever
+                // was allocated first keeps the lower vaddr).
+                if let Some(a) = &self.appended {
+                    floor = floor.max(a.segment_vaddr + a.bytes.len() as u64);
+                }
+                if let Some(w) = &self.appended_writable {
+                    floor = floor.max(w.segment_vaddr + w.bytes.len() as u64);
+                }
                 const PAGE: u64 = 0x10000;
-                let aligned = (max_input_vaddr + PAGE - 1) & !(PAGE - 1);
+                let aligned = (floor + PAGE - 1) & !(PAGE - 1);
                 Ok(aligned.max(PAGE))
             }
             crate::container::BinaryFormat::Macho => {
@@ -2461,8 +2486,8 @@ impl BinaryState {
     /// pass folds to the right page-relative addressing.
     ///
     /// The new segment is R-X (readable + executable, no write
-    /// flag), which fits read-only data and code. Writable data
-    /// would need a separate RW segment — not yet supported.
+    /// flag), which fits read-only data and code. For runtime-WRITABLE
+    /// data (a separate R+W segment), use [`Self::add_writable_data`].
     ///
     /// `align` is the byte alignment the blob requires (1 for
     /// strings, 4 for u32 tables, etc.). The cumulative segment
@@ -2513,6 +2538,81 @@ impl BinaryState {
         state.bytes.extend_from_slice(bytes);
 
         // Register the symbol after we know the blob's vaddr.
+        let symbol_id = SymbolId(self.container.symbols.len());
+        self.container.symbols.push(crate::container::Symbol {
+            id: symbol_id,
+            name: name.to_string(),
+            address: blob_vaddr,
+            size: bytes.len() as u64,
+            kind: SymbolKind::Object,
+            binding: crate::container::SymbolBinding::Global,
+            section: None,
+            is_undefined: false,
+            flags: None,
+        });
+
+        Ok(symbol_id)
+    }
+
+    /// Append runtime-WRITABLE data, returning a `SymbolId` whose
+    /// address points at the first byte of the blob.
+    ///
+    /// Unlike [`Self::add_data`] (whose bytes live in the R+X appended
+    /// segment and are read-only at runtime), these bytes land in a
+    /// separate `PF_R | PF_W` PT_LOAD — use it for buffers that
+    /// appended code writes to at run time (e.g. decrypting data into
+    /// scratch). The blob's address is final on return (the writable
+    /// segment is placed at its own vaddr, below the code append
+    /// region), so an appended function may reference it via
+    /// `Target::Symbol` even though more code is appended afterwards.
+    ///
+    /// To keep addresses stable, call this BEFORE appending any
+    /// function that references the returned symbol — and, ideally,
+    /// before any `add_function`/`add_data` at all, so the writable
+    /// region claims the low append slot and the (growing) code region
+    /// sits above it. ELF only.
+    pub fn add_writable_data(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        align: u64,
+    ) -> Result<SymbolId, TextEditorError> {
+        if !matches!(
+            self.container.kind,
+            crate::container::ContainerKind::SharedObject
+                | crate::container::ContainerKind::Executable,
+        ) {
+            return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
+        }
+        if self.container.format != crate::container::BinaryFormat::Elf {
+            return Err(TextEditorError::AppendUnsupportedKind(self.container.kind));
+        }
+
+        let new_size = bytes.len() as u64 + align.saturating_sub(1);
+        self.check_intra_text_capacity(new_size, &format!("add_writable_data({name:?})"))?;
+
+        // Pick the writable region's base lazily, above anything already
+        // placed (mirrors `add_data`'s use of the code region's vaddr).
+        let segment_vaddr = match &self.appended_writable {
+            Some(state) => state.segment_vaddr,
+            None => self.pick_append_vaddr()?,
+        };
+        let state = self.appended_writable.get_or_insert(WritableState {
+            segment_vaddr,
+            bytes: Vec::new(),
+        });
+        let cumulative = state.bytes.len() as u64;
+        let aligned_cumulative = if align <= 1 {
+            cumulative
+        } else {
+            (cumulative + align - 1) & !(align - 1)
+        };
+        if aligned_cumulative > cumulative {
+            state.bytes.resize(aligned_cumulative as usize, 0);
+        }
+        let blob_vaddr = state.segment_vaddr + aligned_cumulative;
+        state.bytes.extend_from_slice(bytes);
+
         let symbol_id = SymbolId(self.container.symbols.len());
         self.container.symbols.push(crate::container::Symbol {
             id: symbol_id,
@@ -3468,7 +3568,14 @@ impl BinaryEditor {
         // only `add_library_dependency` and no `add_function` /
         // `add_data`, lazily initialise an empty appended
         // segment so the override-supporting writer path runs.
-        if self.binary.appended.is_none() && !self.binary.pending_library_deps.is_empty() {
+        if self.binary.appended.is_none()
+            && (!self.binary.pending_library_deps.is_empty()
+                || self.binary.appended_writable.is_some())
+        {
+            // Writable data (or a library dep) but no appended code: the
+            // appended-segment writer path carries both, so lazily make
+            // an empty code segment. `pick_append_vaddr` already sits
+            // above the writable region, so they stay disjoint.
             let segment_vaddr = self.binary.pick_append_vaddr()?;
             self.binary.appended = Some(AppendedFunctionsState {
                 segment_vaddr,
@@ -3776,8 +3883,15 @@ impl BinaryEditor {
                     use object::elf;
                     segment.p_flags = elf::PF_R | elf::PF_X;
                 }
+                let writable_seg = binary.appended_writable.as_ref().map(|w| {
+                    crate::container::elf_writer::WritableSegment {
+                        vaddr: w.segment_vaddr,
+                        bytes: w.bytes.clone(),
+                        section_name: ".data.armv8_encode_writable".to_string(),
+                    }
+                });
                 crate::container::elf_writer::write_with_appended_segment_inner(
-                    &updated, &image, segment, overrides,
+                    &updated, &image, segment, overrides, writable_seg,
                 )
                 .map_err(TextEditorError::from)
             }

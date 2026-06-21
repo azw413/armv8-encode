@@ -109,6 +109,22 @@ impl AppendedSegment {
     }
 }
 
+/// A second, independent appended PT_LOAD emitted with `PF_R | PF_W`
+/// (no execute) for runtime-WRITABLE data — buffers that injected
+/// code decrypts/scribbles into at run time. Distinct from
+/// [`AppendedSegment`] (R+X code + read-only data): it loads at its
+/// own `vaddr`, which the editor picks BELOW the code append region
+/// so the address is stable regardless of how much code is appended
+/// afterwards (the code segment's `Target::Symbol` references are
+/// resolved at emit time, so writable buffer addresses must be final
+/// before any referencing function is appended).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct WritableSegment {
+    pub vaddr: u64,
+    pub bytes: Vec<u8>,
+    pub section_name: String,
+}
+
 /// Layout decision for an appended segment that mixes code
 /// and data. `code_split` is the segment-relative offset at
 /// which code ends and data begins. Caller (the editor) is
@@ -557,7 +573,7 @@ fn write_with_appended_segment(
     let appended = AppendedSegment::new(new_seg_vaddr, grown_section.bytes.clone());
     let mut overrides = HashMap::new();
     overrides.insert(grown.index, stub_bytes);
-    write_with_appended_segment_inner(container, image, appended, overrides)
+    write_with_appended_segment_inner(container, image, appended, overrides, None)
 }
 
 /// Shared driver for "emit ELF with one extra appended PT_LOAD R-X
@@ -571,6 +587,7 @@ pub(crate) fn write_with_appended_segment_inner(
     image: &ElfImage,
     appended: AppendedSegment,
     section_byte_overrides: HashMap<usize, Vec<u8>>,
+    writable: Option<WritableSegment>,
 ) -> Result<Vec<u8>, ContainerWriteError> {
     // Drop the input's PT_PHDR (file_offset/vaddr point at the
     // input's old PHT location, not the new one we'll emit at
@@ -750,9 +767,25 @@ pub(crate) fn write_with_appended_segment_inner(
         writer.add_section_name(appended.section_name.as_bytes().to_vec().leak());
     let appended_section_index = writer.reserve_section_index();
 
+    // Section name + index for the writable segment (if any). Reserved
+    // before `reserve_shstrtab_section_index` so the count is final.
+    let writable_name_id = writable
+        .as_ref()
+        .map(|w| writer.add_section_name(w.section_name.as_bytes().to_vec().leak()));
+    let _writable_section_index = writable.as_ref().map(|_| writer.reserve_section_index());
+
     writer.reserve_shstrtab_section_index();
     writer.reserve_shstrtab();
     writer.reserve_section_headers();
+
+    // Reserve the writable segment's bytes first (page-aligned), so it
+    // lands in the file BEFORE the code segment and the code PT_LOAD's
+    // coverage (which runs from the code offset through the trailing
+    // PHT) never overlaps it.
+    let writable_file_offset = writable.as_ref().map(|w| {
+        writer.write_align(APPEND_PAGE_ALIGN as usize);
+        writer.reserve(w.bytes.len(), APPEND_PAGE_ALIGN as usize) as u64
+    });
 
     // Reserve the appended segment's bytes at a fresh, page-aligned
     // file offset. Place it after the section header table so all
@@ -770,8 +803,9 @@ pub(crate) fn write_with_appended_segment_inner(
     // each for the code prefix + data suffix when the segment
     // mixes both — see `compute_code_data_split`).
     let appended_pt_load_count: u32 = if split.code_split == 0 { 1 } else { 2 };
+    let writable_pt_load_count: u32 = if writable.is_some() { 1 } else { 0 };
     writer.reserve_program_headers(
-        (phdrs_to_emit.len() as u32) + 1 + appended_pt_load_count,
+        (phdrs_to_emit.len() as u32) + 1 + appended_pt_load_count + writable_pt_load_count,
     );
 
     // ---------------------------------------------------------------
@@ -865,10 +899,34 @@ pub(crate) fn write_with_appended_segment_inner(
         sh_addralign: 4,
         sh_entsize: 0,
     });
+    // Section header for the writable segment (matches the index
+    // reserved between the appended index and shstrtab).
+    if let (Some(w), Some(nid), Some(woff)) =
+        (writable.as_ref(), writable_name_id, writable_file_offset)
+    {
+        writer.write_section_header(&SectionHeader {
+            name: Some(nid),
+            sh_type: elf::SHT_PROGBITS,
+            sh_flags: u64::from(elf::SHF_ALLOC | elf::SHF_WRITE),
+            sh_addr: w.vaddr,
+            sh_offset: woff,
+            sh_size: w.bytes.len() as u64,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: APPEND_PAGE_ALIGN,
+            sh_entsize: 0,
+        });
+    }
     writer.write_shstrtab_section_header();
     let _ = appended_section_index;
 
-    // Appended segment content. write_align matches the reserve call.
+    // Writable segment content first (reserved before the appended
+    // bytes), then the appended segment. write_align matches each
+    // reserve call.
+    if let Some(w) = writable.as_ref() {
+        writer.write_align(APPEND_PAGE_ALIGN as usize);
+        writer.write(&w.bytes);
+    }
     writer.write_align(APPEND_PAGE_ALIGN as usize);
     writer.write(&appended.bytes);
 
@@ -893,8 +951,10 @@ pub(crate) fn write_with_appended_segment_inner(
     // (and SysV uses it for AT_PHDR). Counted in
     // `reserve_program_headers((N + 2) as u32)` above.
     let phdr_entry_size: u64 = 56; // sizeof(Elf64_Phdr)
-    let phdr_count: u64 =
-        (phdrs_to_emit.len() as u64) + 1 + appended_pt_load_count as u64;
+    let phdr_count: u64 = (phdrs_to_emit.len() as u64)
+        + 1
+        + appended_pt_load_count as u64
+        + writable_pt_load_count as u64;
     let elf_align: u64 = 8;
     let pht_file_offset =
         (appended_file_offset + new_seg_filesz + elf_align - 1) & !(elf_align - 1);
@@ -934,6 +994,24 @@ pub(crate) fn write_with_appended_segment_inner(
     // it rejects with `loaded phdr ... not in loadable segment`.
     let pht_end = pht_file_offset + phdr_count * phdr_entry_size;
     let total_cover = pht_end - appended_file_offset;
+
+    // The writable segment's own R+W PT_LOAD, emitted before the code
+    // PT_LOAD(s) so PT_LOADs ascend by vaddr (it sits below the code
+    // append region). Its file region is disjoint from the code
+    // segment's coverage (reserved earlier in the file).
+    if let (Some(w), Some(woff)) = (writable.as_ref(), writable_file_offset) {
+        let wlen = w.bytes.len() as u64;
+        writer.write_program_header(&ProgramHeader {
+            p_type: elf::PT_LOAD,
+            p_flags: elf::PF_R | elf::PF_W,
+            p_offset: woff,
+            p_vaddr: w.vaddr,
+            p_paddr: w.vaddr,
+            p_filesz: wlen,
+            p_memsz: wlen,
+            p_align: APPEND_PAGE_ALIGN,
+        });
+    }
 
     // One PT_LOAD or two:
     // - One: caller didn't request a code/data split, so
