@@ -388,6 +388,56 @@ fn editor_redirects_x86_branch_and_round_trips() {
 }
 
 #[test]
+fn relocates_x86_function_through_generic_pipeline() {
+    use crate::isa::x86::{X86Isa, X86Operand};
+    use crate::rewrite::{emit, lay_out, plan::RewritePlan};
+
+    // .text @ base: je +1 (74 01) skips the nop and lands on ret.
+    //   +0: 74 01   je +0x3
+    //   +2: 90      nop
+    //   +3: c3      ret
+    let mut obj = WriteObject::new(ObjFormat::Elf, ObjArch::X86_64, Endianness::Little);
+    let text_id = obj.section_id(StandardSection::Text);
+    obj.append_section_data(text_id, &[0x74, 0x01, 0x90, 0xc3], 1);
+    obj.add_symbol(WriteSymbol {
+        name: b"f".to_vec(),
+        value: 0,
+        size: 4,
+        kind: ObjSymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: WriteSymbolSection::Section(text_id),
+        flags: SymbolFlags::None,
+    });
+    let bytes = obj.write().unwrap();
+    let container = Container::from_bytes(&bytes).unwrap();
+    let text = container.text_sections().next().unwrap();
+    let (base, code) = text.for_disassembly().unwrap();
+
+    let insns = disassemble_bytes(base, code, Bitness::Bits64).unwrap();
+    // Item 1: the je's branch target is surfaced as a crate-neutral operand.
+    assert_eq!(insns[0].mnemonic(), Mnemonic::Je);
+    assert_eq!(insns[0].operands, vec![X86Operand::Branch(base + 3)]);
+
+    // Lift → relocate the whole function to a fresh address → emit.
+    let cfg = build_cfg(&insns);
+    let plan = RewritePlan::<X86Isa>::lift_from_decoded_with_container(&cfg, &insns, &container);
+    let new_base = base + 0x4_0000;
+    let layout = lay_out::<X86Isa>(&plan, new_base, Some(&container)).unwrap();
+    let out = emit::<X86Isa>(&plan, &layout, Some(&container)).unwrap();
+
+    // Re-decode the relocated bytes and check the branch was retargeted to the
+    // relocated `ret` (item 1 + generic lift/layout/emit + item 5 jcc rel32), and
+    // the nop survived verbatim.
+    let relocated = disassemble_bytes(new_base, &out.bytes, Bitness::Bits64).unwrap();
+    assert_eq!(relocated[0].mnemonic(), Mnemonic::Je);
+    let ret = relocated.last().unwrap();
+    assert_eq!(ret.mnemonic(), Mnemonic::Ret);
+    assert_eq!(relocated[0].instr.near_branch_target(), ret.address);
+    assert!(relocated.iter().any(|i| i.mnemonic() == Mnemonic::Nop));
+}
+
+#[test]
 fn maps_i386_elf_pc32_relocation_distinctly() {
     // R_386_PC32 (== 1 in some other ABI's space) must map to X86Pc32
     // on a 32-bit container, not collide with x86_64 codes.

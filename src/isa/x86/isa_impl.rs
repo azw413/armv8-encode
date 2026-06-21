@@ -22,7 +22,8 @@
 //! size and the generic layout needs no x86 widening (`rel32` reaches ±2 GiB, so
 //! appended code is always in range). Hence the widening hooks are inert.
 
-use super::{encode_instruction, Bitness, EncodeError, X86DecodedInstruction};
+use super::sweep::project_operands;
+use super::{encode_instruction, Bitness, EncodeError, X86DecodedInstruction, X86Operand};
 use crate::container::RelocationKind;
 use crate::isa::{Isa, IsaEncodeOutput, PcRelKind};
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic};
@@ -31,15 +32,6 @@ use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic};
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct X86Isa;
 
-/// Crate-neutral x86 operand. Minimal for now: only the PC-relative branch target
-/// the rewrite layer must introspect. All other operands ride inside the iced
-/// `Instruction` and are reproduced by verbatim copy ([`Isa::decode`]).
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum X86Operand {
-    /// Direct branch/call target (absolute address).
-    Branch(u64),
-}
-
 /// x86 has no `adrp+add`/`movw+movt`-style fusion (RIP-relative is a single
 /// instruction), so there are no macro kinds yet.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -47,6 +39,16 @@ pub enum X86MacroKind {}
 
 /// rel32 reaches ±2 GiB; we always emit this form.
 const REL32_HALF_RANGE: i64 = i32::MAX as i64;
+
+/// Encoded size of the rel32 form we always emit for a near branch/call:
+/// `jmp`/`call` = 5 (opcode + rel32), `jcc` = 6 (`0F 8x` + rel32).
+fn branch_rel32_size(m: Mnemonic) -> Option<u64> {
+    match m {
+        Mnemonic::Jmp | Mnemonic::Call => Some(5),
+        m if is_branch_mnemonic(m) => Some(6), // jcc family
+        _ => None,
+    }
+}
 
 /// True for the near branch/call mnemonics whose target is a `Branch` operand.
 fn is_branch_mnemonic(m: Mnemonic) -> bool {
@@ -87,16 +89,20 @@ impl Isa for X86Isa {
         insn.mnemonic()
     }
 
-    /// Variable-length: report the real decoded byte length.
+    /// Variable-length. A near branch/call is always re-emitted in the rel32 form
+    /// when relocated, so the layout pass must reserve THAT size, not the original
+    /// (possibly rel8) length — otherwise downstream addresses desync. Appended
+    /// functions always relocate, so a branch never verbatim-copies at the wrong
+    /// size. Non-branch instructions report their true decoded length.
     fn decoded_size(insn: &Self::DecodedInstruction) -> u64 {
-        insn.size_bytes()
+        branch_rel32_size(insn.mnemonic()).unwrap_or_else(|| insn.size_bytes())
     }
 
-    fn decoded_operands(_insn: &Self::DecodedInstruction) -> &[Self::Operand] {
-        // TODO(x86): project iced operands (at least `near_branch_target()`) into
-        // stored `X86Operand`s so the generic lift can relocate branches. Until
-        // then, every instruction lifts as operand-less and is copied verbatim.
-        &[]
+    fn decoded_operands(insn: &Self::DecodedInstruction) -> &[Self::Operand] {
+        // Branch/call targets projected at decode time; non-branch instructions
+        // have none (copied verbatim). RIP-relative data refs are not surfaced
+        // yet — see docs/x86-backend.md.
+        &insn.operands
     }
 
     fn decode(address: u64, bytes: &[u8]) -> Option<Self::DecodedInstruction> {
@@ -109,7 +115,7 @@ impl Isa for X86Isa {
         if instr.is_invalid() {
             return None;
         }
-        Some(X86DecodedInstruction { address, instr })
+        Some(X86DecodedInstruction { address, instr, operands: project_operands(&instr) })
     }
 
     fn pcrel_kind(operand: &Self::Operand) -> Option<(PcRelKind, u64)> {
@@ -163,7 +169,21 @@ impl Isa for X86Isa {
             let code = match mnemonic {
                 Mnemonic::Jmp => Code::Jmp_rel32_64,
                 Mnemonic::Call => Code::Call_rel32_64,
-                // TODO(x86): the jcc rel32 family (Je_rel32_64, …).
+                // The jcc rel32 family (always the long form — no rel8 relaxation).
+                Mnemonic::Je => Code::Je_rel32_64,
+                Mnemonic::Jne => Code::Jne_rel32_64,
+                Mnemonic::Jb => Code::Jb_rel32_64,
+                Mnemonic::Jae => Code::Jae_rel32_64,
+                Mnemonic::Jbe => Code::Jbe_rel32_64,
+                Mnemonic::Ja => Code::Ja_rel32_64,
+                Mnemonic::Js => Code::Js_rel32_64,
+                Mnemonic::Jns => Code::Jns_rel32_64,
+                Mnemonic::Jp => Code::Jp_rel32_64,
+                Mnemonic::Jnp => Code::Jnp_rel32_64,
+                Mnemonic::Jl => Code::Jl_rel32_64,
+                Mnemonic::Jge => Code::Jge_rel32_64,
+                Mnemonic::Jle => Code::Jle_rel32_64,
+                Mnemonic::Jg => Code::Jg_rel32_64,
                 other => {
                     return Err(EncodeError::Iced(format!(
                         "x86 encode: branch mnemonic {other:?} not yet mapped"

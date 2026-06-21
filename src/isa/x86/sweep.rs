@@ -11,7 +11,32 @@
 //! (jump tables, padding) is the job of a future recursive-descent pass
 //! with section + relocation context.
 
-use iced_x86::{Decoder, DecoderOptions, Instruction};
+use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind};
+
+/// Crate-neutral x86 operand surfaced to the rewrite layer. Minimal: only the
+/// PC-relative branch/call target the layer must introspect to relocate. All
+/// other operands ride inside the iced `Instruction` and are reproduced by
+/// verbatim copy ([`crate::isa::Isa::decode`]). (RIP-relative *data* refs — x86's
+/// `adrp+add` analogue — are not surfaced yet; see docs/x86-backend.md.)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum X86Operand {
+    /// Direct near branch/call target (absolute address).
+    Branch(u64),
+}
+
+/// Project the relocatable operands out of an iced instruction: a single
+/// [`X86Operand::Branch`] for a near branch/call, else none.
+pub fn project_operands(instr: &Instruction) -> Vec<X86Operand> {
+    for i in 0..instr.op_count() {
+        if matches!(
+            instr.op_kind(i),
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+        ) {
+            return vec![X86Operand::Branch(instr.near_branch_target())];
+        }
+    }
+    Vec::new()
+}
 
 /// Decode width. x86-64 decodes in 64-bit mode; i386 in 32-bit mode.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -36,13 +61,17 @@ impl Bitness {
 /// The full `iced_x86::Instruction` is retained (it is `Copy` and
 /// self-contained) so the encode / rewrite path can re-emit or mutate
 /// the instruction without re-deriving operands from a lossy model.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct X86DecodedInstruction {
     /// Absolute address of the instruction.
     pub address: u64,
     /// The underlying `iced-x86` instruction. Its `ip()` matches
     /// `address` and its `len()` is the encoded byte length.
     pub instr: Instruction,
+    /// Relocatable operands projected from `instr` (branch/call targets) so the
+    /// rewrite layer can see them without depending on iced. Empty for
+    /// instructions with no relocatable operand.
+    pub operands: Vec<X86Operand>,
 }
 
 impl X86DecodedInstruction {
@@ -107,7 +136,7 @@ pub fn disassemble_bytes(
                 bytes: bytes[offset..end].to_vec(),
             });
         }
-        out.push(X86DecodedInstruction { address, instr });
+        out.push(X86DecodedInstruction { address, instr, operands: project_operands(&instr) });
     }
 
     Ok(out)
