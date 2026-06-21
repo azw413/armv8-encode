@@ -351,11 +351,33 @@ fn commit_lifted_x86(
     section: &X86LiftedTextSection,
     container: &Container,
 ) -> Result<(Container, EmitOutput, SectionId), TextEditorError> {
-    let assembled = x86::assemble(&section.instructions, section.base_address, section.bitness)
-        .map_err(|e| TextEditorError::X86Encode(e.to_string()))?;
-    let output = EmitOutput {
-        bytes: assembled.bytes,
-        relocations: Vec::new(),
+    // Patch mode (no lifted instruction list): write `.text` VERBATIM and apply
+    // the recorded byte-patches (e.g. trampolines) in place. This is the only
+    // sound mode for a real binary — re-assembling the whole section relayouts
+    // every instruction and breaks RIP-relative/data refs. The in-place
+    // re-assemble path below is kept for the bypass redirect API on tiny inputs.
+    let output = if section.instructions.is_empty() {
+        let mut bytes = container.section(section.section_id).bytes.clone();
+        for (addr, patch) in &section.patches {
+            let off = addr
+                .checked_sub(section.base_address)
+                .and_then(|o| usize::try_from(o).ok())
+                .ok_or_else(|| {
+                    TextEditorError::X86Encode(format!("patch addr {addr:#x} before .text base"))
+                })?;
+            if off + patch.len() > bytes.len() {
+                return Err(TextEditorError::X86Encode(format!(
+                    "patch at {addr:#x} ({} bytes) overruns .text",
+                    patch.len()
+                )));
+            }
+            bytes[off..off + patch.len()].copy_from_slice(patch);
+        }
+        EmitOutput { bytes, relocations: Vec::new() }
+    } else {
+        let assembled = x86::assemble(&section.instructions, section.base_address, section.bitness)
+            .map_err(|e| TextEditorError::X86Encode(e.to_string()))?;
+        EmitOutput { bytes: assembled.bytes, relocations: Vec::new() }
     };
     let updated = commit_to_container(container, section.section_id, output.clone());
     Ok((updated, output, section.section_id))
@@ -375,8 +397,14 @@ pub struct X86LiftedTextSection {
     bitness: x86::Bitness,
     /// Editable instruction list. Each instruction's `ip()` is its
     /// current source address, which `BlockEncoder` uses to resolve
-    /// intra-section branch targets.
+    /// intra-section branch targets. Empty in *patch mode* (see
+    /// [`BinaryEditor::prepare_text_patch`]).
     instructions: Vec<iced_x86::Instruction>,
+    /// Byte-patches `(address, bytes)` applied over the verbatim original
+    /// `.text` at commit (patch mode) — e.g. a `jmp rel32` trampoline at a
+    /// relocated function's entry. Unlike the re-assemble path, this leaves the
+    /// rest of `.text` byte-identical, so RIP-relative/data refs survive.
+    patches: Vec<(u64, Vec<u8>)>,
 }
 
 impl X86LiftedTextSection {
@@ -415,6 +443,21 @@ impl X86LiftedTextSection {
     /// The decoded instruction list (read-only).
     pub fn instructions(&self) -> &[iced_x86::Instruction] {
         &self.instructions
+    }
+
+    /// Record a `jmp rel32` trampoline at `entry` targeting absolute `target`
+    /// (e.g. a relocated copy in the appended segment). At commit, the 5-byte
+    /// `E9 rel32` overwrites the original bytes at `entry`; the rest of `.text`
+    /// is written verbatim. `rel32` reaches ±2 GiB, so the appended segment is
+    /// always in range. Use with [`BinaryEditor::prepare_text_patch`] (patch
+    /// mode); the function's now-dead body past the 5 bytes is never executed.
+    pub fn add_trampoline(&mut self, entry: u64, target: u64) -> Result<(), TextEditorError> {
+        let instr = iced_x86::Instruction::with_branch(iced_x86::Code::Jmp_rel32_64, target)
+            .map_err(|e| TextEditorError::X86Encode(e.to_string()))?;
+        let bytes = x86::encode_instruction(&instr, entry, self.bitness)
+            .map_err(|e| TextEditorError::X86Encode(e.to_string()))?;
+        self.patches.push((entry, bytes));
+        Ok(())
     }
 }
 
@@ -920,6 +963,7 @@ impl BinaryEditor {
                     base_address: base,
                     bitness,
                     instructions,
+                    patches: Vec::new(),
                 })
             }
             Architecture::Other => {
@@ -931,6 +975,44 @@ impl BinaryEditor {
             }
         };
         self.text = Some(lifted);
+        Ok(())
+    }
+
+    /// Prepare an x86/x86-64 text section for **byte-patch mode**: record its
+    /// id/base/bitness WITHOUT disassembling it (so a real `.text` with embedded
+    /// data/jump-tables doesn't trip the fail-fast sweep). The section is written
+    /// VERBATIM at commit, with only the recorded patches
+    /// ([`X86LiftedTextSection::add_trampoline`]) applied in place — the model for
+    /// relocating a function to the appended segment + trampolining its entry,
+    /// leaving the rest of `.text` (and its RIP-relative refs) untouched.
+    pub fn prepare_text_patch(&mut self, name: &str) -> Result<(), TextEditorError> {
+        if !matches!(
+            self.binary.container.architecture,
+            Architecture::X86_64 | Architecture::X86
+        ) {
+            return Err(TextEditorError::SectionNotText {
+                name: format!("{name} (prepare_text_patch requires an x86 container)"),
+            });
+        }
+        let section = self
+            .binary
+            .container
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| TextEditorError::SectionNotFound(name.to_string()))?;
+        let (base, _code) = section
+            .for_disassembly()
+            .ok_or_else(|| TextEditorError::SectionNotText { name: name.to_string() })?;
+        let bitness = x86::bitness_for_architecture(self.binary.container.architecture)
+            .expect("x86 architecture maps to a bitness");
+        self.text = Some(LiftedTextSectionAny::X86(X86LiftedTextSection {
+            section_id: section.id,
+            base_address: base,
+            bitness,
+            instructions: Vec::new(),
+            patches: Vec::new(),
+        }));
         Ok(())
     }
 
@@ -3361,11 +3443,16 @@ impl BinaryState {
         use crate::container::dynsym_extension as dx;
         use object::elf;
 
-        let dynamic_index = container
+        // A statically-linked executable has no `.dynamic` section at all. With
+        // no `.dynamic` to grow there is nothing to finalize — the appended
+        // segment stands on its own (pure code/data, no dynamic tags).
+        let Some(dynamic_index) = container
             .sections
             .iter()
             .position(|s| s.name == ".dynamic")
-            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        else {
+            return Ok(existing_segment_bytes);
+        };
         let original_size = container.sections[dynamic_index].bytes.len();
 
         // No `.dynamic` override staged → nothing to do.
