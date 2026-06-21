@@ -38,7 +38,10 @@ fn build_x86(src: &str, out: &std::path::Path) -> bool {
     if !have("x86_64-linux-gnu-gcc") {
         return false;
     }
-    let s = std::env::temp_dir().join(format!("av8_x86run_{}.c", std::process::id()));
+    // Derive the source name from `out` so concurrently-running tests (each with
+    // a distinct output path) never clobber each other's `.c` file.
+    let stem = out.file_name().and_then(|n| n.to_str()).unwrap_or("av8_x86run");
+    let s = std::env::temp_dir().join(format!("{stem}.c"));
     std::fs::write(&s, src).unwrap();
     Command::new("x86_64-linux-gnu-gcc")
         .args(["-O2", "-fPIE", "-pie", "-o"])
@@ -68,8 +71,16 @@ fn qemu_run(path: &std::path::Path) -> (String, i32) {
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
 }
 
-#[test]
-fn x86_relocate_function_and_trampoline_runs() {
+/// Build `src` (which must define `fn_name` and a `main`), relocate `fn_name`
+/// into the appended segment via the generic x86 pipeline, trampoline its entry,
+/// commit, and run both the original and rewritten binaries under qemu/ld.so.
+/// Returns `((native_out, native_rc), (rewritten_out, rewritten_rc))`, or `None`
+/// if the toolchain/sysroot is unavailable (caller should skip).
+fn relocate_fn_and_run(
+    src: &str,
+    fn_name: &str,
+    tag: &str,
+) -> Option<((String, i32), (String, i32))> {
     use armv8_encode::container::Container;
     use armv8_encode::isa::x86::{disassemble_bytes, Bitness, X86Isa};
     use armv8_encode::mc::build_cfg;
@@ -77,31 +88,26 @@ fn x86_relocate_function_and_trampoline_runs() {
 
     if !have("qemu-x86_64") || cross_ld().is_none() {
         eprintln!("x86_run: no qemu-x86_64 / cross sysroot — skipping");
-        return;
+        return None;
     }
-    // A leaf function (no calls) + a main that prints it.
-    let orig = std::env::temp_dir().join(format!("av8_x86tr_{}.orig", std::process::id()));
-    let src = "#include <stdio.h>\n\
-        __attribute__((noinline)) int compute(int x){ return x*3 + 7; }\n\
-        int main(void){ printf(\"r=%d\\n\", compute(11)); return 0; }\n";
+    let orig = std::env::temp_dir().join(format!("av8_{tag}_{}.orig", std::process::id()));
     if !build_x86(src, &orig) {
         eprintln!("x86_run: no x86-64 cross toolchain — skipping");
-        return;
+        return None;
     }
-    let (native_out, native_rc) = qemu_run(&orig);
-    assert_eq!(native_out, "r=40\n");
+    let native = qemu_run(&orig);
 
     let bytes = std::fs::read(&orig).unwrap();
     let container = Container::from_bytes(&bytes).unwrap();
 
-    // Locate `compute` and its bytes.
+    // Locate the target function and its bytes.
     let sym = container
         .symbols
         .iter()
-        .find(|s| s.name == "compute" && s.size > 0)
-        .expect("compute symbol");
+        .find(|s| s.name == fn_name && s.size > 0)
+        .unwrap_or_else(|| panic!("{fn_name} symbol"));
     let (entry, size) = (sym.address, sym.size);
-    let sid = container.section_for_address(entry).expect("section for compute");
+    let sid = container.section_for_address(entry).expect("section for fn");
     let section = container.section(sid);
     let off = (entry - section.address) as usize;
     let window = &section.bytes[off..(off + size as usize).min(section.bytes.len())];
@@ -123,7 +129,7 @@ fn x86_relocate_function_and_trampoline_runs() {
     let mut editor = BinaryEditor::new(&container).unwrap();
     let copy = editor
         .binary
-        .add_function_from_plan::<X86Isa>("compute_copy", plan)
+        .add_function_from_plan::<X86Isa>(&format!("{fn_name}_copy"), plan)
         .unwrap();
     let copy_addr = editor.binary.symbol_address(copy);
     editor.prepare_text_patch(".text").unwrap();
@@ -137,16 +143,58 @@ fn x86_relocate_function_and_trampoline_runs() {
         .unwrap();
     let out_bytes = editor.commit_to_bytes().unwrap();
 
-    let rw = std::env::temp_dir().join(format!("av8_x86tr_{}.rw", std::process::id()));
+    let rw = std::env::temp_dir().join(format!("av8_{tag}_{}.rw", std::process::id()));
     std::fs::write(&rw, &out_bytes).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&rw, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let (rw_out, rw_rc) = qemu_run(&rw);
+    let rewritten = qemu_run(&rw);
+    Some((native, rewritten))
+}
+
+#[test]
+fn x86_relocate_function_and_trampoline_runs() {
+    // A leaf function (no calls) + a main that prints it.
+    let src = "#include <stdio.h>\n\
+        __attribute__((noinline)) int compute(int x){ return x*3 + 7; }\n\
+        int main(void){ printf(\"r=%d\\n\", compute(11)); return 0; }\n";
+    let Some(((native_out, native_rc), (rw_out, rw_rc))) =
+        relocate_fn_and_run(src, "compute", "x86tr")
+    else {
+        return;
+    };
+    assert_eq!(native_out, "r=40\n");
     assert_eq!(rw_rc, native_rc, "exit code differs");
     assert_eq!(rw_out, native_out, "output differs — relocated compute or trampoline is wrong");
+}
+
+#[test]
+fn x86_relocate_function_with_plt_call_runs() {
+    // `compute` makes a genuine external call (`strlen@plt`) that survives -O2
+    // because `s` is opaque at compile time. When the function is relocated to
+    // the appended segment, emit must re-fold its `call rel32` so it still
+    // reaches the PLT stub (no dynamic relocation is needed — the stub already
+    // exists). This is the realistic "reference that needs relocation-or-folding"
+    // case for the x86 commit path.
+    let src = "#include <stdio.h>\n#include <string.h>\n\
+        __attribute__((noinline)) int compute(const char *s, int x){\n\
+            return (int)strlen(s) + x*3 + 7;\n\
+        }\n\
+        int main(int argc, char **argv){\n\
+            const char *s = (argc>1)? argv[1] : \"hello\";\n\
+            printf(\"r=%d\\n\", compute(s, 11));\n\
+            return 0;\n\
+        }\n";
+    let Some(((native_out, native_rc), (rw_out, rw_rc))) =
+        relocate_fn_and_run(src, "compute", "x86plt")
+    else {
+        return;
+    };
+    assert_eq!(native_out, "r=45\n"); // strlen("hello")=5 + 33 + 7
+    assert_eq!(rw_rc, native_rc, "exit code differs");
+    assert_eq!(rw_out, native_out, "output differs — relocated PLT call not re-folded correctly");
 }
 
 // DOCUMENTS A KNOWN LIMITATION (ignored): lifting the WHOLE `.text`

@@ -121,6 +121,17 @@ pub enum TextEditorError {
     /// populated. This indicates a reader bug; production paths
     /// always populate it for ET_DYN/ET_EXEC inputs.
     AppendMissingElfImage,
+    /// An appended function's body emitted one or more relocations
+    /// that the appended-segment writer can't yet apply. Defined and
+    /// PLT-stubbed references are *folded* to a resolved displacement at
+    /// emit time (see `emit::symbol_needs_relocation`), so a leftover
+    /// relocation means a reference to an undefined symbol with no
+    /// existing PLT stub — e.g. a newly synthesised call to an external
+    /// not already imported. Emitting the matching dynamic relocation
+    /// (new PLT/GOT/`.rela` entries in the appended segment) is future
+    /// work; surfacing this beats silently dropping the relocation and
+    /// shipping a binary that jumps to the wrong address.
+    AppendNeedsUnsupportedRelocation { name: String, count: usize },
     /// `add_initialiser` was called against a library that has
     /// no `.init_array` section, or whose `.init_array` is
     /// empty. Stage-A `add_initialiser` only supports the
@@ -204,6 +215,13 @@ impl std::fmt::Display for TextEditorError {
                 f,
                 "add_function requires container.elf_image to be populated; \
                  the reader should have populated it for this input",
+            ),
+            Self::AppendNeedsUnsupportedRelocation { name, count } => write!(
+                f,
+                "appended function {name:?} emitted {count} relocation(s) the \
+                 appended-segment writer can't apply (a reference to an \
+                 undefined symbol with no PLT stub); synthesising dynamic \
+                 relocations for the appended segment is not yet supported",
             ),
             Self::NoExistingInitArray => write!(
                 f,
@@ -373,6 +391,12 @@ fn commit_lifted_x86(
             }
             bytes[off..off + patch.len()].copy_from_slice(patch);
         }
+        // No relocations: the bytes are the original `.text` verbatim, so its
+        // existing `.rela.*` entries still apply unchanged (and the appended-
+        // segment writer preserves them from the original image — it never reads
+        // this field). Each patch is a self-contained `jmp rel32` trampoline,
+        // which is PC-relative and needs no relocation. The relocated copy's own
+        // references are folded/checked in `add_function_from_plan`.
         EmitOutput { bytes, relocations: Vec::new() }
     } else {
         let assembled = x86::assemble(&section.instructions, section.base_address, section.bitness)
@@ -1985,6 +2009,22 @@ impl BinaryState {
 
         let layout = lay_out(&plan, function_vaddr, Some(&self.container))?;
         let output = emit(&plan, &layout, Some(&self.container))?;
+        // The appended-segment writer copies `output.bytes` verbatim and emits
+        // no dynamic relocations for them. Emit folds every *resolvable*
+        // reference (intra-binary branches/calls and PLT-stubbed externals) to a
+        // concrete displacement, so a non-empty relocation set here is a
+        // reference we cannot place — fail loudly rather than drop it and ship a
+        // binary that jumps to the wrong address. Mirrors the hole-placement
+        // paths (`place_plan_in_holes`/`place_plan_scattered`), which bail for
+        // the same reason.
+        if !output.relocations.is_empty() {
+            // Roll back the symbol we provisionally registered above.
+            self.container.symbols.pop();
+            return Err(TextEditorError::AppendNeedsUnsupportedRelocation {
+                name: name.to_string(),
+                count: output.relocations.len(),
+            });
+        }
         self.container.symbols[symbol_id.0].size = output.bytes.len() as u64;
 
         let state = self.appended.get_or_insert(AppendedFunctionsState {
