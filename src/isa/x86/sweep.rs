@@ -1055,6 +1055,62 @@ impl X86DecodedInstruction {
         Some((self.instr.memory_displacement64(), gpr64_index(rs)?, is64))
     }
 
+    /// `cmp`/`test` of a 32/64-bit register against an `[rip+disp]` operand →
+    /// `(is_test, is64, mem_is_left, target_vaddr, reg)` — PIE compares against a
+    /// global. For VM RIP_CMP_REG. `None` for 8/16-bit or a non-RIP memory operand.
+    pub fn rip_cmp_reg(&self) -> Option<(bool, bool, bool, u64, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_test = match self.instr.mnemonic() {
+            Mnemonic::Cmp => false,
+            Mnemonic::Test => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || !self.instr.is_ip_rel_memory_operand() {
+            return None;
+        }
+        let (mem_left, reg) = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Memory, OpKind::Register) => (true, self.instr.op1_register()),
+            (OpKind::Register, OpKind::Memory) => (false, self.instr.op0_register()),
+            _ => return None,
+        };
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((is_test, is64, mem_left, self.instr.memory_displacement64(), gpr64_index(reg)?))
+    }
+
+    /// `cmp`/`test [rip+disp], imm` (32/64) → `(is_test, is64, target_vaddr, imm)`.
+    /// For VM RIP_CMP_IMM (PIE compare of a global against a constant).
+    pub fn rip_cmp_imm(&self) -> Option<(bool, bool, u64, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_test = match self.instr.mnemonic() {
+            Mnemonic::Cmp => false,
+            Mnemonic::Test => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32
+                | OpKind::Immediate8to64 | OpKind::Immediate16 | OpKind::Immediate32
+                | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        Some((is_test, is64, self.instr.memory_displacement64(), self.instr.immediate(1) as u32))
+    }
+
     /// A direct near `call` → the absolute target vaddr, else `None` (not a call,
     /// or an indirect `call reg`/`call [mem]`). Covers both intra-binary calls and
     /// `call func@plt` (the target is the PLT stub). For the VM CALL op.
@@ -1068,6 +1124,49 @@ impl X86DecodedInstruction {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
         )
         .then(|| self.instr.near_branch_target())
+    }
+
+    /// Indirect `call reg` (`call rax` — function pointer / C++ vtable thunk) → the
+    /// GPR index, else `None`. For the VM CALL_REG op.
+    pub fn call_reg(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Call
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let r = self.instr.op0_register();
+        r.is_gpr64().then(|| gpr64_index(r)).flatten()
+    }
+
+    /// Indirect `call [base+index*scale+disp]` (non-RIP — vtable slot / fn-ptr in
+    /// memory) → `(base, index, scale_log2, disp)`. For the VM CALL_MEM op. RIP is
+    /// handled by [`Self::call_rip`]; segment-overridden operands are rejected.
+    pub fn call_mem(&self) -> Option<(Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Call
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        self.mem_addr()
+    }
+
+    /// Indirect `call [rip+disp]` (a GOT / PLT-less indirect call) → the GOT-slot
+    /// vaddr (`*slot` is the callee). For the VM CALL_RIP op.
+    pub fn call_rip(&self) -> Option<u64> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Call
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        Some(self.instr.memory_displacement64())
     }
 
     /// `push r64` → the GPR index (register form only), else `None`. For the VM
@@ -1853,6 +1952,35 @@ mod effects_tests {
         );
         // mov [rip+0],imm (c7 05 .. dword) -> rip_store_imm (not store_imm_mem).
         assert_eq!(decode(&[0xc7, 0x05, 0, 0, 0, 0, 0x07, 0, 0, 0]).store_imm_mem(), None);
+    }
+
+    #[test]
+    fn indirect_call_projections() {
+        // call rax (ff d0) -> CALL_REG reg=0.
+        assert_eq!(decode(&[0xff, 0xd0]).call_reg(), Some(0));
+        // call [rdi] (ff 17) -> CALL_MEM base=7.
+        assert_eq!(decode(&[0xff, 0x17]).call_mem(), Some((Some(7), None, 0, 0)));
+        // call [rax+rcx*8+0x10] (ff 54 c8 10) -> CALL_MEM base=0, index=1, scale 3, disp 0x10.
+        assert_eq!(decode(&[0xff, 0x54, 0xc8, 0x10]).call_mem(), Some((Some(0), Some(1), 3, 0x10)));
+        // call [rip+0] (ff 15 ..) len 6 -> CALL_RIP target 0x1006.
+        assert_eq!(decode(&[0xff, 0x15, 0, 0, 0, 0]).call_rip(), Some(0x1006));
+        // a direct call is none of these.
+        assert_eq!(decode(&[0xe8, 0, 0, 0, 0]).call_reg(), None);
+        assert_eq!(decode(&[0xe8, 0, 0, 0, 0]).call_mem(), None);
+    }
+
+    #[test]
+    fn rip_cmp_projections() {
+        // cmp [rip+0],edi (39 3d ..) len 6 -> mem_left, target 0x1006, reg=7.
+        assert_eq!(decode(&[0x39, 0x3d, 0, 0, 0, 0]).rip_cmp_reg(), Some((false, false, true, 0x1006, 7)));
+        // cmp edi,[rip+0] (3b 3d ..) -> reg_left.
+        assert_eq!(decode(&[0x3b, 0x3d, 0, 0, 0, 0]).rip_cmp_reg(), Some((false, false, false, 0x1006, 7)));
+        // cmp rdi,[rip+0] (48 3b 3d ..) len 7 -> 64-bit, target 0x1007.
+        assert_eq!(decode(&[0x48, 0x3b, 0x3d, 0, 0, 0, 0]).rip_cmp_reg(), Some((false, true, false, 0x1007, 7)));
+        // cmp qword[rip+0],5 (48 83 3d .. 05) len 8 -> imm form, is64, target 0x1008, imm 5.
+        assert_eq!(decode(&[0x48, 0x83, 0x3d, 0, 0, 0, 0, 0x05]).rip_cmp_imm(), Some((false, true, 0x1008, 5)));
+        // a non-RIP cmp is not a rip_cmp.
+        assert_eq!(decode(&[0x39, 0xc8]).rip_cmp_reg(), None);
     }
 
     #[test]
