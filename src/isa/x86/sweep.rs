@@ -639,7 +639,7 @@ impl X86DecodedInstruction {
     /// where kind = 0..7 in that order. Low-byte registers only (rejects ah/ch/dh/bh).
     /// For the VM NARROW8 op (partial-register byte ops).
     pub fn narrow8_rr(&self) -> Option<(u8, u8, u8)> {
-        use iced_x86::{Mnemonic, OpKind};
+        use iced_x86::OpKind;
         let kind = byte_alu_kind(self.instr.mnemonic())?;
         if self.instr.op_count() != 2
             || self.instr.op0_kind() != OpKind::Register
@@ -654,7 +654,7 @@ impl X86DecodedInstruction {
 
     /// 8-bit `op r8, imm8` (same kinds as [`Self::narrow8_rr`]) → `(kind, rd, imm)`.
     pub fn narrow8_ri(&self) -> Option<(u8, u8, u8)> {
-        use iced_x86::{Mnemonic, OpKind};
+        use iced_x86::OpKind;
         let kind = byte_alu_kind(self.instr.mnemonic())?;
         if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
             return None;
