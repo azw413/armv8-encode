@@ -302,6 +302,89 @@ impl X86DecodedInstruction {
         Some((base, index, scale_log2, self.instr.memory_displacement64() as u32))
     }
 
+    /// Like [`Self::mem_addr`] but for an `fs:`/`gs:`-overridden operand: returns
+    /// `(is_gs, base, index, scale_log2, disp)`. `None` if there is no fs/gs prefix
+    /// (a plain memory operand — use `mem_addr`), for RIP-relative, or an odd scale.
+    /// The VM re-emits the access with the same segment prefix; since the interpreter
+    /// runs on the same thread, fs/gs resolve to the same TLS base (stack canary).
+    fn mem_addr_seg(&self) -> Option<(bool, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::Register;
+        let is_gs = match self.instr.segment_prefix() {
+            Register::FS => false,
+            Register::GS => true,
+            _ => return None,
+        };
+        let base = self.instr.memory_base();
+        if matches!(base, Register::RIP | Register::EIP) {
+            return None;
+        }
+        let base = match base {
+            Register::None => None,
+            r => Some(gpr64_index(r)?),
+        };
+        let index = match self.instr.memory_index() {
+            Register::None => None,
+            r => Some(gpr64_index(r)?),
+        };
+        let scale_log2 = match self.instr.memory_index_scale() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => return None,
+        };
+        Some((is_gs, base, index, scale_log2, self.instr.memory_displacement64() as u32))
+    }
+
+    /// `mov reg, fs/gs:[mem]` (segment-relative load, 32/64 — e.g. the stack-canary
+    /// `mov rax, fs:0x28`) → `(is_gs, is64, rd, base, index, scale_log2, disp)`.
+    /// For the VM SEG_LOAD op.
+    pub fn seg_load(&self) -> Option<(bool, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        let (is_gs, base, index, scale, disp) = self.mem_addr_seg()?;
+        Some((is_gs, is64, gpr64_index(rd)?, base, index, scale, disp))
+    }
+
+    /// `op reg, fs/gs:[mem]` (segment-relative arithmetic, 32/64) for add/sub/and/or/
+    /// xor — e.g. the canary check `xor rax, fs:0x28` → `(kind, is_gs, is64, rd, base,
+    /// index, scale_log2, disp)`, kind as in [`Self::arith_rm`]. For the VM SEG_ARITH op.
+    pub fn seg_arith(&self) -> Option<(u8, bool, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Add => 0,
+            Mnemonic::Sub => 1,
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        let (is_gs, base, index, scale, disp) = self.mem_addr_seg()?;
+        Some((kind, is_gs, is64, gpr64_index(rd)?, base, index, scale, disp))
+    }
+
     /// `mov r32, [base+index*scale+disp]` (a 32-bit load) → `(rd, base, index,
     /// scale_log2, disp)`, else `None`. For the VM LOAD op.
     pub fn load_parts(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
@@ -694,6 +777,79 @@ impl X86DecodedInstruction {
             return None;
         }
         let rs = low_gpr8(self.instr.op1_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((base, index, scale, disp, rs))
+    }
+
+    /// 16-bit `op r16, r16` for mov/add/sub/and/or/xor/cmp/test → `(kind, rd, rs)`
+    /// (kind as in [`Self::narrow8_rr`]). For the VM NARROW16 op (partial-word ops).
+    pub fn narrow16_rr(&self) -> Option<(u8, u8, u8)> {
+        use iced_x86::OpKind;
+        let kind = byte_alu_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let d = self.instr.op0_register();
+        let s = self.instr.op1_register();
+        if !d.is_gpr16() || !s.is_gpr16() {
+            return None;
+        }
+        Some((kind, gpr64_index(d)?, gpr64_index(s)?))
+    }
+
+    /// 16-bit `op r16, imm16` (same kinds) → `(kind, rd, imm)`.
+    pub fn narrow16_ri(&self) -> Option<(u8, u8, u16)> {
+        use iced_x86::OpKind;
+        let kind = byte_alu_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let d = self.instr.op0_register();
+        if !d.is_gpr16() {
+            return None;
+        }
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate16 | OpKind::Immediate8to16
+        ) {
+            return None;
+        }
+        Some((kind, gpr64_index(d)?, self.instr.immediate(1) as u16))
+    }
+
+    /// 16-bit load `mov r16, [mem]` → `(rd, base, index, scale_log2, disp)`. For VM LOAD16.
+    pub fn load16(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || self.instr.memory_size().size() != 2
+            || !self.instr.op0_register().is_gpr16()
+        {
+            return None;
+        }
+        let rd = gpr64_index(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((rd, base, index, scale, disp))
+    }
+
+    /// 16-bit store `mov [mem], r16` → `(base, index, scale_log2, disp, rs)`. For VM STORE16.
+    pub fn store16(&self) -> Option<(Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+            || self.instr.memory_size().size() != 2
+            || !self.instr.op1_register().is_gpr16()
+        {
+            return None;
+        }
+        let rs = gpr64_index(self.instr.op1_register())?;
         let (base, index, scale, disp) = self.mem_addr()?;
         Some((base, index, scale, disp, rs))
     }
@@ -1604,6 +1760,41 @@ mod effects_tests {
         assert_eq!(decode(&[0x48, 0x23, 0x46, 0x08]).arith_rm(), Some((2, true, 0, Some(6), None, 0, 8)));
         // add eax,ecx (01 c8) reg-reg -> not arith_rm.
         assert_eq!(decode(&[0x01, 0xc8]).arith_rm(), None);
+    }
+
+    #[test]
+    fn seg_projections() {
+        // mov rax,fs:0x28 (64 48 8b 04 25 28..) -> SEG_LOAD fs, 64-bit, reg=0, disp 0x28.
+        assert_eq!(
+            decode(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00]).seg_load(),
+            Some((false, true, 0, None, None, 0, 0x28))
+        );
+        // sub rax,fs:0x28 (64 48 2b 04 25 28..) -> SEG_ARITH kind=sub(1), fs, 64-bit.
+        assert_eq!(
+            decode(&[0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00]).seg_arith(),
+            Some((1, false, true, 0, None, None, 0, 0x28))
+        );
+        // mov rax,gs:0x10 (65 48 8b 04 25 10..) -> SEG_LOAD gs.
+        assert_eq!(
+            decode(&[0x65, 0x48, 0x8b, 0x04, 0x25, 0x10, 0x00, 0x00, 0x00]).seg_load(),
+            Some((true, true, 0, None, None, 0, 0x10))
+        );
+        // a plain (non-segment) load is not a SEG_LOAD.
+        assert_eq!(decode(&[0x48, 0x8b, 0x07]).seg_load(), None);
+    }
+
+    #[test]
+    fn word_op_projections() {
+        // cmp di,si (66 39 f7) -> NARROW16 kind=cmp(6), rd=7, rs=6.
+        assert_eq!(decode(&[0x66, 0x39, 0xf7]).narrow16_rr(), Some((6, 7, 6)));
+        // or ax,0x8000 (66 0d 00 80) -> kind=or(4), rd=0, imm=0x8000.
+        assert_eq!(decode(&[0x66, 0x0d, 0x00, 0x80]).narrow16_ri(), Some((4, 0, 0x8000)));
+        // mov ax,[rsi] (66 8b 06) -> LOAD16 rd=0, base=6.
+        assert_eq!(decode(&[0x66, 0x8b, 0x06]).load16(), Some((0, Some(6), None, 0, 0)));
+        // mov [rdi],ax (66 89 07) -> STORE16 base=7, rs=0.
+        assert_eq!(decode(&[0x66, 0x89, 0x07]).store16(), Some((Some(7), None, 0, 0, 0)));
+        // 32-bit cmp is not a word op.
+        assert_eq!(decode(&[0x39, 0xf7]).narrow16_rr(), None);
     }
 
     #[test]
