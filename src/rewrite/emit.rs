@@ -117,6 +117,9 @@ pub fn emit<I: Isa>(
                         &mut output,
                     )?;
                 }
+                // Pre-encoded position-independent bytes: copied verbatim, no
+                // relocations (see `RewriteOp::Raw`).
+                RewriteOp::Raw(bytes) => output.bytes.extend_from_slice(bytes),
             }
         }
     }

@@ -197,6 +197,112 @@ fn x86_relocate_function_with_plt_call_runs() {
     assert_eq!(rw_out, native_out, "output differs — relocated PLT call not re-folded correctly");
 }
 
+#[test]
+fn x86_hole_placement_runs() {
+    // Exercises the de-pinned (formerly AArch64-only) hole-placement helpers on
+    // x86: place both raw data and a lifted x86 code plan into a freed `.text`
+    // hole, commit, and run. The hole is a `used` but never-called `filler`
+    // function whose whole body is dead, so overwriting it can't change behaviour;
+    // `compute` (live) must still return 40.
+    use armv8_encode::container::Container;
+    use armv8_encode::isa::x86::{disassemble_bytes, Bitness, X86Isa};
+    use armv8_encode::mc::build_cfg;
+    use armv8_encode::rewrite::{plan::RewritePlan, BinaryEditor};
+
+    if !have("qemu-x86_64") || cross_ld().is_none() {
+        eprintln!("x86_run: no qemu-x86_64 / cross sysroot — skipping");
+        return;
+    }
+    let orig = std::env::temp_dir().join(format!("av8_x86hole_{}.orig", std::process::id()));
+    // `filler` is kept (`used`) but never called -> its body is a safe hole.
+    let src = "#include <stdio.h>\n\
+        __attribute__((used,noinline)) static int filler(int n){\n\
+            int s=0; for(int i=0;i<n;i++) s+=i*i+n; return s;\n\
+        }\n\
+        __attribute__((noinline)) int compute(int x){ return x*3 + 7; }\n\
+        int main(void){ printf(\"r=%d\\n\", compute(11)); return 0; }\n";
+    if !build_x86(src, &orig) {
+        eprintln!("x86_run: no x86-64 cross toolchain — skipping");
+        return;
+    }
+    let native = qemu_run(&orig);
+    assert_eq!(native.0, "r=40\n");
+
+    let bytes = std::fs::read(&orig).unwrap();
+    let container = Container::from_bytes(&bytes).unwrap();
+    let filler = container
+        .symbols
+        .iter()
+        .find(|s| s.name == "filler" && s.size > 0)
+        .expect("filler symbol");
+    // The whole filler body is a freed hole.
+    let mut holes = vec![(filler.address, filler.size)];
+    assert!(filler.size >= 8, "need a usable hole; filler is {} bytes", filler.size);
+
+    let mut editor = BinaryEditor::new(&container).unwrap();
+    editor.prepare_text_patch(".text").unwrap();
+
+    // (a) raw data into the hole.
+    let blob = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let data_sym = editor
+        .place_data_in_holes("hole_blob", &blob, &mut holes)
+        .expect("data placed in hole");
+
+    // (b) a real, position-independent x86 plan into the hole: lift `compute`
+    // itself (its ops carry real `.text` original addresses, so emit copies them
+    // verbatim). The placed copy is dead — nothing jumps to it — so it can't
+    // change behaviour; this just proves a lifted plan places into an x86 hole.
+    let cmp = container.symbols.iter().find(|s| s.name == "compute" && s.size > 0).unwrap();
+    let csid = container.section_for_address(cmp.address).unwrap();
+    let csec = container.section(csid);
+    let coff0 = (cmp.address - csec.address) as usize;
+    let cwin = &csec.bytes[coff0..(coff0 + cmp.size as usize).min(csec.bytes.len())];
+    let mut snippet = Vec::new();
+    for d in disassemble_bytes(cmp.address, cwin, Bitness::Bits64).unwrap() {
+        let is_ret = d.mnemonic() == iced_x86::Mnemonic::Ret;
+        snippet.push(d);
+        if is_ret { break; }
+    }
+    let cfg = build_cfg(&snippet);
+    let plan = RewritePlan::<X86Isa>::lift_from_decoded_with_container(&cfg, &snippet, &container);
+    let code_sym = editor
+        .place_plan_in_holes::<X86Isa>("hole_code", &plan, &mut holes)
+        .expect("place_plan_in_holes ok")
+        .expect("code placed in hole");
+
+    // Both landed inside the original filler body.
+    let dv = editor.binary.symbol_address(data_sym);
+    let cv = editor.binary.symbol_address(code_sym);
+    assert!(dv >= filler.address && dv < filler.address + filler.size, "data in filler");
+    assert!(cv >= filler.address && cv < filler.address + filler.size, "code in filler");
+
+    let out_bytes = editor.commit_to_bytes().unwrap();
+    let rw = std::env::temp_dir().join(format!("av8_x86hole_{}.rw", std::process::id()));
+    std::fs::write(&rw, &out_bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&rw, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let rewritten = qemu_run(&rw);
+    assert_eq!(rewritten.1, native.1, "exit code differs after hole placement");
+    assert_eq!(rewritten.0, native.0, "output differs — hole placement corrupted .text");
+
+    // Confirm the placed bytes actually landed at the hole VAs in the output.
+    let placed = Container::from_bytes(&out_bytes).unwrap();
+    let sid = placed.section_for_address(dv).unwrap();
+    let sec = placed.section(sid);
+    let doff = (dv - sec.address) as usize;
+    assert_eq!(&sec.bytes[doff..doff + 4], &blob, "data blob not patched into hole");
+    let coff = (cv - sec.address) as usize;
+    // Verbatim-copied `compute` starts with endbr64 (f3 0f 1e fa).
+    assert_eq!(
+        &sec.bytes[coff..coff + 4],
+        &[0xf3, 0x0f, 0x1e, 0xfa],
+        "lifted plan not patched into hole",
+    );
+}
+
 // DOCUMENTS A KNOWN LIMITATION (ignored): lifting the WHOLE `.text`
 // (`lift_text_section`) and committing it re-assembles every instruction via iced
 // `BlockEncoder`, which relayouts the section and breaks RIP-relative/data

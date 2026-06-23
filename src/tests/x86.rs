@@ -388,6 +388,54 @@ fn editor_redirects_x86_branch_and_round_trips() {
 }
 
 #[test]
+fn raw_op_is_emitted_verbatim_and_shifts_later_branches() {
+    use crate::isa::x86::X86Isa;
+    use crate::rewrite::ir::RewriteOp;
+    use crate::rewrite::{emit, lay_out, plan::RewritePlan};
+
+    // je +1 ; nop ; ret  (74 01 90 c3) in a one-section ELF, lifted to a plan.
+    let mut obj = WriteObject::new(ObjFormat::Elf, ObjArch::X86_64, Endianness::Little);
+    let text_id = obj.section_id(StandardSection::Text);
+    obj.append_section_data(text_id, &[0x74, 0x01, 0x90, 0xc3], 1);
+    obj.add_symbol(WriteSymbol {
+        name: b"f".to_vec(),
+        value: 0,
+        size: 4,
+        kind: ObjSymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: WriteSymbolSection::Section(text_id),
+        flags: SymbolFlags::None,
+    });
+    let bytes = obj.write().unwrap();
+    let container = Container::from_bytes(&bytes).unwrap();
+    let text = container.text_sections().next().unwrap();
+    let (base, code) = text.for_disassembly().unwrap();
+    let insns = disassemble_bytes(base, code, Bitness::Bits64).unwrap();
+    let cfg = build_cfg(&insns);
+    let mut plan = RewritePlan::<X86Isa>::lift_from_decoded_with_container(&cfg, &insns, &container);
+
+    // Inject two `nop`s as a Raw op at the very front of the entry block.
+    plan.blocks[0].ops.insert(0, RewriteOp::Raw(vec![0x90, 0x90]));
+
+    let new_base = base + 0x4_0000;
+    let layout = lay_out::<X86Isa>(&plan, new_base, Some(&container)).unwrap();
+    let out = emit::<X86Isa>(&plan, &layout, Some(&container)).unwrap();
+
+    // Raw bytes are emitted verbatim at the front (two `nop`s)...
+    assert_eq!(&out.bytes[..2], &[0x90, 0x90], "Raw op not emitted verbatim");
+    // ...and the je re-folded across the inserted bytes to still land on the
+    // relocated `ret`.
+    let relocated = disassemble_bytes(new_base, &out.bytes, Bitness::Bits64).unwrap();
+    assert_eq!(relocated[0].mnemonic(), Mnemonic::Nop);
+    assert_eq!(relocated[1].mnemonic(), Mnemonic::Nop);
+    let je = relocated.iter().find(|i| i.mnemonic() == Mnemonic::Je).expect("je survived");
+    let ret = relocated.last().unwrap();
+    assert_eq!(ret.mnemonic(), Mnemonic::Ret);
+    assert_eq!(je.instr.near_branch_target(), ret.address, "je must re-fold to the ret");
+}
+
+#[test]
 fn relocates_x86_function_through_generic_pipeline() {
     use crate::isa::x86::{X86Isa, X86Operand};
     use crate::rewrite::{emit, lay_out, plan::RewritePlan};

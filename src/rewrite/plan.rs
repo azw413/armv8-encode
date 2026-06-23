@@ -254,14 +254,14 @@ impl<I: Isa> RewritePlan<I> {
     pub fn instruction_at(&self, address: u64) -> Option<&RewriteInstruction<I>> {
         match self.op_at(address)? {
             RewriteOp::Instruction(insn) => Some(insn),
-            RewriteOp::Macro(_) => None,
+            RewriteOp::Macro(_) | RewriteOp::Raw(_) => None,
         }
     }
 
     pub fn instruction_at_mut(&mut self, address: u64) -> Option<&mut RewriteInstruction<I>> {
         match self.op_at_mut(address)? {
             RewriteOp::Instruction(insn) => Some(insn),
-            RewriteOp::Macro(_) => None,
+            RewriteOp::Macro(_) | RewriteOp::Raw(_) => None,
         }
     }
 
@@ -271,7 +271,9 @@ impl<I: Isa> RewritePlan<I> {
             .ok_or(EditError::AddressNotFound(address))?;
         let instr = match op {
             RewriteOp::Instruction(instr) => instr,
-            RewriteOp::Macro(_) => return Err(EditError::NotAnInstruction(address)),
+            RewriteOp::Macro(_) | RewriteOp::Raw(_) => {
+                return Err(EditError::NotAnInstruction(address))
+            }
         };
         for operand in &mut instr.operands {
             match operand {
@@ -298,7 +300,7 @@ impl<I: Isa> RewritePlan<I> {
                 macro_op.target = new_target;
                 Ok(())
             }
-            RewriteOp::Instruction(_) => Err(EditError::NotAMacro(address)),
+            RewriteOp::Instruction(_) | RewriteOp::Raw(_) => Err(EditError::NotAMacro(address)),
         }
     }
 

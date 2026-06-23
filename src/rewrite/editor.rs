@@ -743,6 +743,21 @@ impl LiftedTextSectionAny {
             Self::X86(s) => s.base_address,
         }
     }
+
+    /// ISA-agnostic raw byte overlay at virtual address `va`, applied to the
+    /// committed section. For the fixed-width ISAs this is an *overlay* on top of
+    /// the re-laid-out section; for x86 it's a *byte-patch* on top of the verbatim
+    /// section (same `(va, bytes)` model under both, applied at commit). The
+    /// hole-placement helpers use this to drop position-independent code/data into
+    /// freed `.text` regions without caring which ISA the section is.
+    pub fn overlay_bytes(&mut self, va: u64, bytes: Vec<u8>) {
+        match self {
+            Self::Aarch64(s) => s.overlay_bytes(va, bytes),
+            Self::Thumb(s) => s.overlay_bytes(va, bytes),
+            Self::Arm(s) => s.overlay_bytes(va, bytes),
+            Self::X86(s) => s.patches.push((va, bytes)),
+        }
+    }
 }
 
 // Back-compat aliases. Methods on the aarch64 variant — which
@@ -1099,7 +1114,7 @@ impl BinaryEditor {
     /// `holes` (each `(vaddr, size)`), overlay the bytes there, and define an
     /// Object symbol at that address. Returns the symbol, or `None` (the hole
     /// list unchanged) when nothing fits — the caller should append instead.
-    /// AArch64 lifted text only.
+    /// ISA-agnostic (works on any lifted text section, including x86 patch mode).
     pub fn place_data_in_holes(
         &mut self,
         name: &str,
@@ -1109,27 +1124,28 @@ impl BinaryEditor {
         let Some(va) = take_hole(holes, data.len() as u64) else {
             return None;
         };
-        let text = self.text.as_mut()?.aarch64_mut()?;
+        let text = self.text.as_mut()?;
         let section = text.section_id();
         text.overlay_bytes(va, data.to_vec());
         Some(self.binary.define_text_symbol(name, va, data.len() as u64, false, section))
     }
 
-    /// Place a position-independent AArch64 code `plan` into a freed `.text`
-    /// hole: best-fit it, emit at the hole's address, overlay the bytes, and
-    /// define a Function symbol there. Returns `None` (holes unchanged) if it
-    /// doesn't fit or would require a relocation (which an overlay can't carry) —
-    /// the caller appends instead.
-    pub fn place_plan_in_holes(
+    /// Place a position-independent code `plan` into a freed `.text` hole:
+    /// best-fit it, emit at the hole's address, overlay the bytes, and define a
+    /// Function symbol there. Returns `None` (holes unchanged) if it doesn't fit
+    /// or would require a relocation (which an overlay can't carry) — the caller
+    /// appends instead. Generic over the plan's [`Isa`]; the overlay routes
+    /// through the lifted section regardless of ISA (x86 lands it as a byte-patch).
+    pub fn place_plan_in_holes<I: Isa>(
         &mut self,
         name: &str,
-        plan: &RewritePlanGeneric<Aarch64Isa>,
+        plan: &RewritePlanGeneric<I>,
         holes: &mut Vec<(u64, u64)>,
     ) -> Result<Option<SymbolId>, TextEditorError> {
         // Probe at base 0 for the size and to confirm it emits no relocations
         // (both are base-independent for a self-contained, non-widening blob).
-        let probe_layout = lay_out(plan, 0, Some(&self.binary.container))?;
-        let probe = emit(plan, &probe_layout, Some(&self.binary.container))?;
+        let probe_layout = lay_out::<I>(plan, 0, Some(&self.binary.container))?;
+        let probe = emit::<I>(plan, &probe_layout, Some(&self.binary.container))?;
         if !probe.relocations.is_empty() {
             return Ok(None);
         }
@@ -1137,13 +1153,12 @@ impl BinaryEditor {
         let Some(va) = take_hole(holes, size) else {
             return Ok(None);
         };
-        let layout = lay_out(plan, va, Some(&self.binary.container))?;
-        let output = emit(plan, &layout, Some(&self.binary.container))?;
+        let layout = lay_out::<I>(plan, va, Some(&self.binary.container))?;
+        let output = emit::<I>(plan, &layout, Some(&self.binary.container))?;
         let text = self
             .text
             .as_mut()
-            .and_then(|t| t.aarch64_mut())
-            .ok_or_else(|| TextEditorError::SectionNotFound("<no aarch64 .text>".into()))?;
+            .ok_or_else(|| TextEditorError::SectionNotFound("<no lifted .text>".into()))?;
         let section = text.section_id();
         text.overlay_bytes(va, output.bytes);
         Ok(Some(self.binary.define_text_symbol(name, va, size, true, section)))
@@ -1165,10 +1180,10 @@ impl BinaryEditor {
     /// landed (its scattered VA plus its contiguous 0-based offset), so callers
     /// that need per-instruction addresses (e.g. a computed-goto dispatch table)
     /// can map a byte offset in the original blob to its scattered address.
-    pub fn place_plan_scattered(
+    pub fn place_plan_scattered<I: Isa>(
         &mut self,
         name: &str,
-        plan: &RewritePlanGeneric<Aarch64Isa>,
+        plan: &RewritePlanGeneric<I>,
         holes: &mut Vec<(u64, u64)>,
     ) -> Result<Option<ScatterPlacement>, TextEditorError> {
         if plan.blocks.is_empty() {
@@ -1194,14 +1209,14 @@ impl BinaryEditor {
                 None => return Ok(None),
             }
         }
-        let layout = match lay_out_scattered(plan, &addrs, Some(&self.binary.container)) {
+        let layout = match lay_out_scattered::<I>(plan, &addrs, Some(&self.binary.container)) {
             Ok(l) => l,
             Err(LayoutError::DisplacementTooLarge { .. }) | Err(LayoutError::DidNotConverge) => {
                 return Ok(None);
             }
             Err(other) => return Err(other.into()),
         };
-        let output = emit(plan, &layout, Some(&self.binary.container))?;
+        let output = emit::<I>(plan, &layout, Some(&self.binary.container))?;
         if !output.relocations.is_empty() {
             return Ok(None);
         }
@@ -1211,8 +1226,7 @@ impl BinaryEditor {
         let text = self
             .text
             .as_mut()
-            .and_then(|t| t.aarch64_mut())
-            .ok_or_else(|| TextEditorError::SectionNotFound("<no aarch64 .text>".into()))?;
+            .ok_or_else(|| TextEditorError::SectionNotFound("<no lifted .text>".into()))?;
         let section = text.section_id();
         // emit() produces block bytes in block order, contiguous per block.
         let mut off = 0usize;

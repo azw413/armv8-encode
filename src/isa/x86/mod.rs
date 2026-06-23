@@ -30,11 +30,29 @@ pub mod sweep;
 pub use encode::{assemble, encode_instruction, Assembled, EncodeError};
 pub use isa_impl::X86Isa;
 pub use sweep::{
-    disassemble_bytes, project_operands, Bitness, DisassembleError, X86DecodedInstruction,
-    X86Operand,
+    disassemble_bytes, flag_bits, project_operands, Bitness, DisassembleError,
+    X86DecodedInstruction, X86Operand, X86RegUse,
 };
 
 use crate::container::Architecture;
+
+/// Mnemonic for an unconditional near jump. Callers synthesizing a `jmp <block>`
+/// connector — e.g. to make a fall-through edge explicit before reordering basic
+/// blocks — pair this with a [`crate::rewrite::ir::RewriteOperand::Branch`] block
+/// target; the emit pass re-encodes it to `jmp rel32` (5 bytes) via
+/// [`X86Isa::encode`]. Lets a consumer build the op without naming `iced_x86`.
+pub fn jmp_mnemonic() -> iced_x86::Mnemonic {
+    iced_x86::Mnemonic::Jmp
+}
+
+/// Mnemonic for `jne` (jump-if-not-equal / ZF=0). Paired with a
+/// [`crate::rewrite::ir::RewriteOperand::Branch`] block target, the emit pass
+/// re-encodes it to `jne rel32` (6 bytes) via [`X86Isa::encode`]. Used to build
+/// an opaque-predicate branch (never taken after a `cmp r,r`, which forces ZF=1)
+/// without naming `iced_x86`.
+pub fn jne_mnemonic() -> iced_x86::Mnemonic {
+    iced_x86::Mnemonic::Jne
+}
 
 /// Map a container architecture onto the x86 decode width. Returns
 /// `None` for non-x86 architectures.

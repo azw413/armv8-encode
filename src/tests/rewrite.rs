@@ -181,7 +181,7 @@ fn replace_terminator_swaps_block_exit() {
         crate::rewrite::RewriteOp::Instruction(insn) => insn
             .pc_relative_target()
             .expect("head terminator should have a branch target"),
-        crate::rewrite::RewriteOp::Macro(_) => {
+        crate::rewrite::RewriteOp::Macro(_) | crate::rewrite::RewriteOp::Raw(_) => {
             panic!("head terminator should be a singleton instruction")
         }
     };

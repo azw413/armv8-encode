@@ -169,6 +169,17 @@ impl<I: Isa> Debug for RewriteBlock<I> {
 pub enum RewriteOp<I: Isa> {
     Instruction(RewriteInstruction<I>),
     Macro(MacroOp<I>),
+    /// Pre-encoded, **position-independent** machine-code bytes inserted into the
+    /// stream verbatim. The layout pass reserves exactly `bytes.len()` and the
+    /// emit pass copies the bytes unchanged — they carry no operands, no
+    /// relocations, and no PC-relative fields, so they must be self-contained
+    /// (e.g. inserted junk / opaque-predicate scaffolding). This is the only way
+    /// to inject a synthesized instruction for an ISA whose operand model can't
+    /// represent it (x86: [`Isa::Operand`](crate::isa::Isa::Operand) surfaces only
+    /// branch targets, and [`Isa::encode`](crate::isa::Isa::encode) only the
+    /// branch family) — everything else is verbatim-copied from the source, and
+    /// `Raw` extends that to bytes with no source instruction.
+    Raw(Vec<u8>),
 }
 
 impl<I: Isa> Clone for RewriteOp<I> {
@@ -176,6 +187,7 @@ impl<I: Isa> Clone for RewriteOp<I> {
         match self {
             Self::Instruction(i) => Self::Instruction(i.clone()),
             Self::Macro(m) => Self::Macro(m.clone()),
+            Self::Raw(b) => Self::Raw(b.clone()),
         }
     }
 }
@@ -185,6 +197,7 @@ impl<I: Isa> PartialEq for RewriteOp<I> {
         match (self, other) {
             (Self::Instruction(a), Self::Instruction(b)) => a == b,
             (Self::Macro(a), Self::Macro(b)) => a == b,
+            (Self::Raw(a), Self::Raw(b)) => a == b,
             _ => false,
         }
     }
@@ -197,6 +210,7 @@ impl<I: Isa> Debug for RewriteOp<I> {
         match self {
             Self::Instruction(i) => f.debug_tuple("Instruction").field(i).finish(),
             Self::Macro(m) => f.debug_tuple("Macro").field(m).finish(),
+            Self::Raw(b) => f.debug_tuple("Raw").field(b).finish(),
         }
     }
 }
@@ -256,6 +270,7 @@ impl<I: Isa> RewriteOp<I> {
                 .source_size
                 .unwrap_or_else(|| I::instruction_source_size(insn.mnemonic)),
             Self::Macro(macro_op) => I::macro_source_size(&macro_op.original_instructions),
+            Self::Raw(bytes) => bytes.len() as u64,
         }
     }
 
@@ -263,6 +278,7 @@ impl<I: Isa> RewriteOp<I> {
         match self {
             Self::Instruction(insn) => insn.original_address,
             Self::Macro(macro_op) => macro_op.original_addresses.first().copied(),
+            Self::Raw(_) => None,
         }
     }
 
@@ -270,6 +286,7 @@ impl<I: Isa> RewriteOp<I> {
         match self {
             Self::Instruction(insn) => insn.original_address == Some(address),
             Self::Macro(macro_op) => macro_op.original_addresses.contains(&address),
+            Self::Raw(_) => false,
         }
     }
 }

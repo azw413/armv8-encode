@@ -237,6 +237,22 @@ fn attach_successors(
 ) {
     for block in blocks.iter_mut() {
         let Some(terminator) = block.terminator else {
+            // No terminator: the block ran to the next leader without branching
+            // (the next instruction is a leader only because something else jumps
+            // there), so control falls through into the block at `block.end`.
+            // Without this edge a fall-through predecessor looks successor-less,
+            // making backward dataflow (liveness) treat its live-out as the
+            // function-exit set and miss values carried into the next block (e.g.
+            // a loop preheader falling into the loop header). Only record an edge
+            // for an in-slice successor; an off-slice fall-through (the final
+            // block running off the end) stays successor-less, which downstream
+            // analyses already treat as the exit set.
+            if let EdgeTarget::Block(id) = resolve(block.end, block_at_address) {
+                block.successors.push(Edge {
+                    kind: EdgeKind::Fallthrough,
+                    target: EdgeTarget::Block(id),
+                });
+            }
             continue;
         };
 

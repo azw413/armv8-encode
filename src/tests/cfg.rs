@@ -262,10 +262,11 @@ fn branch_into_middle_splits_a_would_be_block() {
     assert_eq!(head.start, 0x1000);
     assert_eq!(head.end, 0x1008);
     assert_eq!(head.terminator, None);
-    // Falls off the end into the next block in source order, but since the
-    // builder doesn't synthesize fallthrough edges for non-terminated blocks,
-    // there's no successor here.
-    assert!(head.successors.is_empty());
+    // The non-terminated head falls through into the next block in source order;
+    // the builder records that as a Fallthrough edge so backward analyses see it.
+    assert_eq!(head.successors.len(), 1);
+    assert_eq!(head.successors[0].kind, EdgeKind::Fallthrough);
+    assert_eq!(head.successors[0].target, EdgeTarget::Block(BasicBlockId(1)));
 
     let body = &cfg.blocks[1];
     assert_eq!(body.start, 0x1008);
@@ -289,11 +290,14 @@ fn predecessors_of_finds_all_incoming_edges() {
     // 0x1008 ret          (target block)
     let cfg = cfg_from_templates(0x1000, vec![beq(0x1008), nop(), ret()]);
 
+    // The target (0x1008) is reached from block 0 (the taken branch) AND from the
+    // fall-through block 1 (which runs off its end into 0x1008).
     let target_block = cfg.block_at(0x1008).expect("0x1008 should be a block");
-    let preds = cfg.predecessors_of(target_block);
-    assert_eq!(preds, vec![BasicBlockId(0)]);
+    let mut preds = cfg.predecessors_of(target_block);
+    preds.sort_by_key(|b| b.0);
+    assert_eq!(preds, vec![BasicBlockId(0), BasicBlockId(1)]);
 
-    // The fallthrough block is also reached only from block 0.
+    // The fallthrough block is reached only from block 0 (the branch's fallthrough).
     let fall_block = cfg.block_at(0x1004).expect("0x1004 should be a block");
     let preds = cfg.predecessors_of(fall_block);
     assert_eq!(preds, vec![BasicBlockId(0)]);
