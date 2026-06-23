@@ -31,7 +31,7 @@ pub use encode::{assemble, encode_instruction, Assembled, EncodeError};
 pub use isa_impl::X86Isa;
 pub use sweep::{
     disassemble_bytes, flag_bits, project_operands, Bitness, DisassembleError,
-    X86DecodedInstruction, X86Operand, X86RegUse,
+    X86DecodedInstruction, X86Operand, X86RegUse, X86RrOp,
 };
 
 use crate::container::Architecture;

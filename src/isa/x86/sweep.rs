@@ -195,6 +195,1077 @@ impl X86DecodedInstruction {
         Some((gpr, self.instr.immediate32()))
     }
 
+    /// If this is `lea r32, [base + index*scale + disp]` (32-bit destination),
+    /// return `(rd, base, index, scale_log2, disp)` where `base`/`index` are
+    /// `Some(gpr 0..15)` or `None` (absent), `scale_log2` ∈ 0..=3 (×1/2/4/8), and
+    /// `disp` is the 32-bit displacement. `None` for 64-bit-dest lea, RIP-relative
+    /// lea (an address load, not guest-register arithmetic), or non-lea. For the
+    /// VM's LEA op — the workhorse most `-O2` arithmetic folds into.
+    pub fn lea_parts(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind, Register};
+        if self.instr.mnemonic() != Mnemonic::Lea
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd_reg = self.instr.op0_register();
+        if !rd_reg.is_gpr32() {
+            return None; // 32-bit destination only (Phase 3)
+        }
+        let rd = gpr64_index(rd_reg)?;
+        let base = self.instr.memory_base();
+        if matches!(base, Register::RIP | Register::EIP) {
+            return None; // RIP-relative = address load, not guest arithmetic
+        }
+        let base = match base {
+            Register::None => None,
+            r => Some(gpr64_index(r)?),
+        };
+        let index = match self.instr.memory_index() {
+            Register::None => None,
+            r => Some(gpr64_index(r)?),
+        };
+        let scale_log2 = match self.instr.memory_index_scale() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => return None,
+        };
+        let disp = self.instr.memory_displacement64() as u32;
+        Some((rd, base, index, scale_log2, disp))
+    }
+
+    /// If this is a register-to-register `op r32, r32` (both operands 32-bit GPRs),
+    /// return `(op, rd, rs)` — `rd` is the destination/left, `rs` the source/right.
+    /// Covers mov/add/sub/and/or/xor and 2-operand imul; `None` otherwise. For the
+    /// VM's reg-reg ops. (Flag effects are irrelevant: a flag *reader* isn't in the
+    /// VM's op set, so any function whose result depends on these flags fails to
+    /// lower and falls back to mutation.)
+    pub fn binary_rr(&self) -> Option<(X86RrOp, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let op = match self.instr.mnemonic() {
+            Mnemonic::Mov => X86RrOp::Mov,
+            Mnemonic::Add => X86RrOp::Add,
+            Mnemonic::Sub => X86RrOp::Sub,
+            Mnemonic::And => X86RrOp::And,
+            Mnemonic::Or => X86RrOp::Or,
+            Mnemonic::Xor => X86RrOp::Xor,
+            Mnemonic::Imul => X86RrOp::Imul,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd_reg = self.instr.op0_register();
+        let rs_reg = self.instr.op1_register();
+        if !rd_reg.is_gpr32() || !rs_reg.is_gpr32() {
+            return None;
+        }
+        Some((op, gpr64_index(rd_reg)?, gpr64_index(rs_reg)?))
+    }
+
+    /// Extract a memory operand's `(base, index, scale_log2, disp)` — `base`/`index`
+    /// are `Some(gpr 0..15)` or `None`; `disp` is 32-bit. `None` for RIP-relative
+    /// (PIE global), a segment-overridden operand (`fs:`/`gs:` — TLS / stack
+    /// canary; the address isn't `base+index+disp`), or an unusual scale. Shared by
+    /// load/store projections.
+    fn mem_addr(&self) -> Option<(Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::Register;
+        if self.instr.segment_prefix() != Register::None {
+            return None; // fs:/gs: — segment base not modelled
+        }
+        let base = self.instr.memory_base();
+        if matches!(base, Register::RIP | Register::EIP) {
+            return None;
+        }
+        let base = match base {
+            Register::None => None,
+            r => Some(gpr64_index(r)?),
+        };
+        let index = match self.instr.memory_index() {
+            Register::None => None,
+            r => Some(gpr64_index(r)?),
+        };
+        let scale_log2 = match self.instr.memory_index_scale() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => return None,
+        };
+        Some((base, index, scale_log2, self.instr.memory_displacement64() as u32))
+    }
+
+    /// `mov r32, [base+index*scale+disp]` (a 32-bit load) → `(rd, base, index,
+    /// scale_log2, disp)`, else `None`. For the VM LOAD op.
+    pub fn load_parts(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if !rd.is_gpr32() {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((gpr64_index(rd)?, base, index, scale, disp))
+    }
+
+    /// `mov [base+index*scale+disp], r32` (a 32-bit store) → `(base, index,
+    /// scale_log2, disp, rs)`, else `None`. For the VM STORE op.
+    pub fn store_parts(&self) -> Option<(Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rs = self.instr.op1_register();
+        if !rs.is_gpr32() {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((base, index, scale, disp, gpr64_index(rs)?))
+    }
+
+    /// 64-bit `mov r64, [mem]` → `(rd, base, index, scale_log2, disp)`. For VM LOAD64.
+    pub fn load_parts64(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if !rd.is_gpr64() {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((gpr64_index(rd)?, base, index, scale, disp))
+    }
+
+    /// 64-bit `mov [mem], r64` → `(base, index, scale_log2, disp, rs)`. For VM STORE64.
+    pub fn store_parts64(&self) -> Option<(Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rs = self.instr.op1_register();
+        if !rs.is_gpr64() {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((base, index, scale, disp, gpr64_index(rs)?))
+    }
+
+    /// 64-bit-dest `lea r64, [base+index*scale+disp]` → `(rd, base, index,
+    /// scale_log2, disp)`; `None` for RIP-relative. For VM LEA64 (pointer math).
+    pub fn lea_parts64(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Lea
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if !rd.is_gpr64() {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((gpr64_index(rd)?, base, index, scale, disp))
+    }
+
+    /// Register-to-register `op r64, r64` for add/sub/and/or/xor/imul (NOT mov — see
+    /// [`Self::mov_rr64`]) → `(op, rd, rs)`. For the VM's 64-bit reg-reg ops.
+    pub fn binary_rr64(&self) -> Option<(X86RrOp, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let op = match self.instr.mnemonic() {
+            Mnemonic::Add => X86RrOp::Add,
+            Mnemonic::Sub => X86RrOp::Sub,
+            Mnemonic::And => X86RrOp::And,
+            Mnemonic::Or => X86RrOp::Or,
+            Mnemonic::Xor => X86RrOp::Xor,
+            Mnemonic::Imul => X86RrOp::Imul,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let rs = self.instr.op1_register();
+        if !rd.is_gpr64() || !rs.is_gpr64() {
+            return None;
+        }
+        Some((op, gpr64_index(rd)?, gpr64_index(rs)?))
+    }
+
+    /// `mov r64, imm` (sign-extended imm32, or `movabs` imm64) → `(rd, imm)`. For
+    /// VM MOV64_IMM.
+    pub fn mov_imm64(&self) -> Option<(u8, i64)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if !rd.is_gpr64() {
+            return None;
+        }
+        let imm = match self.instr.op1_kind() {
+            OpKind::Immediate32to64 => self.instr.immediate32to64(),
+            OpKind::Immediate64 => self.instr.immediate64() as i64,
+            _ => return None,
+        };
+        Some((gpr64_index(rd)?, imm))
+    }
+
+    /// `test r, r` (32/64, any register pair) → `(is64, a, b)`. Flags-only (AND-based).
+    /// For the VM TEST op. (Same-register `test` is also matched by
+    /// [`Self::test_rr_self`], which the lowerer checks first.)
+    pub fn test_rr(&self) -> Option<(bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Test
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let a = self.instr.op0_register();
+        let b = self.instr.op1_register();
+        if a.is_gpr32() && b.is_gpr32() {
+            Some((false, gpr64_index(a)?, gpr64_index(b)?))
+        } else if a.is_gpr64() && b.is_gpr64() {
+            Some((true, gpr64_index(a)?, gpr64_index(b)?))
+        } else {
+            None
+        }
+    }
+
+    /// `test r, imm` (32/64) → `(is64, a, imm)`. For the VM TEST op (imm form).
+    pub fn test_ri(&self) -> Option<(bool, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Test
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let a = self.instr.op0_register();
+        let is64 = a.is_gpr64();
+        if !a.is_gpr32() && !is64 {
+            return None;
+        }
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                | OpKind::Immediate32 | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        Some((is64, gpr64_index(a)?, self.instr.immediate(1) as u32))
+    }
+
+    /// `and`/`or`/`xor reg, imm` (32/64) → `(kind, is64, rd, imm)`, kind =
+    /// 2=and,3=or,4=xor (matching [`Self::arith_rm`]). `imm` is the low 32 bits of
+    /// the (sign-extended) immediate; the VM re-extends. For the VM ALU_IMM op.
+    pub fn alu_imm(&self) -> Option<(u8, bool, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                | OpKind::Immediate32 | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        Some((kind, is64, gpr64_index(rd)?, self.instr.immediate(1) as u32))
+    }
+
+    /// `op reg, [mem]` (load-fused arithmetic) for add/sub/and/or/xor →
+    /// `(kind, is64, reg, base, index, scale_log2, disp)`, where kind =
+    /// 0=add,1=sub,2=and,3=or,4=xor. `reg` is the dest (= left operand), `[mem]` the
+    /// right. 32/64-bit. For the VM ARITH_RM op.
+    pub fn arith_rm(&self) -> Option<(u8, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Add => 0,
+            Mnemonic::Sub => 1,
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let reg = self.instr.op0_register();
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, is64, gpr64_index(reg)?, base, index, scale, disp))
+    }
+
+    /// `op [mem], reg` (memory read-modify-write) for add/sub/and/or/xor →
+    /// `(kind, is64, base, index, scale_log2, disp, reg)`. For VM ARITH_MR (reg form).
+    pub fn arith_mr_reg(&self) -> Option<(u8, bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Add => 0,
+            Mnemonic::Sub => 1,
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let reg = self.instr.op1_register();
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, is64, base, index, scale, disp, gpr64_index(reg)?))
+    }
+
+    /// `op [mem]:{32,64}, imm` (memory RMW with immediate) for add/sub/and/or/xor →
+    /// `(kind, is64, base, index, scale_log2, disp, imm)`. For VM ARITH_MR (imm form).
+    pub fn arith_mr_imm(&self) -> Option<(u8, bool, Option<u8>, Option<u8>, u8, u32, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Add => 0,
+            Mnemonic::Sub => 1,
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                | OpKind::Immediate32 | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, is64, base, index, scale, disp, self.instr.immediate(1) as u32))
+    }
+
+    /// `shl`/`shr`/`sar reg, imm8` or `reg, cl` (32/64) → `(kind, is64, is_cl, rd,
+    /// imm_count)`, kind = 0=shl,1=shr,2=sar. For VM SHIFT.
+    pub fn shift_op(&self) -> Option<(u8, bool, bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind, Register};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Shl => 0,
+            Mnemonic::Shr => 1,
+            Mnemonic::Sar => 2,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        let idx = gpr64_index(rd)?;
+        match self.instr.op1_kind() {
+            OpKind::Immediate8 => Some((kind, is64, false, idx, self.instr.immediate8())),
+            OpKind::Register if self.instr.op1_register() == Register::CL => {
+                Some((kind, is64, true, idx, 0))
+            }
+            _ => None,
+        }
+    }
+
+    /// 8-bit `op r8, r8` for mov/add/sub/and/or/xor/cmp/test → `(kind, rd, rs)`,
+    /// where kind = 0..7 in that order. Low-byte registers only (rejects ah/ch/dh/bh).
+    /// For the VM NARROW8 op (partial-register byte ops).
+    pub fn narrow8_rr(&self) -> Option<(u8, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = byte_alu_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let d = self.instr.op0_register();
+        let s = self.instr.op1_register();
+        Some((kind, low_gpr8(d)?, low_gpr8(s)?))
+    }
+
+    /// 8-bit `op r8, imm8` (same kinds as [`Self::narrow8_rr`]) → `(kind, rd, imm)`.
+    pub fn narrow8_ri(&self) -> Option<(u8, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = byte_alu_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        if !matches!(self.instr.op1_kind(), OpKind::Immediate8) {
+            return None;
+        }
+        let d = self.instr.op0_register();
+        Some((kind, low_gpr8(d)?, self.instr.immediate(1) as u8))
+    }
+
+    /// 8-bit load `mov r8, [mem]` → `(rd, base, index, scale_log2, disp)`. For VM LOAD8.
+    pub fn load8(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || self.instr.memory_size().size() != 1
+        {
+            return None;
+        }
+        let rd = low_gpr8(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((rd, base, index, scale, disp))
+    }
+
+    /// 8-bit store `mov [mem], r8` → `(base, index, scale_log2, disp, rs)`. For VM STORE8.
+    pub fn store8(&self) -> Option<(Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+            || self.instr.memory_size().size() != 1
+        {
+            return None;
+        }
+        let rs = low_gpr8(self.instr.op1_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((base, index, scale, disp, rs))
+    }
+
+    /// `movzx`/`movsx`/`movsxd r, r` (width-changing register move) →
+    /// `(signed, src_size_log2, dst64, dst, src)`. `src_size_log2`: 0=byte, 1=word,
+    /// 2=dword (movsxd). `None` for a high-byte src (ah/ch/dh/bh) or odd widths.
+    pub fn ext_rr(&self) -> Option<(bool, u8, bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind, Register};
+        let (signed, fixed) = match self.instr.mnemonic() {
+            Mnemonic::Movzx => (false, None),
+            Mnemonic::Movsx => (true, None),
+            Mnemonic::Movsxd => (true, Some(2u8)),
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let dst = self.instr.op0_register();
+        if !dst.is_gpr32() && !dst.is_gpr64() {
+            return None;
+        }
+        let src = self.instr.op1_register();
+        if matches!(src, Register::AH | Register::CH | Register::DH | Register::BH) {
+            return None;
+        }
+        let size_log2 = match fixed {
+            Some(s) => {
+                if !src.is_gpr32() {
+                    return None;
+                }
+                s
+            }
+            None if src.is_gpr8() => 0,
+            None if src.is_gpr16() => 1,
+            None => return None,
+        };
+        Some((signed, size_log2, dst.is_gpr64(), gpr64_index(dst)?, gpr64_index(src)?))
+    }
+
+    /// `movzx`/`movsx`/`movsxd r, [mem]` (width-changing load) → `(signed,
+    /// src_size_log2, dst64, dst, base, index, scale_log2, disp)`. `None` for RIP or
+    /// odd widths.
+    pub fn ext_rm(&self) -> Option<(bool, u8, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let signed = match self.instr.mnemonic() {
+            Mnemonic::Movzx => false,
+            Mnemonic::Movsx | Mnemonic::Movsxd => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let dst = self.instr.op0_register();
+        if !dst.is_gpr32() && !dst.is_gpr64() {
+            return None;
+        }
+        let size_log2 = match self.instr.memory_size().size() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => return None,
+        };
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((signed, size_log2, dst.is_gpr64(), gpr64_index(dst)?, base, index, scale, disp))
+    }
+
+    /// `mov [mem], imm` (non-RIP) at a 32/64-bit width → `(is64, base, index,
+    /// scale_log2, disp, imm)`. For VM STORE_IMM. `None` for 8/16-bit, RIP, or
+    /// a non-immediate source.
+    pub fn store_imm_mem(&self) -> Option<(bool, Option<u8>, Option<u8>, u8, u32, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov || self.instr.op_count() != 2 {
+            return None;
+        }
+        let imm = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Memory, OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate8) => {
+                self.instr.immediate(1) as u32
+            }
+            _ => return None,
+        };
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        let (base, index, scale, disp) = self.mem_addr()?; // None for RIP/segment
+        Some((is64, base, index, scale, disp, imm))
+    }
+
+    /// `mov [rip+disp], imm` at a 32/64-bit width → `(is64, target_vaddr, imm)`.
+    /// For VM RIP_STORE_IMM.
+    pub fn rip_store_imm(&self) -> Option<(bool, u64, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate8
+        ) {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        Some((is64, self.instr.memory_displacement64(), self.instr.immediate(1) as u32))
+    }
+
+    /// `cmp`/`test` of a 32/64-bit register against a (non-RIP) memory operand →
+    /// `(is_test, is64, mem_is_left, base, index, scale_log2, disp, reg)`. For VM
+    /// CMP_MEM_REG. Width is the register's; `None` for 8/16-bit or RIP.
+    pub fn cmp_mem_reg(&self) -> Option<(bool, bool, bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_test = match self.instr.mnemonic() {
+            Mnemonic::Cmp => false,
+            Mnemonic::Test => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 {
+            return None;
+        }
+        let (mem_left, reg) = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Memory, OpKind::Register) => (true, self.instr.op1_register()),
+            (OpKind::Register, OpKind::Memory) => (false, self.instr.op0_register()),
+            _ => return None,
+        };
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is_test, is64, mem_left, base, index, scale, disp, gpr64_index(reg)?))
+    }
+
+    /// `lea r64, [rip+disp]` → `(rd, target_vaddr)` (the absolute address the `lea`
+    /// computes). For VM RIP_LEA (global/string addresses in a PIE).
+    pub fn rip_lea(&self) -> Option<(u8, u64)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Lea
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if !rd.is_gpr64() {
+            return None;
+        }
+        Some((gpr64_index(rd)?, self.instr.memory_displacement64()))
+    }
+
+    /// `mov r32/r64, [rip+disp]` → `(rd, target_vaddr, is64)`. For VM RIP_LOAD
+    /// (PIE global reads + GOT loads).
+    pub fn rip_load(&self) -> Option<(u8, u64, bool)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((gpr64_index(rd)?, self.instr.memory_displacement64(), is64))
+    }
+
+    /// `mov [rip+disp], r32/r64` → `(target_vaddr, rs, is64)`. For VM RIP_STORE.
+    pub fn rip_store(&self) -> Option<(u64, u8, bool)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        let rs = self.instr.op1_register();
+        let is64 = rs.is_gpr64();
+        if !rs.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((self.instr.memory_displacement64(), gpr64_index(rs)?, is64))
+    }
+
+    /// A direct near `call` → the absolute target vaddr, else `None` (not a call,
+    /// or an indirect `call reg`/`call [mem]`). Covers both intra-binary calls and
+    /// `call func@plt` (the target is the PLT stub). For the VM CALL op.
+    pub fn call_target(&self) -> Option<u64> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Call {
+            return None;
+        }
+        matches!(
+            self.instr.op0_kind(),
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+        )
+        .then(|| self.instr.near_branch_target())
+    }
+
+    /// `push r64` → the GPR index (register form only), else `None`. For the VM
+    /// PUSH op (always 64-bit in x86-64).
+    pub fn push_reg(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Push
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let r = self.instr.op0_register();
+        r.is_gpr64().then(|| gpr64_index(r)).flatten()
+    }
+
+    /// `pop r64` → the GPR index (register form only), else `None`. For the VM POP op.
+    pub fn pop_reg(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Pop
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let r = self.instr.op0_register();
+        r.is_gpr64().then(|| gpr64_index(r)).flatten()
+    }
+
+    /// `mov r64, r64` (a full 64-bit register copy) → `(rd, rs)`, else `None`. For
+    /// the VM MOV64_RR op (e.g. `mov rbp, rsp`).
+    pub fn mov_rr64(&self) -> Option<(u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let rs = self.instr.op1_register();
+        if !rd.is_gpr64() || !rs.is_gpr64() {
+            return None;
+        }
+        Some((gpr64_index(rd)?, gpr64_index(rs)?))
+    }
+
+    /// `add/sub r64, imm` (a 64-bit register/immediate op) → `(rd, imm, is_sub)`,
+    /// else `None`. `imm` is the low 32 bits of the sign-extended immediate (the VM
+    /// re-sign-extends); covers the imm8 and imm32 encodings. For the VM
+    /// ADD64_IMM/SUB64_IMM ops (e.g. `sub rsp, N`).
+    pub fn add_sub_imm64(&self) -> Option<(u8, u32, bool)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_sub = match self.instr.mnemonic() {
+            Mnemonic::Add => false,
+            Mnemonic::Sub => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if !rd.is_gpr64() {
+            return None;
+        }
+        let imm = match self.instr.op1_kind() {
+            OpKind::Immediate8to64 => self.instr.immediate8to64() as u32,
+            OpKind::Immediate32to64 => self.instr.immediate32to64() as u32,
+            _ => return None,
+        };
+        Some((gpr64_index(rd)?, imm, is_sub))
+    }
+
+    /// True for `leave` (= `mov rsp, rbp; pop rbp`). The VM lowers it to those two ops.
+    pub fn is_leave(&self) -> bool {
+        self.instr.mnemonic() == iced_x86::Mnemonic::Leave
+    }
+
+    /// `setcc r8` (a conditional byte set) → `(cc, rd)` where `cc` is the x86
+    /// condition code (same encoding as [`Self::branch`]) and `rd` is the
+    /// destination GPR (the low byte gets 0/1; upper bits are preserved). `None`
+    /// for non-setcc, or a legacy high-byte dest (`ah/ch/dh/bh` — different merge).
+    pub fn setcc_parts(&self) -> Option<(u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind, Register};
+        let cc = match self.instr.mnemonic() {
+            Mnemonic::Sete => 0x4,
+            Mnemonic::Setne => 0x5,
+            Mnemonic::Setb => 0x2,
+            Mnemonic::Setae => 0x3,
+            Mnemonic::Setbe => 0x6,
+            Mnemonic::Seta => 0x7,
+            Mnemonic::Sets => 0x8,
+            Mnemonic::Setns => 0x9,
+            Mnemonic::Setl => 0xc,
+            Mnemonic::Setge => 0xd,
+            Mnemonic::Setle => 0xe,
+            Mnemonic::Setg => 0xf,
+            _ => return None,
+        };
+        if self.instr.op_count() != 1 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        if matches!(rd, Register::AH | Register::CH | Register::DH | Register::BH) || !rd.is_gpr8() {
+            return None;
+        }
+        gpr64_index(rd).map(|i| (cc, i))
+    }
+
+    /// `cmovcc r32, r32` (a 32-bit conditional move) → `(cc, rd, rs)` where `cc`
+    /// is the x86 condition code (same encoding as [`Self::branch`]). `rd = cc ? rs
+    /// : rd`. `None` otherwise. For the VM CMOV op (branchless conditionals).
+    pub fn cmov_parts(&self) -> Option<(u8, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let cc = match self.instr.mnemonic() {
+            Mnemonic::Cmove => 0x4,
+            Mnemonic::Cmovne => 0x5,
+            Mnemonic::Cmovb => 0x2,
+            Mnemonic::Cmovae => 0x3,
+            Mnemonic::Cmovbe => 0x6,
+            Mnemonic::Cmova => 0x7,
+            Mnemonic::Cmovs => 0x8,
+            Mnemonic::Cmovns => 0x9,
+            Mnemonic::Cmovl => 0xc,
+            Mnemonic::Cmovge => 0xd,
+            Mnemonic::Cmovle => 0xe,
+            Mnemonic::Cmovg => 0xf,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let rs = self.instr.op1_register();
+        if !rd.is_gpr32() || !rs.is_gpr32() {
+            return None;
+        }
+        Some((cc, gpr64_index(rd)?, gpr64_index(rs)?))
+    }
+
+    /// 64-bit `cmovcc r64, r64` → `(cc, rd, rs)`. For VM CMOV (64-bit move variant).
+    pub fn cmov_parts64(&self) -> Option<(u8, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let cc = match self.instr.mnemonic() {
+            Mnemonic::Cmove => 0x4,
+            Mnemonic::Cmovne => 0x5,
+            Mnemonic::Cmovb => 0x2,
+            Mnemonic::Cmovae => 0x3,
+            Mnemonic::Cmovbe => 0x6,
+            Mnemonic::Cmova => 0x7,
+            Mnemonic::Cmovs => 0x8,
+            Mnemonic::Cmovns => 0x9,
+            Mnemonic::Cmovl => 0xc,
+            Mnemonic::Cmovge => 0xd,
+            Mnemonic::Cmovle => 0xe,
+            Mnemonic::Cmovg => 0xf,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let rs = self.instr.op1_register();
+        if !rd.is_gpr64() || !rs.is_gpr64() {
+            return None;
+        }
+        Some((cc, gpr64_index(rd)?, gpr64_index(rs)?))
+    }
+
+    /// `cmp r32, r32` → `(left_gpr, right_gpr)`, else `None`. For the VM CMP op.
+    pub fn cmp_rr(&self) -> Option<(u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Cmp
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let l = self.instr.op0_register();
+        let r = self.instr.op1_register();
+        if !l.is_gpr32() || !r.is_gpr32() {
+            return None;
+        }
+        Some((gpr64_index(l)?, gpr64_index(r)?))
+    }
+
+    /// `cmp r32, imm32` → `(left_gpr, imm)`, else `None`. For the VM CMP op.
+    pub fn cmp_imm(&self) -> Option<(u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Cmp
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let l = self.instr.op0_register();
+        if !l.is_gpr32() {
+            return None;
+        }
+        let imm = match self.instr.op1_kind() {
+            OpKind::Immediate8to32 => self.instr.immediate8to32() as u32,
+            OpKind::Immediate32 => self.instr.immediate32(),
+            _ => return None,
+        };
+        Some((gpr64_index(l)?, imm))
+    }
+
+    /// `test r32, r32` with the SAME register (the `test eax,eax` zero/sign idiom)
+    /// → that gpr. Flag-equivalent to `cmp r,0`, so the VM lowers it that way.
+    pub fn test_rr_self(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Test
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let l = self.instr.op0_register();
+        if !l.is_gpr32() || l != self.instr.op1_register() {
+            return None;
+        }
+        gpr64_index(l)
+    }
+
+    /// `cmp r64, r64` → `(left, right)`. For VM CMP64_RR.
+    pub fn cmp_rr64(&self) -> Option<(u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Cmp
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let l = self.instr.op0_register();
+        let r = self.instr.op1_register();
+        if !l.is_gpr64() || !r.is_gpr64() {
+            return None;
+        }
+        Some((gpr64_index(l)?, gpr64_index(r)?))
+    }
+
+    /// `cmp r64, imm` → `(left, imm)` (imm = low 32 bits of the sign-extended
+    /// immediate; the VM re-sign-extends). For VM CMP64_IMM.
+    pub fn cmp_imm64(&self) -> Option<(u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Cmp
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let l = self.instr.op0_register();
+        if !l.is_gpr64() {
+            return None;
+        }
+        let imm = match self.instr.op1_kind() {
+            OpKind::Immediate8to64 => self.instr.immediate8to64() as u32,
+            OpKind::Immediate32to64 => self.instr.immediate32to64() as u32,
+            _ => return None,
+        };
+        Some((gpr64_index(l)?, imm))
+    }
+
+    /// `test r64, r64` with the SAME register (64-bit `test rax,rax` null check) →
+    /// that gpr. Flag-equivalent to `cmp r,0`; the VM lowers it that way (64-bit).
+    pub fn test_rr_self64(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Test
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let l = self.instr.op0_register();
+        if !l.is_gpr64() || l != self.instr.op1_register() {
+            return None;
+        }
+        gpr64_index(l)
+    }
+
+    /// `cmp [mem], imm` / `test [mem], imm` at a 32- or 64-bit memory width →
+    /// `(is_test, is64, base, index, scale_log2, disp, imm)`. `None` for 8/16-bit
+    /// widths, RIP-relative, or a non-immediate. For VM CMP_MEM_IMM.
+    pub fn cmp_mem_imm(&self) -> Option<(bool, bool, Option<u8>, Option<u8>, u8, u32, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_test = match self.instr.mnemonic() {
+            Mnemonic::Cmp => false,
+            Mnemonic::Test => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32
+                | OpKind::Immediate8to64 | OpKind::Immediate16 | OpKind::Immediate32
+                | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        let imm = self.instr.immediate(1) as u32;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is_test, is64, base, index, scale, disp, imm))
+    }
+
+    /// A direct near branch: `(None, target)` for `jmp`, `(Some(cc), target)` for a
+    /// conditional `jcc`, where `cc` is the x86 condition code (E=4, NE=5, B=2,
+    /// AE=3, BE=6, A=7, S=8, NS=9, L=0xc, GE=0xd, LE=0xe, G=0xf). `None` for
+    /// non-branches and indirect branches (no static target). `target` is absolute.
+    pub fn branch(&self) -> Option<(Option<u8>, u64)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let near = matches!(
+            self.instr.op0_kind(),
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+        );
+        let m = self.instr.mnemonic();
+        if m == Mnemonic::Jmp {
+            return near.then(|| (None, self.instr.near_branch_target()));
+        }
+        let cc = match m {
+            Mnemonic::Je => 0x4,
+            Mnemonic::Jne => 0x5,
+            Mnemonic::Jb => 0x2,
+            Mnemonic::Jae => 0x3,
+            Mnemonic::Jbe => 0x6,
+            Mnemonic::Ja => 0x7,
+            Mnemonic::Js => 0x8,
+            Mnemonic::Jns => 0x9,
+            Mnemonic::Jl => 0xc,
+            Mnemonic::Jge => 0xd,
+            Mnemonic::Jle => 0xe,
+            Mnemonic::Jg => 0xf,
+            _ => return None,
+        };
+        near.then(|| (Some(cc), self.instr.near_branch_target()))
+    }
+
     /// True for call/syscall/interrupt instructions whose full register impact —
     /// the callee's ABI clobbers and argument reads — is NOT captured by
     /// [`Self::register_effects`] (iced reports only the direct stack/target
@@ -225,6 +1296,20 @@ impl X86DecodedInstruction {
             map_rflags(self.instr.rflags_modified()),
         )
     }
+}
+
+/// A register-to-register binary operation recognized by
+/// [`X86DecodedInstruction::binary_rr`]. `Mov` writes `rd = rs`; the rest are
+/// read-modify-write `rd = rd op rs`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum X86RrOp {
+    Mov,
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Imul,
 }
 
 /// How one GPR is used by an instruction (see
@@ -282,6 +1367,32 @@ fn map_rflags(bits: u32) -> u8 {
 
 /// Map an iced register to its 0..15 GPR index (folding sub-registers to the
 /// 64-bit parent), or `None` for non-GPR registers.
+/// Kind code for a byte ALU mnemonic (0=mov,1=add,2=sub,3=and,4=or,5=xor,6=cmp,
+/// 7=test), or `None`. Shared by the VM's NARROW8 reg-reg / reg-imm projections.
+fn byte_alu_kind(m: iced_x86::Mnemonic) -> Option<u8> {
+    use iced_x86::Mnemonic::*;
+    Some(match m {
+        Mov => 0,
+        Add => 1,
+        Sub => 2,
+        And => 3,
+        Or => 4,
+        Xor => 5,
+        Cmp => 6,
+        Test => 7,
+        _ => return None,
+    })
+}
+
+/// A LOW-byte GPR (al/bl/.../sil/dil/r8b..r15b) → its 0..15 index; `None` for a
+/// legacy high-byte reg (ah/ch/dh/bh — different bit position) or a non-gpr8.
+fn low_gpr8(reg: Register) -> Option<u8> {
+    if matches!(reg, Register::AH | Register::CH | Register::DH | Register::BH) || !reg.is_gpr8() {
+        return None;
+    }
+    gpr64_index(reg)
+}
+
 fn gpr64_index(reg: Register) -> Option<u8> {
     if !reg.is_gpr() {
         return None;
@@ -402,6 +1513,278 @@ mod effects_tests {
         assert_eq!(decode(&[0x48, 0x83, 0xc0, 0x05]).add_sub_imm(), None);
         // add eax, ecx (01 c8): register source, not an immediate -> None.
         assert_eq!(decode(&[0x01, 0xc8]).add_sub_imm(), None);
+    }
+
+    #[test]
+    fn cmp_64bit_and_mem_projections() {
+        // cmp rax,rdx (48 39 d0) -> CMP64_RR (0,2).
+        assert_eq!(decode(&[0x48, 0x39, 0xd0]).cmp_rr64(), Some((0, 2)));
+        // cmp rdi,5 (48 83 ff 05) -> CMP64_IMM (7, 5).
+        assert_eq!(decode(&[0x48, 0x83, 0xff, 0x05]).cmp_imm64(), Some((7, 5)));
+        // test rdi,rdi (48 85 ff) -> test_rr_self64 (7).
+        assert_eq!(decode(&[0x48, 0x85, 0xff]).test_rr_self64(), Some(7));
+        // cmpq 42,(rdi) (48 83 3f 2a) -> CMP_MEM_IMM (cmp, is64, base=7, disp 0, imm 42).
+        assert_eq!(
+            decode(&[0x48, 0x83, 0x3f, 0x2a]).cmp_mem_imm(),
+            Some((false, true, Some(7), None, 0, 0, 42))
+        );
+        // cmpl 99,(rdi) (83 3f 63) -> 32-bit memory.
+        assert_eq!(
+            decode(&[0x83, 0x3f, 0x63]).cmp_mem_imm(),
+            Some((false, false, Some(7), None, 0, 0, 99))
+        );
+        // testb (byte) -> 8-bit width rejected.
+        assert_eq!(decode(&[0xf6, 0x07, 0x01]).cmp_mem_imm(), None); // test byte [rdi],1
+        // 32-bit register forms must not match the 64-bit projections.
+        assert_eq!(decode(&[0x39, 0xd0]).cmp_rr64(), None); // cmp eax,edx
+    }
+
+    #[test]
+    fn data_ops_64bit_projections() {
+        // mov rax,[rdi] (48 8b 07) -> LOAD64 rd=0 base=7.
+        assert_eq!(decode(&[0x48, 0x8b, 0x07]).load_parts64(), Some((0, Some(7), None, 0, 0)));
+        // mov [rdi],rax (48 89 07) -> STORE64.
+        assert_eq!(decode(&[0x48, 0x89, 0x07]).store_parts64(), Some((Some(7), None, 0, 0, 0)));
+        // lea rax,[rdi+8] (48 8d 47 08) -> LEA64.
+        assert_eq!(decode(&[0x48, 0x8d, 0x47, 0x08]).lea_parts64(), Some((0, Some(7), None, 0, 8)));
+        // imul rax,rsi (48 0f af c6) -> binary_rr64 Imul rd=0 rs=6.
+        assert_eq!(decode(&[0x48, 0x0f, 0xaf, 0xc6]).binary_rr64(), Some((X86RrOp::Imul, 0, 6)));
+        // movabs rax,0x123456789 (48 b8 ..) -> MOV64_IMM.
+        assert_eq!(
+            decode(&[0x48, 0xb8, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00]).mov_imm64(),
+            Some((0, 0x1_2345_6789))
+        );
+        // mov rax,5 (48 c7 c0 05 00 00 00) -> sign-extended imm.
+        assert_eq!(decode(&[0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00]).mov_imm64(), Some((0, 5)));
+        // 32-bit forms must NOT match the 64-bit projections.
+        assert_eq!(decode(&[0x8b, 0x07]).load_parts64(), None); // mov eax,[rdi]
+        assert_eq!(decode(&[0x48, 0x89, 0xf0]).binary_rr64(), None); // mov rax,rsi (use mov_rr64)
+    }
+
+    #[test]
+    fn test_projections() {
+        // test edi,esi (85 f7) -> rr, 32-bit, a=7, b=6 (different regs).
+        assert_eq!(decode(&[0x85, 0xf7]).test_rr(), Some((false, 7, 6)));
+        // test rax,rcx (48 85 c8) -> rr, 64-bit, a=0, b=1.
+        assert_eq!(decode(&[0x48, 0x85, 0xc8]).test_rr(), Some((true, 0, 1)));
+        // test eax,0x40 (a9 40 ..) -> ri, 32-bit, a=0, imm=0x40.
+        assert_eq!(decode(&[0xa9, 0x40, 0x00, 0x00, 0x00]).test_ri(), Some((false, 0, 0x40)));
+        // cmp is not test.
+        assert_eq!(decode(&[0x39, 0xc8]).test_rr(), None);
+    }
+
+    #[test]
+    fn alu_imm_shift_rmw_projections() {
+        // and eax,0x12345 (25 ..) -> kind and(2), 32-bit, rd=0, imm.
+        assert_eq!(decode(&[0x25, 0x45, 0x23, 0x01, 0x00]).alu_imm(), Some((2, false, 0, 0x12345)));
+        // or rax,5 (48 83 c8 05) -> kind or(3), 64-bit, imm 5.
+        assert_eq!(decode(&[0x48, 0x83, 0xc8, 0x05]).alu_imm(), Some((3, true, 0, 5)));
+        // add [rdi],esi (01 37) -> ARITH_MR reg, kind add(0), 32, base=7, reg=6.
+        assert_eq!(decode(&[0x01, 0x37]).arith_mr_reg(), Some((0, false, Some(7), None, 0, 0, 6)));
+        // or dword[rdi],0x80 (81 0f 80 ..) -> ARITH_MR imm, kind or(3), base=7, imm 0x80.
+        assert_eq!(
+            decode(&[0x81, 0x0f, 0x80, 0x00, 0x00, 0x00]).arith_mr_imm(),
+            Some((3, false, Some(7), None, 0, 0, 0x80))
+        );
+        // shl eax,cl (d3 e0) -> SHIFT kind shl(0), 32, is_cl.
+        assert_eq!(decode(&[0xd3, 0xe0]).shift_op(), Some((0, false, true, 0, 0)));
+        // sar rax,5 (48 c1 f8 05) -> kind sar(2), 64, imm 5.
+        assert_eq!(decode(&[0x48, 0xc1, 0xf8, 0x05]).shift_op(), Some((2, true, false, 0, 5)));
+        // add reg,imm is NOT alu_imm (only and/or/xor).
+        assert_eq!(decode(&[0x83, 0xc0, 0x05]).alu_imm(), None);
+    }
+
+    #[test]
+    fn arith_rm_projection() {
+        // add eax,[rdi] (03 07) -> kind add(0), 32-bit, reg=0, base=7.
+        assert_eq!(decode(&[0x03, 0x07]).arith_rm(), Some((0, false, 0, Some(7), None, 0, 0)));
+        // xor eax,[rdi] (33 07) -> kind xor(4).
+        assert_eq!(decode(&[0x33, 0x07]).arith_rm(), Some((4, false, 0, Some(7), None, 0, 0)));
+        // and rax,[rsi+8] (48 23 46 08) -> kind and(2), 64-bit, reg=0, base=6, disp 8.
+        assert_eq!(decode(&[0x48, 0x23, 0x46, 0x08]).arith_rm(), Some((2, true, 0, Some(6), None, 0, 8)));
+        // add eax,ecx (01 c8) reg-reg -> not arith_rm.
+        assert_eq!(decode(&[0x01, 0xc8]).arith_rm(), None);
+    }
+
+    #[test]
+    fn byte_op_projections() {
+        // cmp dil,sil (40 38 f7) -> NARROW8 kind=cmp(6), rd=7, rs=6.
+        assert_eq!(decode(&[0x40, 0x38, 0xf7]).narrow8_rr(), Some((6, 7, 6)));
+        // add al,cl (00 c8) -> kind=add(1), rd=0, rs=1.
+        assert_eq!(decode(&[0x00, 0xc8]).narrow8_rr(), Some((1, 0, 1)));
+        // and al,0x0f (24 0f) -> kind=and(3), rd=0, imm=0x0f.
+        assert_eq!(decode(&[0x24, 0x0f]).narrow8_ri(), Some((3, 0, 0x0f)));
+        // mov al,[rsi] (8a 06) -> LOAD8 rd=0, base=6.
+        assert_eq!(decode(&[0x8a, 0x06]).load8(), Some((0, Some(6), None, 0, 0)));
+        // mov [rdi],al (88 07) -> STORE8 base=7, rs=0.
+        assert_eq!(decode(&[0x88, 0x07]).store8(), Some((Some(7), None, 0, 0, 0)));
+        // high-byte reg rejected: cmp al,ah (38 e0).
+        assert_eq!(decode(&[0x38, 0xe0]).narrow8_rr(), None);
+        // a 32-bit op is not a byte op.
+        assert_eq!(decode(&[0x01, 0xc8]).narrow8_rr(), None); // add eax,ecx
+    }
+
+    #[test]
+    fn ext_projections() {
+        // movsxd rdi,edi (48 63 ff) -> EXT_RR signed, dword, dst64, dst=7, src=7.
+        assert_eq!(decode(&[0x48, 0x63, 0xff]).ext_rr(), Some((true, 2, true, 7, 7)));
+        // movzx eax,cl (0f b6 c1) -> unsigned, byte, dst32, dst=0, src=1.
+        assert_eq!(decode(&[0x0f, 0xb6, 0xc1]).ext_rr(), Some((false, 0, false, 0, 1)));
+        // movzx eax,byte[rdi] (0f b6 07) -> EXT_RM unsigned, byte, dst32, dst=0, base=7.
+        assert_eq!(
+            decode(&[0x0f, 0xb6, 0x07]).ext_rm(),
+            Some((false, 0, false, 0, Some(7), None, 0, 0))
+        );
+        // movsx eax,word[rdi] (0f bf 07) -> signed, word.
+        assert_eq!(
+            decode(&[0x0f, 0xbf, 0x07]).ext_rm(),
+            Some((true, 1, false, 0, Some(7), None, 0, 0))
+        );
+        // a plain mov is not an ext.
+        assert_eq!(decode(&[0x89, 0xc8]).ext_rr(), None);
+    }
+
+    #[test]
+    fn store_imm_and_mem_cmp_projections() {
+        // mov dword[rdi],5 (c7 07 05 ..) -> STORE_IMM 32, base=7, imm=5.
+        assert_eq!(decode(&[0xc7, 0x07, 0x05, 0, 0, 0]).store_imm_mem(), Some((false, Some(7), None, 0, 0, 5)));
+        // mov qword[rdi],0 (48 c7 07 ..) -> STORE_IMM 64.
+        assert_eq!(decode(&[0x48, 0xc7, 0x07, 0, 0, 0, 0]).store_imm_mem(), Some((true, Some(7), None, 0, 0, 0)));
+        // cmp [rdi],esi (39 37) -> CMP_MEM_REG mem_left, base=7, reg=6.
+        assert_eq!(
+            decode(&[0x39, 0x37]).cmp_mem_reg(),
+            Some((false, false, true, Some(7), None, 0, 0, 6))
+        );
+        // cmp eax,[rdi] (3b 07) -> reg-left (mem_left=false), reg=0.
+        assert_eq!(
+            decode(&[0x3b, 0x07]).cmp_mem_reg(),
+            Some((false, false, false, Some(7), None, 0, 0, 0))
+        );
+        // mov [rip+0],imm (c7 05 .. dword) -> rip_store_imm (not store_imm_mem).
+        assert_eq!(decode(&[0xc7, 0x05, 0, 0, 0, 0, 0x07, 0, 0, 0]).store_imm_mem(), None);
+    }
+
+    #[test]
+    fn rip_relative_projections() {
+        // Decoded at base 0x1000. mov eax,[rip+0] (8b 05 ..) len 6 -> target 0x1006.
+        assert_eq!(decode(&[0x8b, 0x05, 0, 0, 0, 0]).rip_load(), Some((0, 0x1006, false)));
+        // mov rax,[rip+0] (48 8b 05 ..) len 7 -> target 0x1007, is64.
+        assert_eq!(decode(&[0x48, 0x8b, 0x05, 0, 0, 0, 0]).rip_load(), Some((0, 0x1007, true)));
+        // lea rax,[rip+0] (48 8d 05 ..) len 7 -> target 0x1007.
+        assert_eq!(decode(&[0x48, 0x8d, 0x05, 0, 0, 0, 0]).rip_lea(), Some((0, 0x1007)));
+        // mov [rip+0],rax (48 89 05 ..) len 7 -> target 0x1007, is64.
+        assert_eq!(decode(&[0x48, 0x89, 0x05, 0, 0, 0, 0]).rip_store(), Some((0x1007, 0, true)));
+        // A non-RIP load must not match rip_load.
+        assert_eq!(decode(&[0x8b, 0x07]).rip_load(), None); // mov eax,[rdi]
+    }
+
+    #[test]
+    fn call_target_projection() {
+        // call rel32=0 (e8 00 00 00 00) at 0x1000 -> target 0x1005.
+        assert_eq!(decode(&[0xe8, 0x00, 0x00, 0x00, 0x00]).call_target(), Some(0x1005));
+        // call rax (ff d0): indirect -> None.
+        assert_eq!(decode(&[0xff, 0xd0]).call_target(), None);
+        // jmp (e9 ...): not a call.
+        assert_eq!(decode(&[0xe9, 0x00, 0x00, 0x00, 0x00]).call_target(), None);
+    }
+
+    #[test]
+    fn stack_and_frame_projections() {
+        // push rbp (55) / pop rbp (5d): rbp=5.
+        assert_eq!(decode(&[0x55]).push_reg(), Some(5));
+        assert_eq!(decode(&[0x5d]).pop_reg(), Some(5));
+        // mov rbp,rsp (48 89 e5): rd=rbp(5), rs=rsp(4).
+        assert_eq!(decode(&[0x48, 0x89, 0xe5]).mov_rr64(), Some((5, 4)));
+        // sub rsp,0x10 (48 83 ec 10): rd=rsp(4), imm=0x10, is_sub.
+        assert_eq!(decode(&[0x48, 0x83, 0xec, 0x10]).add_sub_imm64(), Some((4, 0x10, true)));
+        // add rsp,0x10 (48 83 c4 10): not sub.
+        assert_eq!(decode(&[0x48, 0x83, 0xc4, 0x10]).add_sub_imm64(), Some((4, 0x10, false)));
+        // leave (c9).
+        assert!(decode(&[0xc9]).is_leave());
+        // mov ebp,esp (89 e5): 32-bit -> not mov_rr64.
+        assert_eq!(decode(&[0x89, 0xe5]).mov_rr64(), None);
+        // segment-overridden load (mov rax, fs:0x28 = 64 48 8b 04 25 28 00 00 00) -> rejected.
+        assert_eq!(decode(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00]).load_parts(), None);
+    }
+
+    #[test]
+    fn setcc_projection() {
+        // setne al (0f 95 c0): cc=NE(5), rd=0.
+        assert_eq!(decode(&[0x0f, 0x95, 0xc0]).setcc_parts(), Some((0x5, 0)));
+        // setg bl (0f 9f c3): cc=G(0xf), rd=3.
+        assert_eq!(decode(&[0x0f, 0x9f, 0xc3]).setcc_parts(), Some((0xf, 3)));
+        // sete dil (40 0f 94 c7): REX-required low byte of rdi -> rd=7.
+        assert_eq!(decode(&[0x40, 0x0f, 0x94, 0xc7]).setcc_parts(), Some((0x4, 7)));
+        // sete ah (0f 94 c4): legacy high byte -> None (different merge).
+        assert_eq!(decode(&[0x0f, 0x94, 0xc4]).setcc_parts(), None);
+    }
+
+    #[test]
+    fn cmov_projection() {
+        // cmovge eax,esi (0f 4d c6): cc=GE(0xd), rd=0, rs=6.
+        assert_eq!(decode(&[0x0f, 0x4d, 0xc6]).cmov_parts(), Some((0xd, 0, 6)));
+        // cmove edx,ecx (0f 44 d1): cc=E(4), rd=2, rs=1.
+        assert_eq!(decode(&[0x0f, 0x44, 0xd1]).cmov_parts(), Some((0x4, 2, 1)));
+        // mov eax,esi (89 f0): not a cmov.
+        assert_eq!(decode(&[0x89, 0xf0]).cmov_parts(), None);
+    }
+
+    #[test]
+    fn load_store_projections() {
+        // mov eax,[rdi] (8b 07): rd=0, base=7, no index, disp 0.
+        assert_eq!(decode(&[0x8b, 0x07]).load_parts(), Some((0, Some(7), None, 0, 0)));
+        // mov eax,[rdi+rsi*4+8] (8b 44 b7 08): rd=0, base=7, index=6, ×4, +8.
+        assert_eq!(decode(&[0x8b, 0x44, 0xb7, 0x08]).load_parts(), Some((0, Some(7), Some(6), 2, 8)));
+        // mov [rdi],eax (89 07): base=7, no index, disp 0, rs=0.
+        assert_eq!(decode(&[0x89, 0x07]).store_parts(), Some((Some(7), None, 0, 0, 0)));
+        // mov eax,[rip+0x10] (8b 05 ...): RIP-relative -> None (PIE global).
+        assert_eq!(decode(&[0x8b, 0x05, 0x10, 0, 0, 0]).load_parts(), None);
+        // mov eax,ecx (89 c8): register source, not a load/store.
+        assert_eq!(decode(&[0x89, 0xc8]).load_parts(), None);
+        assert_eq!(decode(&[0x89, 0xc8]).store_parts(), None);
+    }
+
+    #[test]
+    fn cmp_and_branch_projections() {
+        // cmp eax,ecx (39 c8); cmp eax,5 (83 f8 05); test eax,eax (85 c0).
+        assert_eq!(decode(&[0x39, 0xc8]).cmp_rr(), Some((0, 1)));
+        assert_eq!(decode(&[0x83, 0xf8, 0x05]).cmp_imm(), Some((0, 5)));
+        assert_eq!(decode(&[0x85, 0xc0]).test_rr_self(), Some(0));
+        // Branches decode at base 0x1000: jmp +0 -> 0x1005, je +0 -> 0x1002, jl -> 0x1002.
+        assert_eq!(decode(&[0xe9, 0, 0, 0, 0]).branch(), Some((None, 0x1005)));
+        assert_eq!(decode(&[0x74, 0x00]).branch(), Some((Some(0x4), 0x1002)));
+        assert_eq!(decode(&[0x7c, 0x00]).branch(), Some((Some(0xc), 0x1002)));
+        // Non-branches / indirect.
+        assert_eq!(decode(&[0xc3]).branch(), None); // ret
+        assert_eq!(decode(&[0x01, 0xc8]).cmp_rr(), None); // add, not cmp
+    }
+
+    #[test]
+    fn binary_rr_projection() {
+        // mov eax,ecx (89 c8): Mov rd=0 rs=1.
+        assert_eq!(decode(&[0x89, 0xc8]).binary_rr(), Some((X86RrOp::Mov, 0, 1)));
+        // add eax,ecx (01 c8): Add.
+        assert_eq!(decode(&[0x01, 0xc8]).binary_rr(), Some((X86RrOp::Add, 0, 1)));
+        // imul eax,ecx (0f af c1): Imul rd=0 rs=1.
+        assert_eq!(decode(&[0x0f, 0xaf, 0xc1]).binary_rr(), Some((X86RrOp::Imul, 0, 1)));
+        // xor r8d,r9d (45 31 c8): rd=8 rs=9 (REX-extended).
+        assert_eq!(decode(&[0x45, 0x31, 0xc8]).binary_rr(), Some((X86RrOp::Xor, 8, 9)));
+        // add eax,5 (imm source) -> not reg-reg.
+        assert_eq!(decode(&[0x83, 0xc0, 0x05]).binary_rr(), None);
+        // imul eax,ecx,7 (3-operand) -> not the 2-operand reg-reg form.
+        assert_eq!(decode(&[0x6b, 0xc1, 0x07]).binary_rr(), None);
+    }
+
+    #[test]
+    fn lea_parts_projection() {
+        // lea eax,[rdi+rdi*2+7] (8d 44 7f 07): rd=0, base=rdi(7), index=rdi(7), ×2, +7.
+        assert_eq!(decode(&[0x8d, 0x44, 0x7f, 0x07]).lea_parts(), Some((0, Some(7), Some(7), 1, 7)));
+        // lea eax,[rdi+5] (8d 47 05): base only.
+        assert_eq!(decode(&[0x8d, 0x47, 0x05]).lea_parts(), Some((0, Some(7), None, 0, 5)));
+        // lea rax,[rdi+5] (48 8d 47 05): 64-bit dest -> None (Phase 3 is 32-bit).
+        assert_eq!(decode(&[0x48, 0x8d, 0x47, 0x05]).lea_parts(), None);
+        // lea eax,[rip+0x10] (8d 05 ...): RIP-relative address load -> None.
+        assert_eq!(decode(&[0x8d, 0x05, 0x10, 0x00, 0x00, 0x00]).lea_parts(), None);
     }
 
     #[test]

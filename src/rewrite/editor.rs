@@ -2628,6 +2628,21 @@ impl BinaryState {
     /// `align` is the byte alignment the blob requires (1 for
     /// strings, 4 for u32 tables, etc.). The cumulative segment
     /// is padded to satisfy it.
+    /// The vaddr the next [`Self::add_data`] with this `align` will assign — without
+    /// appending anything. Lets a caller build position-dependent appended content
+    /// (e.g. a blob that must reference other sections by a fixed delta) before
+    /// committing it. Pure: mirrors `add_data`'s placement exactly.
+    pub fn pending_append_vaddr(&self, align: u64) -> Result<u64, TextEditorError> {
+        let segment_vaddr = match &self.appended {
+            Some(state) => state.segment_vaddr,
+            None => self.pick_append_vaddr()?,
+        };
+        let cumulative = self.appended.as_ref().map(|s| s.bytes.len() as u64).unwrap_or(0);
+        let aligned_cumulative =
+            if align <= 1 { cumulative } else { (cumulative + align - 1) & !(align - 1) };
+        Ok(segment_vaddr + aligned_cumulative)
+    }
+
     pub fn add_data(
         &mut self,
         name: &str,
