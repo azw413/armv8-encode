@@ -632,10 +632,145 @@ impl X86DecodedInstruction {
         Some((kind, is64, gpr64_index(reg)?, base, index, scale, disp))
     }
 
+    /// Locked arithmetic RMW `lock op [mem], reg` for add/sub/and/or/xor (32/64) →
+    /// `(kind, is64, base, index, scale_log2, disp, reg)` (kind as in [`Self::arith_rm`]).
+    /// Only the `lock`-prefixed form (the non-atomic version is [`Self::arith_mr_reg`]).
+    /// The VM re-emits the real `lock op`. For VM ATOMIC_ARITH (reg form).
+    pub fn atomic_arith_reg(&self) -> Option<(u8, bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if !self.instr.has_lock_prefix() {
+            return None;
+        }
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Add => 0,
+            Mnemonic::Sub => 1,
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let reg = self.instr.op1_register();
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, is64, base, index, scale, disp, gpr64_index(reg)?))
+    }
+
+    /// Locked arithmetic RMW `lock op [mem], imm` (32/64; e.g. `lock add [p],1` —
+    /// atomic increment) for add/sub/and/or/xor → `(kind, is64, base, index,
+    /// scale_log2, disp, imm)`. For VM ATOMIC_ARITH (imm form).
+    pub fn atomic_arith_imm(&self) -> Option<(u8, bool, Option<u8>, Option<u8>, u8, u32, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if !self.instr.has_lock_prefix() {
+            return None;
+        }
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Add => 0,
+            Mnemonic::Sub => 1,
+            Mnemonic::And => 2,
+            Mnemonic::Or => 3,
+            Mnemonic::Xor => 4,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32
+                | OpKind::Immediate8to64 | OpKind::Immediate16 | OpKind::Immediate32
+                | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, is64, base, index, scale, disp, self.instr.immediate(1) as u32))
+    }
+
+    /// Atomic `xadd [mem], reg` (32/64) → `(is64, base, index, scale_log2, disp, reg)`.
+    /// The VM re-emits a `lock xadd` on the computed address, so atomicity is preserved
+    /// for a multithreaded guest. For VM ATOMIC_XADD.
+    pub fn xadd_mem(&self) -> Option<(bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Xadd
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let reg = self.instr.op1_register();
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is64, base, index, scale, disp, gpr64_index(reg)?))
+    }
+
+    /// Atomic `cmpxchg [mem], reg` (32/64) → `(is64, base, index, scale_log2, disp, reg)`.
+    /// Compares against `rax`/`eax`, swaps `reg` in on equal, updates `rax` and ZF. The
+    /// VM re-emits a `lock cmpxchg`. For VM ATOMIC_CMPXCHG.
+    pub fn cmpxchg_mem(&self) -> Option<(bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Cmpxchg
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let reg = self.instr.op1_register();
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is64, base, index, scale, disp, gpr64_index(reg)?))
+    }
+
+    /// Atomic `xchg [mem], reg` / `xchg reg, [mem]` (32/64; memory xchg is implicitly
+    /// locked) → `(is64, base, index, scale_log2, disp, reg)`. For VM ATOMIC_XCHG.
+    pub fn xchg_mem(&self) -> Option<(bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Xchg || self.instr.op_count() != 2 {
+            return None;
+        }
+        let reg = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Memory, OpKind::Register) => self.instr.op1_register(),
+            (OpKind::Register, OpKind::Memory) => self.instr.op0_register(),
+            _ => return None,
+        };
+        let is64 = reg.is_gpr64();
+        if !reg.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is64, base, index, scale, disp, gpr64_index(reg)?))
+    }
+
     /// `op [mem], reg` (memory read-modify-write) for add/sub/and/or/xor →
     /// `(kind, is64, base, index, scale_log2, disp, reg)`. For VM ARITH_MR (reg form).
+    /// A `lock`-prefixed RMW is rejected (it must stay atomic — the non-atomic VM
+    /// lowering would break a multithreaded guest; it falls back to mutation).
     pub fn arith_mr_reg(&self) -> Option<(u8, bool, Option<u8>, Option<u8>, u8, u32, u8)> {
         use iced_x86::{Mnemonic, OpKind};
+        if self.instr.has_lock_prefix() {
+            return None;
+        }
         let kind = match self.instr.mnemonic() {
             Mnemonic::Add => 0,
             Mnemonic::Sub => 1,
@@ -661,8 +796,12 @@ impl X86DecodedInstruction {
 
     /// `op [mem]:{32,64}, imm` (memory RMW with immediate) for add/sub/and/or/xor →
     /// `(kind, is64, base, index, scale_log2, disp, imm)`. For VM ARITH_MR (imm form).
+    /// A `lock`-prefixed RMW is rejected (must stay atomic — see [`Self::arith_mr_reg`]).
     pub fn arith_mr_imm(&self) -> Option<(u8, bool, Option<u8>, Option<u8>, u8, u32, u32)> {
         use iced_x86::{Mnemonic, OpKind};
+        if self.instr.has_lock_prefix() {
+            return None;
+        }
         let kind = match self.instr.mnemonic() {
             Mnemonic::Add => 0,
             Mnemonic::Sub => 1,
@@ -700,7 +839,7 @@ impl X86DecodedInstruction {
             Mnemonic::Sar => 2,
             _ => return None,
         };
-        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+        if self.instr.op0_kind() != OpKind::Register {
             return None;
         }
         let rd = self.instr.op0_register();
@@ -709,6 +848,14 @@ impl X86DecodedInstruction {
             return None;
         }
         let idx = gpr64_index(rd)?;
+        // `shr eax` (the `D1 /n` form) is a shift by an implicit 1 — iced reports it
+        // as a single-operand instruction.
+        if self.instr.op_count() == 1 {
+            return Some((kind, is64, false, idx, 1));
+        }
+        if self.instr.op_count() != 2 {
+            return None;
+        }
         match self.instr.op1_kind() {
             OpKind::Immediate8 => Some((kind, is64, false, idx, self.instr.immediate8())),
             OpKind::Register if self.instr.op1_register() == Register::CL => {
@@ -716,6 +863,478 @@ impl X86DecodedInstruction {
             }
             _ => None,
         }
+    }
+
+    /// 3-operand `imul reg, reg, imm` (32/64) → `(is64, rd, rs, imm)` — `rd = rs * imm`
+    /// (common for `index * sizeof`). For VM IMUL3.
+    pub fn imul_rri(&self) -> Option<(bool, u8, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Imul
+            || self.instr.op_count() != 3
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let rs = self.instr.op1_register();
+        let is64 = rd.is_gpr64();
+        if (rd.is_gpr32() == is64) || rs.is_gpr64() != is64 {
+            return None;
+        }
+        if !matches!(
+            self.instr.op2_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                | OpKind::Immediate32 | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        Some((is64, gpr64_index(rd)?, gpr64_index(rs)?, self.instr.immediate(2) as u32))
+    }
+
+    // --- SSE Phase A: bulk 128-bit moves + the zero/all-ones idioms (SIMD used as a
+    // fast memory mover, not floating-point math). The VM models a 16-slot XMM file. ---
+
+    /// `movaps`/`movups`/`movdqa`/`movdqu xmm, xmm` (a 128-bit register copy) →
+    /// `(xd, xs)`. For VM SSE_MOV_RR.
+    pub fn sse_mov_rr(&self) -> Option<(u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if !matches!(
+            self.instr.mnemonic(),
+            Mnemonic::Movaps | Mnemonic::Movups | Mnemonic::Movdqa | Mnemonic::Movdqu
+        ) || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        Some((xmm_index(self.instr.op0_register())?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// `movaps`/`movups`/`movdqa`/`movdqu xmm, [mem]` (a 128-bit load) →
+    /// `(xd, base, index, scale_log2, disp)`. For VM SSE_LOAD.
+    pub fn sse_load(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if !matches!(
+            self.instr.mnemonic(),
+            Mnemonic::Movaps | Mnemonic::Movups | Mnemonic::Movdqa | Mnemonic::Movdqu
+        ) || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let xd = xmm_index(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((xd, base, index, scale, disp))
+    }
+
+    /// `movaps`/`movups`/`movdqa`/`movdqu [mem], xmm` (a 128-bit store) →
+    /// `(base, index, scale_log2, disp, xs)`. For VM SSE_STORE.
+    pub fn sse_store(&self) -> Option<(Option<u8>, Option<u8>, u8, u32, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if !matches!(
+            self.instr.mnemonic(),
+            Mnemonic::Movaps | Mnemonic::Movups | Mnemonic::Movdqa | Mnemonic::Movdqu
+        ) || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let xs = xmm_index(self.instr.op1_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((base, index, scale, disp, xs))
+    }
+
+    /// `pxor xmm, xmm` with the SAME register (the zero idiom) → `xd`. For VM SSE_ZERO.
+    /// A `pxor` of two distinct registers is a real vector op, not this.
+    pub fn sse_zero(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Pxor
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+            || self.instr.op0_register() != self.instr.op1_register()
+        {
+            return None;
+        }
+        xmm_index(self.instr.op0_register())
+    }
+
+    /// `pcmpeqd xmm, xmm` with the SAME register (the all-ones idiom) → `xd`. For VM SSE_ONES.
+    pub fn sse_ones(&self) -> Option<u8> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Pcmpeqd
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+            || self.instr.op0_register() != self.instr.op1_register()
+        {
+            return None;
+        }
+        xmm_index(self.instr.op0_register())
+    }
+
+    /// `movq`/`movd`/`movsd`/`movss xmm, [mem]` or `[mem], xmm` (an 8- or 4-byte SSE
+    /// memory move) → `(is_q, to_xmm, xmm, base, index, scale_log2, disp)`, where `is_q`
+    /// = 8-byte vs 4-byte, `to_xmm` = the xmm is the dest. The *memory* forms of
+    /// `movsd`/`movss` are bit-identical to `movq`/`movd` (load zeroes the high lanes;
+    /// store writes the low lane). For VM SSE_QMOV.
+    pub fn sse_qmov_mem(&self) -> Option<(bool, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_q = match self.instr.mnemonic() {
+            Mnemonic::Movq | Mnemonic::Movsd => true,
+            Mnemonic::Movd | Mnemonic::Movss => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 {
+            return None;
+        }
+        let (to_xmm, xmm_reg) = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Register, OpKind::Memory) => (true, self.instr.op0_register()),
+            (OpKind::Memory, OpKind::Register) => (false, self.instr.op1_register()),
+            _ => return None,
+        };
+        let xmm = xmm_index(xmm_reg)?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is_q, to_xmm, xmm, base, index, scale, disp))
+    }
+
+    /// `punpcklqdq`/`punpckldq xmm, xmm` (interleave the low quad/double-words — used to
+    /// build a 128-bit value from two halves) → `(kind, xd, xs)`, kind 0=qdq, 1=ldq.
+    /// For VM SSE_PUNPCK (reg form).
+    pub fn sse_punpck_rr(&self) -> Option<(u8, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Punpcklqdq => 0,
+            Mnemonic::Punpckldq => 1,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        Some((kind, xmm_index(self.instr.op0_register())?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// `punpcklqdq`/`punpckldq xmm, [mem]` → `(kind, xd, base, index, scale_log2, disp)`.
+    /// For VM SSE_PUNPCK (mem form).
+    pub fn sse_punpck_rm(&self) -> Option<(u8, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Punpcklqdq => 0,
+            Mnemonic::Punpckldq => 1,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let xd = xmm_index(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, xd, base, index, scale, disp))
+    }
+
+    /// `movhps`/`movlps`/`movhpd`/`movlpd` (load/store the HIGH or LOW 64 bits of an xmm,
+    /// preserving the other half) → `(is_high, to_xmm, xmm, base, index, scale_log2, disp)`.
+    /// For VM SSE_HLPS. (`movlps xmm,xmm` is `movhlps`, a different mnemonic, so one
+    /// operand is always memory here.)
+    pub fn sse_hlps(&self) -> Option<(bool, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_high = match self.instr.mnemonic() {
+            Mnemonic::Movhps | Mnemonic::Movhpd => true,
+            Mnemonic::Movlps | Mnemonic::Movlpd => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 {
+            return None;
+        }
+        let (to_xmm, xmm_reg) = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Register, OpKind::Memory) => (true, self.instr.op0_register()),
+            (OpKind::Memory, OpKind::Register) => (false, self.instr.op1_register()),
+            _ => return None,
+        };
+        let xmm = xmm_index(xmm_reg)?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is_high, to_xmm, xmm, base, index, scale, disp))
+    }
+
+    /// `movq`/`movd` between an xmm and a GPR, or `movq xmm, xmm` → `(is_q, to_xmm,
+    /// other_is_xmm, xmm, other)`. `other` is the GPR index (or, for `movq xmm,xmm`,
+    /// the source xmm index). For VM SSE_QMOV_R.
+    pub fn sse_qmov_reg(&self) -> Option<(bool, bool, bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_q = match self.instr.mnemonic() {
+            Mnemonic::Movq => true,
+            Mnemonic::Movd => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let r0 = self.instr.op0_register();
+        let r1 = self.instr.op1_register();
+        if r0.is_xmm() && r1.is_xmm() {
+            // movq xmm, xmm (low-64 copy, zero high) — movd has no xmm,xmm form.
+            if !is_q {
+                return None;
+            }
+            Some((true, true, true, xmm_index(r0)?, xmm_index(r1)?))
+        } else if r0.is_xmm() {
+            Some((is_q, true, false, xmm_index(r0)?, gpr64_index(r1)?)) // xmm <- gpr
+        } else if r1.is_xmm() {
+            Some((is_q, false, false, xmm_index(r1)?, gpr64_index(r0)?)) // gpr <- xmm
+        } else {
+            None
+        }
+    }
+
+    // --- SSE Phase B: scalar floating-point. Handlers re-emit the real SSE op on the
+    // ctx XMM/GPR slots, so FP semantics (rounding, NaN, flags) are exact. ---
+
+    /// `movsd`/`movss xmm, xmm` (scalar move, register form — the low lane is copied and
+    /// the DEST's upper lanes are PRESERVED, unlike the memory form) → `(is_double, xd,
+    /// xs)`. For VM SSE_FP_MOVRR.
+    pub fn sse_fp_movrr(&self) -> Option<(bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_double = match self.instr.mnemonic() {
+            Mnemonic::Movsd => true,
+            Mnemonic::Movss => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        Some((is_double, xmm_index(self.instr.op0_register())?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// Scalar-FP arithmetic `op xmm, xmm` (add/sub/mul/div/min/max/sqrt, ss/sd) →
+    /// `(kind, is_double, xd, xs)`. For VM SSE_FP_ARITH (reg form).
+    pub fn sse_fp_arith_rr(&self) -> Option<(u8, bool, u8, u8)> {
+        use iced_x86::OpKind;
+        let (kind, is_double) = fp_arith_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        Some((kind, is_double, xmm_index(self.instr.op0_register())?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// Scalar-FP arithmetic `op xmm, [mem]` → `(kind, is_double, xd, base, index,
+    /// scale_log2, disp)`. For VM SSE_FP_ARITH (mem form).
+    pub fn sse_fp_arith_rm(&self) -> Option<(u8, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::OpKind;
+        let (kind, is_double) = fp_arith_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let xd = xmm_index(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((kind, is_double, xd, base, index, scale, disp))
+    }
+
+    /// Scalar-FP compare `comisd/ucomisd/comiss/ucomiss xmm, xmm` (sets EFLAGS for a
+    /// following `jcc`/`setcc`) → `(is_unordered, is_double, lhs, rhs)`. For VM SSE_FP_CMP (reg).
+    pub fn sse_fp_cmp_rr(&self) -> Option<(bool, bool, u8, u8)> {
+        use iced_x86::OpKind;
+        let (un, is_double) = fp_cmp_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        Some((un, is_double, xmm_index(self.instr.op0_register())?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// Scalar-FP compare vs memory → `(is_unordered, is_double, lhs, base, index,
+    /// scale_log2, disp)`. For VM SSE_FP_CMP (mem).
+    pub fn sse_fp_cmp_rm(&self) -> Option<(bool, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::OpKind;
+        let (un, is_double) = fp_cmp_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let lhs = xmm_index(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((un, is_double, lhs, base, index, scale, disp))
+    }
+
+    /// `cvtsi2sd`/`cvtsi2ss xmm, gpr` (int→float) → `(is_double, gpr_is64, xmm, gpr)`.
+    /// For VM SSE_CVT_I2F (reg form).
+    pub fn sse_cvt_i2f_reg(&self) -> Option<(bool, bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_double = match self.instr.mnemonic() {
+            Mnemonic::Cvtsi2sd => true,
+            Mnemonic::Cvtsi2ss => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let gpr = self.instr.op1_register();
+        let is64 = gpr.is_gpr64();
+        if !gpr.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((is_double, is64, xmm_index(self.instr.op0_register())?, gpr64_index(gpr)?))
+    }
+
+    /// `cvtsi2sd`/`cvtsi2ss xmm, [mem]` (int→float) → `(is_double, mem_is64, xmm, base,
+    /// index, scale_log2, disp)`. For VM SSE_CVT_I2F (mem form).
+    pub fn sse_cvt_i2f_mem(&self) -> Option<(bool, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_double = match self.instr.mnemonic() {
+            Mnemonic::Cvtsi2sd => true,
+            Mnemonic::Cvtsi2ss => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        let xmm = xmm_index(self.instr.op0_register())?;
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((is_double, is64, xmm, base, index, scale, disp))
+    }
+
+    /// `cvt[t]sd2si`/`cvt[t]ss2si gpr, xmm` (float→int) → `(is_double, gpr_is64,
+    /// truncate, gpr, xmm)`. For VM SSE_CVT_F2I.
+    pub fn sse_cvt_f2i(&self) -> Option<(bool, bool, bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let (is_double, truncate) = match self.instr.mnemonic() {
+            Mnemonic::Cvtsd2si => (true, false),
+            Mnemonic::Cvttsd2si => (true, true),
+            Mnemonic::Cvtss2si => (false, false),
+            Mnemonic::Cvttss2si => (false, true),
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let gpr = self.instr.op0_register();
+        let is64 = gpr.is_gpr64();
+        if !gpr.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((is_double, is64, truncate, gpr64_index(gpr)?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// `cvtsd2ss`/`cvtss2sd xmm, xmm` (double↔float) → `(sd2ss, xd, xs)` (`sd2ss` =
+    /// double→float). For VM SSE_CVT_FF.
+    pub fn sse_cvt_ff(&self) -> Option<(bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let sd2ss = match self.instr.mnemonic() {
+            Mnemonic::Cvtsd2ss => true,
+            Mnemonic::Cvtss2sd => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        Some((sd2ss, xmm_index(self.instr.op0_register())?, xmm_index(self.instr.op1_register())?))
+    }
+
+    /// RIP-relative SSE 128-bit load `movaps`/`movups`/`movdqa`/`movdqu xmm, [rip+disp]`
+    /// (a 128-bit constant / vector literal) → `(xd, target_vaddr)`. For VM SSE_LOAD_RIP.
+    pub fn sse_load_rip(&self) -> Option<(u8, u64)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if !matches!(
+            self.instr.mnemonic(),
+            Mnemonic::Movaps | Mnemonic::Movups | Mnemonic::Movdqa | Mnemonic::Movdqu
+        ) || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        Some((xmm_index(self.instr.op0_register())?, self.instr.memory_displacement64()))
+    }
+
+    /// RIP-relative `movq`/`movd`/`movsd`/`movss xmm, [rip]` / `[rip], xmm` (8/4-byte FP
+    /// constant load or global store) → `(is_q, to_xmm, xmm, target_vaddr)`. For VM SSE_QMOV_RIP.
+    pub fn sse_qmov_rip(&self) -> Option<(bool, bool, u8, u64)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let is_q = match self.instr.mnemonic() {
+            Mnemonic::Movq | Mnemonic::Movsd => true,
+            Mnemonic::Movd | Mnemonic::Movss => false,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || !self.instr.is_ip_rel_memory_operand() {
+            return None;
+        }
+        let (to_xmm, xmm_reg) = match (self.instr.op0_kind(), self.instr.op1_kind()) {
+            (OpKind::Register, OpKind::Memory) => (true, self.instr.op0_register()),
+            (OpKind::Memory, OpKind::Register) => (false, self.instr.op1_register()),
+            _ => return None,
+        };
+        Some((is_q, to_xmm, xmm_index(xmm_reg)?, self.instr.memory_displacement64()))
+    }
+
+    /// RIP-relative scalar-FP arith `op xmm, [rip]` (op against an FP constant) →
+    /// `(kind, is_double, xd, target_vaddr)`. For VM SSE_FP_ARITH_RIP.
+    pub fn sse_fp_arith_rip(&self) -> Option<(u8, bool, u8, u64)> {
+        use iced_x86::OpKind;
+        let (kind, is_double) = fp_arith_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        Some((kind, is_double, xmm_index(self.instr.op0_register())?, self.instr.memory_displacement64()))
+    }
+
+    /// RIP-relative scalar-FP compare `comi/ucomi xmm, [rip]` → `(is_unordered,
+    /// is_double, lhs, target_vaddr)`. For VM SSE_FP_CMP_RIP.
+    pub fn sse_fp_cmp_rip(&self) -> Option<(bool, bool, u8, u64)> {
+        use iced_x86::OpKind;
+        let (un, is_double) = fp_cmp_kind(self.instr.mnemonic())?;
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        Some((un, is_double, xmm_index(self.instr.op0_register())?, self.instr.memory_displacement64()))
     }
 
     /// 8-bit `op r8, r8` for mov/add/sub/and/or/xor/cmp/test → `(kind, rd, rs)`,
@@ -921,6 +1540,35 @@ impl X86DecodedInstruction {
         };
         let (base, index, scale, disp) = self.mem_addr()?;
         Some((signed, size_log2, dst.is_gpr64(), gpr64_index(dst)?, base, index, scale, disp))
+    }
+
+    /// `movzx`/`movsx reg, [rip+disp]` (a width-changing load of a PIE global) →
+    /// `(signed, src_size_log2, dst64, dst, target_vaddr)`. For VM EXT_RIP.
+    pub fn ext_rip(&self) -> Option<(bool, u8, bool, u8, u64)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let signed = match self.instr.mnemonic() {
+            Mnemonic::Movzx => false,
+            Mnemonic::Movsx | Mnemonic::Movsxd => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        let dst = self.instr.op0_register();
+        if !dst.is_gpr32() && !dst.is_gpr64() {
+            return None;
+        }
+        let size_log2 = match self.instr.memory_size().size() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => return None,
+        };
+        Some((signed, size_log2, dst.is_gpr64(), gpr64_index(dst)?, self.instr.memory_displacement64()))
     }
 
     /// `mov [mem], imm` (non-RIP) → `(size_log2, base, index, scale_log2, disp, imm)`,
@@ -1318,6 +1966,185 @@ impl X86DecodedInstruction {
         gpr64_index(rd).map(|i| (cc, i))
     }
 
+    /// `setcc [mem]` (a conditional byte set to memory) → `(cc, base, index,
+    /// scale_log2, disp)` (cc as in [`Self::setcc_parts`]). For the VM SETCC op's
+    /// memory form. `None` for non-setcc or RIP/segment.
+    pub fn setcc_mem(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let cc = match self.instr.mnemonic() {
+            Mnemonic::Sete => 0x4,
+            Mnemonic::Setne => 0x5,
+            Mnemonic::Setb => 0x2,
+            Mnemonic::Setae => 0x3,
+            Mnemonic::Setbe => 0x6,
+            Mnemonic::Seta => 0x7,
+            Mnemonic::Sets => 0x8,
+            Mnemonic::Setns => 0x9,
+            Mnemonic::Setl => 0xc,
+            Mnemonic::Setge => 0xd,
+            Mnemonic::Setle => 0xe,
+            Mnemonic::Setg => 0xf,
+            _ => return None,
+        };
+        if self.instr.op_count() != 1 || self.instr.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((cc, base, index, scale, disp))
+    }
+
+    /// `div`/`idiv reg` (32/64) → `(signed, is64, reg)`. Divides `[r]dx:[r]ax` by the
+    /// register; quotient → rax, remainder → rdx. For VM DIV (reg form). 8/16-bit rejected.
+    pub fn div_reg(&self) -> Option<(bool, bool, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let signed = match self.instr.mnemonic() {
+            Mnemonic::Div => false,
+            Mnemonic::Idiv => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 1 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let r = self.instr.op0_register();
+        let is64 = r.is_gpr64();
+        if !r.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((signed, is64, gpr64_index(r)?))
+    }
+
+    /// `div`/`idiv [mem]` (32/64) → `(signed, is64, base, index, scale_log2, disp)`.
+    /// For VM DIV (mem form).
+    pub fn div_mem(&self) -> Option<(bool, bool, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let signed = match self.instr.mnemonic() {
+            Mnemonic::Div => false,
+            Mnemonic::Idiv => true,
+            _ => return None,
+        };
+        if self.instr.op_count() != 1 || self.instr.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        let is64 = match self.instr.memory_size().size() {
+            4 => false,
+            8 => true,
+            _ => return None,
+        };
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((signed, is64, base, index, scale, disp))
+    }
+
+    /// `cdq`/`cqo` (sign-extend `eax`/`rax` into `edx`/`rdx`, the dividend setup for a
+    /// signed `idiv`) → `is64` (`cdq`=false, `cqo`=true). For VM CDQ.
+    pub fn cdq_cqo(&self) -> Option<bool> {
+        use iced_x86::Mnemonic;
+        match self.instr.mnemonic() {
+            Mnemonic::Cdq => Some(false),
+            Mnemonic::Cqo => Some(true),
+            _ => None,
+        }
+    }
+
+    /// `cdqe` (sign-extend `eax` into `rax` — accumulator widening) → `()`. For VM CDQE.
+    pub fn is_cdqe(&self) -> bool {
+        self.instr.mnemonic() == iced_x86::Mnemonic::Cdqe
+    }
+
+    /// `neg`/`not r32`/`r64` → `(kind, is64, rd)` (kind 0=neg, 1=not). `neg` sets
+    /// flags, `not` does not (the VM captures flags only for `neg`). For VM UNARY.
+    pub fn unary_rr(&self) -> Option<(u8, bool, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Neg => 0,
+            Mnemonic::Not => 1,
+            _ => return None,
+        };
+        if self.instr.op_count() != 1 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        Some((kind, is64, gpr64_index(rd)?))
+    }
+
+    /// `adc`/`sbb reg, reg` (32/64) → `(kind, is64, rd, rs)` (kind 0=adc, 1=sbb).
+    /// Reads the carry flag and sets flags. For VM ADC_SBB (reg form).
+    pub fn adc_sbb_rr(&self) -> Option<(u8, bool, u8, u8)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Adc => 0,
+            Mnemonic::Sbb => 1,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let rs = self.instr.op1_register();
+        let is64 = rd.is_gpr64();
+        if rd.is_gpr32() == is64 || rs.is_gpr64() != is64 {
+            return None;
+        }
+        Some((kind, is64, gpr64_index(rd)?, gpr64_index(rs)?))
+    }
+
+    /// `adc`/`sbb reg, imm` (32/64) → `(kind, is64, rd, imm)`. For VM ADC_SBB (imm form).
+    pub fn adc_sbb_ri(&self) -> Option<(u8, bool, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let kind = match self.instr.mnemonic() {
+            Mnemonic::Adc => 0,
+            Mnemonic::Sbb => 1,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64
+                | OpKind::Immediate32 | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        Some((kind, is64, gpr64_index(rd)?, self.instr.immediate(1) as u32))
+    }
+
+    /// `push imm` (sign-extended to 64) → the immediate. For VM PUSH_IMM.
+    pub fn push_imm(&self) -> Option<u32> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Push || self.instr.op_count() != 1 {
+            return None;
+        }
+        matches!(
+            self.instr.op0_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to64 | OpKind::Immediate32 | OpKind::Immediate32to64
+        )
+        .then(|| self.instr.immediate(0) as u32)
+    }
+
+    /// `push qword [mem]` → `(base, index, scale_log2, disp)`. For VM PUSH_MEM.
+    pub fn push_mem(&self) -> Option<(Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Push
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        self.mem_addr()
+    }
+
     /// `cmovcc r32, r32` (a 32-bit conditional move) → `(cc, rd, rs)` where `cc`
     /// is the x86 condition code (same encoding as [`Self::branch`]). `rd = cc ? rs
     /// : rd`. `None` otherwise. For the VM CMOV op (branchless conditionals).
@@ -1382,6 +2209,41 @@ impl X86DecodedInstruction {
             return None;
         }
         Some((cc, gpr64_index(rd)?, gpr64_index(rs)?))
+    }
+
+    /// `cmovcc reg, [mem]` (32/64) → `(cc, is64, dst, base, index, scale_log2, disp)`.
+    /// cmov reads the memory operand unconditionally (faults like native). For the VM
+    /// CMOV op's memory-source form.
+    pub fn cmov_mem(&self) -> Option<(u8, bool, u8, Option<u8>, Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        let cc = match self.instr.mnemonic() {
+            Mnemonic::Cmove => 0x4,
+            Mnemonic::Cmovne => 0x5,
+            Mnemonic::Cmovb => 0x2,
+            Mnemonic::Cmovae => 0x3,
+            Mnemonic::Cmovbe => 0x6,
+            Mnemonic::Cmova => 0x7,
+            Mnemonic::Cmovs => 0x8,
+            Mnemonic::Cmovns => 0x9,
+            Mnemonic::Cmovl => 0xc,
+            Mnemonic::Cmovge => 0xd,
+            Mnemonic::Cmovle => 0xe,
+            Mnemonic::Cmovg => 0xf,
+            _ => return None,
+        };
+        if self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Register
+            || self.instr.op1_kind() != OpKind::Memory
+        {
+            return None;
+        }
+        let rd = self.instr.op0_register();
+        let is64 = rd.is_gpr64();
+        if !rd.is_gpr32() && !is64 {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        Some((cc, is64, gpr64_index(rd)?, base, index, scale, disp))
     }
 
     /// `cmp r32, r32` → `(left_gpr, right_gpr)`, else `None`. For the VM CMP op.
@@ -1665,6 +2527,42 @@ fn map_rflags(bits: u32) -> u8 {
 
 /// Map an iced register to its 0..15 GPR index (folding sub-registers to the
 /// 64-bit parent), or `None` for non-GPR registers.
+/// An `xmm0..15` register → its 0..15 index; `None` for non-xmm or `xmm16..31`
+/// (AVX-512, which the VM's 16-slot XMM file doesn't model).
+fn xmm_index(reg: Register) -> Option<u8> {
+    if !reg.is_xmm() {
+        return None;
+    }
+    let i = (reg as u32).wrapping_sub(Register::XMM0 as u32);
+    (i < 16).then_some(i as u8)
+}
+
+/// Scalar-FP binary-arith mnemonic → `(kind, is_double)` (kind 0=add,1=sub,2=mul,
+/// 3=div,4=min,5=max,6=sqrt). For the VM SSE_FP_ARITH op.
+fn fp_arith_kind(m: iced_x86::Mnemonic) -> Option<(u8, bool)> {
+    use iced_x86::Mnemonic::*;
+    Some(match m {
+        Addsd => (0, true), Addss => (0, false),
+        Subsd => (1, true), Subss => (1, false),
+        Mulsd => (2, true), Mulss => (2, false),
+        Divsd => (3, true), Divss => (3, false),
+        Minsd => (4, true), Minss => (4, false),
+        Maxsd => (5, true), Maxss => (5, false),
+        Sqrtsd => (6, true), Sqrtss => (6, false),
+        _ => return None,
+    })
+}
+
+/// Scalar-FP compare mnemonic → `(is_unordered, is_double)`. For the VM SSE_FP_CMP op.
+fn fp_cmp_kind(m: iced_x86::Mnemonic) -> Option<(bool, bool)> {
+    use iced_x86::Mnemonic::*;
+    Some(match m {
+        Comisd => (false, true), Ucomisd => (true, true),
+        Comiss => (false, false), Ucomiss => (true, false),
+        _ => return None,
+    })
+}
+
 /// Kind code for a byte ALU mnemonic (0=mov,1=add,2=sub,3=and,4=or,5=xor,6=cmp,
 /// 7=test), or `None`. Shared by the VM's NARROW8 reg-reg / reg-imm projections.
 fn byte_alu_kind(m: iced_x86::Mnemonic) -> Option<u8> {
@@ -2029,6 +2927,177 @@ mod effects_tests {
         );
         // mov [rip+0],imm (c7 05 .. dword) -> rip_store_imm (not store_imm_mem).
         assert_eq!(decode(&[0xc7, 0x05, 0, 0, 0, 0, 0x07, 0, 0, 0]).store_imm_mem(), None);
+    }
+
+    #[test]
+    fn rip_sse_projections() {
+        // mulsd xmm0,[rip+0] (f2 0f 59 05 ..) len 8 -> arith kind mul(2), double, xd=0, tgt 0x1008.
+        assert_eq!(decode(&[0xf2, 0x0f, 0x59, 0x05, 0, 0, 0, 0]).sse_fp_arith_rip(), Some((2, true, 0, 0x1008)));
+        // comisd xmm0,[rip+0] (66 0f 2f 05 ..) -> !unord, double, lhs=0, tgt 0x1008.
+        assert_eq!(decode(&[0x66, 0x0f, 0x2f, 0x05, 0, 0, 0, 0]).sse_fp_cmp_rip(), Some((false, true, 0, 0x1008)));
+        // movsd xmm0,[rip+0] (f2 0f 10 05 ..) -> is_q, to_xmm, xmm=0, tgt 0x1008.
+        assert_eq!(decode(&[0xf2, 0x0f, 0x10, 0x05, 0, 0, 0, 0]).sse_qmov_rip(), Some((true, true, 0, 0x1008)));
+        // movaps xmm1,[rip+0] (0f 28 0d ..) len 7 -> xd=1, tgt 0x1007.
+        assert_eq!(decode(&[0x0f, 0x28, 0x0d, 0, 0, 0, 0]).sse_load_rip(), Some((1, 0x1007)));
+        // a non-RIP movaps load is not sse_load_rip.
+        assert_eq!(decode(&[0x0f, 0x28, 0x06]).sse_load_rip(), None);
+    }
+
+    #[test]
+    fn scalar_float_projections() {
+        // addsd xmm0,xmm1 (f2 0f 58 c1) -> arith kind add(0), double, xd=0, xs=1.
+        assert_eq!(decode(&[0xf2, 0x0f, 0x58, 0xc1]).sse_fp_arith_rr(), Some((0, true, 0, 1)));
+        // mulss xmm2,[rdi] (f3 0f 59 17) -> kind mul(2), single, xd=2, base=7.
+        assert_eq!(decode(&[0xf3, 0x0f, 0x59, 0x17]).sse_fp_arith_rm(), Some((2, false, 2, Some(7), None, 0, 0)));
+        // comisd xmm0,xmm1 (66 0f 2f c1) -> !unord, double, lhs=0, rhs=1.
+        assert_eq!(decode(&[0x66, 0x0f, 0x2f, 0xc1]).sse_fp_cmp_rr(), Some((false, true, 0, 1)));
+        // cvtsi2sd xmm0,rdi (f2 48 0f 2a c7) -> double, gpr64, xmm=0, gpr=7.
+        assert_eq!(decode(&[0xf2, 0x48, 0x0f, 0x2a, 0xc7]).sse_cvt_i2f_reg(), Some((true, true, 0, 7)));
+        // cvttsd2si rax,xmm0 (f2 48 0f 2c c0) -> double, gpr64, truncate, gpr=0, xmm=0.
+        assert_eq!(decode(&[0xf2, 0x48, 0x0f, 0x2c, 0xc0]).sse_cvt_f2i(), Some((true, true, true, 0, 0)));
+        // cvtsd2ss xmm0,xmm1 (f2 0f 5a c1) -> sd2ss, xd=0, xs=1.
+        assert_eq!(decode(&[0xf2, 0x0f, 0x5a, 0xc1]).sse_cvt_ff(), Some((true, 0, 1)));
+        // movsd xmm1,xmm0 (f2 0f 10 c8) -> double reg move, xd=1, xs=0.
+        assert_eq!(decode(&[0xf2, 0x0f, 0x10, 0xc8]).sse_fp_movrr(), Some((true, 1, 0)));
+        // movsd xmm0,[rdi] (f2 0f 10 07) is the MEM form (handled by sse_qmov_mem), not movrr.
+        assert_eq!(decode(&[0xf2, 0x0f, 0x10, 0x07]).sse_fp_movrr(), None);
+    }
+
+    #[test]
+    fn sse_punpck_hlps_projections() {
+        // punpcklqdq xmm0,xmm1 (66 0f 6c c1) -> kind qdq(0), xd=0, xs=1.
+        assert_eq!(decode(&[0x66, 0x0f, 0x6c, 0xc1]).sse_punpck_rr(), Some((0, 0, 1)));
+        // punpckldq xmm2,[rdi] (66 0f 62 17) -> kind ldq(1), xd=2, base=7.
+        assert_eq!(decode(&[0x66, 0x0f, 0x62, 0x17]).sse_punpck_rm(), Some((1, 2, Some(7), None, 0, 0)));
+        // movhps xmm0,[rsi] (0f 16 06) -> is_high, to_xmm, xmm=0, base=6.
+        assert_eq!(decode(&[0x0f, 0x16, 0x06]).sse_hlps(), Some((true, true, 0, Some(6), None, 0, 0)));
+        // movlps [rdi],xmm1 (0f 13 0f) -> low, store, xmm=1, base=7.
+        assert_eq!(decode(&[0x0f, 0x13, 0x0f]).sse_hlps(), Some((false, false, 1, Some(7), None, 0, 0)));
+        // movhlps (0f 12 c1, reg-reg) is not movlps -> not sse_hlps.
+        assert_eq!(decode(&[0x0f, 0x12, 0xc1]).sse_hlps(), None);
+    }
+
+    #[test]
+    fn sse_movq_reg_projections() {
+        // movq xmm0,rdi (66 48 0f 6e c7) -> is_q, to_xmm, !other_xmm, xmm=0, gpr=7.
+        assert_eq!(decode(&[0x66, 0x48, 0x0f, 0x6e, 0xc7]).sse_qmov_reg(), Some((true, true, false, 0, 7)));
+        // movq rax,xmm0 (66 48 0f 7e c0) -> is_q, !to_xmm, xmm=0, gpr=0.
+        assert_eq!(decode(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]).sse_qmov_reg(), Some((true, false, false, 0, 0)));
+        // movq xmm1,xmm0 (f3 0f 7e c8) -> is_q, to_xmm, other_is_xmm, xmm=1, src xmm=0.
+        assert_eq!(decode(&[0xf3, 0x0f, 0x7e, 0xc8]).sse_qmov_reg(), Some((true, true, true, 1, 0)));
+        // movd xmm2,eax (66 0f 6e d0) -> !is_q, to_xmm, xmm=2, gpr=0.
+        assert_eq!(decode(&[0x66, 0x0f, 0x6e, 0xd0]).sse_qmov_reg(), Some((false, true, false, 2, 0)));
+        // movq xmm0,[rdi] (memory) is not the register form.
+        assert_eq!(decode(&[0xf3, 0x0f, 0x7e, 0x07]).sse_qmov_reg(), None);
+    }
+
+    #[test]
+    fn sse_bulk_projections() {
+        // movdqu xmm0,[rsi] (f3 0f 6f 06) -> sse_load xd=0, base=6.
+        assert_eq!(decode(&[0xf3, 0x0f, 0x6f, 0x06]).sse_load(), Some((0, Some(6), None, 0, 0)));
+        // movups [rdi],xmm0 (0f 11 07) -> sse_store base=7, xs=0.
+        assert_eq!(decode(&[0x0f, 0x11, 0x07]).sse_store(), Some((Some(7), None, 0, 0, 0)));
+        // movaps xmm1,xmm0 (0f 28 c8) -> sse_mov_rr (1, 0).
+        assert_eq!(decode(&[0x0f, 0x28, 0xc8]).sse_mov_rr(), Some((1, 0)));
+        // pxor xmm0,xmm0 (66 0f ef c0) -> sse_zero 0.
+        assert_eq!(decode(&[0x66, 0x0f, 0xef, 0xc0]).sse_zero(), Some(0));
+        // pcmpeqd xmm0,xmm0 (66 0f 76 c0) -> sse_ones 0.
+        assert_eq!(decode(&[0x66, 0x0f, 0x76, 0xc0]).sse_ones(), Some(0));
+        // movq xmm0,[rdi] (f3 0f 7e 07) -> sse_qmov is_q, to_xmm, xmm=0, base=7.
+        assert_eq!(decode(&[0xf3, 0x0f, 0x7e, 0x07]).sse_qmov_mem(), Some((true, true, 0, Some(7), None, 0, 0)));
+        // movq [rdi],xmm0 (66 0f d6 07) -> store direction.
+        assert_eq!(decode(&[0x66, 0x0f, 0xd6, 0x07]).sse_qmov_mem(), Some((true, false, 0, Some(7), None, 0, 0)));
+        // pxor of two DISTINCT regs is not the zero idiom.
+        assert_eq!(decode(&[0x66, 0x0f, 0xef, 0xc1]).sse_zero(), None); // pxor xmm0,xmm1
+    }
+
+    #[test]
+    fn imul3_and_shift1_projections() {
+        // imul rax,rdi,0x12345 (48 69 c7 ..) -> is64, rd=0, rs=7, imm 0x12345.
+        assert_eq!(decode(&[0x48, 0x69, 0xc7, 0x45, 0x23, 0x01, 0x00]).imul_rri(), Some((true, 0, 7, 0x12345)));
+        // imul ecx,edx,5 (6b ca 05) -> 32-bit, rd=1, rs=2, imm 5.
+        assert_eq!(decode(&[0x6b, 0xca, 0x05]).imul_rri(), Some((false, 1, 2, 5)));
+        // shr rax (48 d1 e8) -> shift_op kind shr(1), 64-bit, !cl, imm count 1.
+        assert_eq!(decode(&[0x48, 0xd1, 0xe8]).shift_op(), Some((1, true, false, 0, 1)));
+        // sar eax (d1 f8) -> kind sar(2), 32-bit, count 1.
+        assert_eq!(decode(&[0xd1, 0xf8]).shift_op(), Some((2, false, false, 0, 1)));
+        // 2-operand imul is not imul_rri.
+        assert_eq!(decode(&[0x48, 0x0f, 0xaf, 0xc1]).imul_rri(), None); // imul rax,rcx
+    }
+
+    #[test]
+    fn cmov_mem_and_ext_rip_projections() {
+        // movzx eax,byte[rip+0] (0f b6 05 ..) len 7 -> ext_rip unsigned, size 0, dst32, target 0x1007.
+        assert_eq!(decode(&[0x0f, 0xb6, 0x05, 0, 0, 0, 0]).ext_rip(), Some((false, 0, false, 0, 0x1007)));
+        // movsx rax,byte[rip+0] (48 0f be 05 ..) len 8 -> signed, dst64, target 0x1008.
+        assert_eq!(decode(&[0x48, 0x0f, 0xbe, 0x05, 0, 0, 0, 0]).ext_rip(), Some((true, 0, true, 0, 0x1008)));
+        // cmove rax,[rdi] (48 0f 44 07) -> cmov_mem cc=4, 64-bit, dst=0, base=7.
+        assert_eq!(decode(&[0x48, 0x0f, 0x44, 0x07]).cmov_mem(), Some((4, true, 0, Some(7), None, 0, 0)));
+        // cmove eax,ecx (0f 44 c1) reg-reg -> not cmov_mem.
+        assert_eq!(decode(&[0x0f, 0x44, 0xc1]).cmov_mem(), None);
+        // a non-RIP movzx is not ext_rip.
+        assert_eq!(decode(&[0x0f, 0xb6, 0x07]).ext_rip(), None); // movzx eax,byte[rdi]
+    }
+
+    #[test]
+    fn division_projections() {
+        // cdq (99) -> cdq_cqo false; cqo (48 99) -> true.
+        assert_eq!(decode(&[0x99]).cdq_cqo(), Some(false));
+        assert_eq!(decode(&[0x48, 0x99]).cdq_cqo(), Some(true));
+        // cdqe (48 98).
+        assert!(decode(&[0x48, 0x98]).is_cdqe());
+        // idiv ecx (f7 f9) -> div_reg signed, 32-bit, reg=1.
+        assert_eq!(decode(&[0xf7, 0xf9]).div_reg(), Some((true, false, 1)));
+        // div rcx (48 f7 f1) -> unsigned, 64-bit, reg=1.
+        assert_eq!(decode(&[0x48, 0xf7, 0xf1]).div_reg(), Some((false, true, 1)));
+        // div dword[rdi] (f7 37) -> div_mem unsigned, 32-bit, base=7.
+        assert_eq!(decode(&[0xf7, 0x37]).div_mem(), Some((false, false, Some(7), None, 0, 0)));
+    }
+
+    #[test]
+    fn neg_adc_setccmem_push_projections() {
+        // neg eax (f7 d8) -> unary kind neg(0), 32-bit, rd=0.
+        assert_eq!(decode(&[0xf7, 0xd8]).unary_rr(), Some((0, false, 0)));
+        // not rax (48 f7 d0) -> kind not(1), 64-bit.
+        assert_eq!(decode(&[0x48, 0xf7, 0xd0]).unary_rr(), Some((1, true, 0)));
+        // adc edx,ecx (11 ca) -> kind adc(0), 32-bit, rd=2, rs=1.
+        assert_eq!(decode(&[0x11, 0xca]).adc_sbb_rr(), Some((0, false, 2, 1)));
+        // sbb rcx,rdx (48 19 d1) -> kind sbb(1), 64-bit, rd=1, rs=2.
+        assert_eq!(decode(&[0x48, 0x19, 0xd1]).adc_sbb_rr(), Some((1, true, 1, 2)));
+        // adc eax,5 (83 d0 05) -> imm form, kind adc(0), rd=0, imm=5.
+        assert_eq!(decode(&[0x83, 0xd0, 0x05]).adc_sbb_ri(), Some((0, false, 0, 5)));
+        // setl [rdi] (0f 9c 07) -> setcc_mem cc=0xc, base=7.
+        assert_eq!(decode(&[0x0f, 0x9c, 0x07]).setcc_mem(), Some((0xc, Some(7), None, 0, 0)));
+        // push 0x42 (6a 42) -> push_imm.
+        assert_eq!(decode(&[0x6a, 0x42]).push_imm(), Some(0x42));
+        // push [rdi] (ff 37) -> push_mem base=7.
+        assert_eq!(decode(&[0xff, 0x37]).push_mem(), Some((Some(7), None, 0, 0)));
+    }
+
+    #[test]
+    fn locked_arith_projections() {
+        // lock add [rdi],1 (f0 83 07 01) -> imm, kind add(0), 32-bit, base=7, imm=1.
+        assert_eq!(decode(&[0xf0, 0x83, 0x07, 0x01]).atomic_arith_imm(), Some((0, false, Some(7), None, 0, 0, 1)));
+        // lock add [rdi],rsi (f0 48 01 37) -> reg, kind add(0), 64-bit, reg=6.
+        assert_eq!(decode(&[0xf0, 0x48, 0x01, 0x37]).atomic_arith_reg(), Some((0, true, Some(7), None, 0, 0, 6)));
+        // lock or [rdi],esi (f0 09 37) -> reg, kind or(3), 32-bit, reg=6.
+        assert_eq!(decode(&[0xf0, 0x09, 0x37]).atomic_arith_reg(), Some((3, false, Some(7), None, 0, 0, 6)));
+        // a NON-locked add [rdi],esi (01 37) is not atomic_arith.
+        assert_eq!(decode(&[0x01, 0x37]).atomic_arith_reg(), None);
+    }
+
+    #[test]
+    fn atomic_projections() {
+        // lock xadd [rdi],eax (f0 0f c1 07) -> xadd 32-bit, base=7, reg=0.
+        assert_eq!(decode(&[0xf0, 0x0f, 0xc1, 0x07]).xadd_mem(), Some((false, Some(7), None, 0, 0, 0)));
+        // lock xadd [rdi],rax (f0 48 0f c1 07) -> 64-bit.
+        assert_eq!(decode(&[0xf0, 0x48, 0x0f, 0xc1, 0x07]).xadd_mem(), Some((true, Some(7), None, 0, 0, 0)));
+        // lock cmpxchg [rdi],edx (f0 0f b1 17) -> cmpxchg, reg=2.
+        assert_eq!(decode(&[0xf0, 0x0f, 0xb1, 0x17]).cmpxchg_mem(), Some((false, Some(7), None, 0, 0, 2)));
+        // xchg [rdi],eax (87 07) -> xchg, base=7, reg=0.
+        assert_eq!(decode(&[0x87, 0x07]).xchg_mem(), Some((false, Some(7), None, 0, 0, 0)));
+        // a `lock add [rdi],eax` (f0 01 07) must NOT be taken by the non-atomic ARITH_MR.
+        assert_eq!(decode(&[0xf0, 0x01, 0x07]).arith_mr_reg(), None);
     }
 
     #[test]
