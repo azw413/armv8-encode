@@ -374,28 +374,42 @@ pub fn write_with_appended_segment_opts(
         }
     }
 
-    // Headerpad check: we need 152 bytes (segment_command_64 +
-    // one section_64) for the new LC_SEGMENT_64 entry, plus
-    // dylib_command bytes (24 + path + NUL + pad-to-8) for
-    // each library dependency. If there isn't room, fail
-    // with actionable guidance — the user must rebuild with
-    // bigger headerpad.
-    const NEW_LC_SIZE: u64 = 152;
+    let mut bytes = image.raw_bytes.clone();
+
+    // Reclaim header space by dropping load commands that are safe to remove
+    // (LC_CODE_SIGNATURE — codesign rebuilds it; LC_FUNCTION_STARTS /
+    // LC_DATA_IN_CODE — runtime-optional). Each removal turns into extra
+    // headerpad, so binaries built with little or none (the system tools) can
+    // still take an appended segment. After this the LC list is shorter, so we
+    // read `ncmds`/`sizeofcmds` back from `bytes` rather than the stale `layout`.
+    let reclaimed = reclaim_headerpad(&mut bytes)?;
+    let sizeofcmds_now = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+
+    // Headerpad check. The new LC_SEGMENT_64 is either 152 bytes
+    // (segment_command_64 + one section_64) or, when headerpad is
+    // tight, 72 bytes (a section-less bare segment — see
+    // `build_segment_command_64`). Plus dylib_command bytes
+    // (24 + path + NUL + pad-to-8) for each library dependency.
+    // Prefer the section form; fall back to section-less only if
+    // it's the difference between fitting and failing.
     let dep_lc_total: u64 = library_deps
         .iter()
         .map(|name| dylib_command_size(name))
         .sum();
-    let total_lc_growth = NEW_LC_SIZE + dep_lc_total;
-    if layout.headerpad() < total_lc_growth {
+    let headerpad = layout.headerpad() + reclaimed;
+    let new_lc_size = if headerpad >= SEGMENT_LC_SIZE_WITH_SECTION + dep_lc_total {
+        SEGMENT_LC_SIZE_WITH_SECTION
+    } else if headerpad >= SEGMENT_LC_SIZE_NO_SECTION + dep_lc_total {
+        SEGMENT_LC_SIZE_NO_SECTION
+    } else {
         return Err(ContainerWriteError::ObjectWrite(format!(
-            "Mach-O append: not enough headerpad room ({} bytes, need {total_lc_growth}). \
+            "Mach-O append: not enough headerpad room ({headerpad} bytes, need {}). \
              Rebuild the input with `-Wl,-headerpad,0x1000` (or larger) so the \
              writer has space to grow the load-command list in place.",
-            layout.headerpad(),
+            SEGMENT_LC_SIZE_NO_SECTION + dep_lc_total,
         )));
-    }
-
-    let mut bytes = image.raw_bytes.clone();
+    };
+    let new_lc_size_usize = new_lc_size as usize;
 
     // Apply section-byte overrides at original file offsets.
     // Same constraint as the round-trip path: same-length only.
@@ -496,18 +510,21 @@ pub fn write_with_appended_segment_opts(
     // linkedit_shift.
     shift_linkedit_offsets(&mut bytes, layout, linkedit_old_fileoff, linkedit_shift)?;
 
-    // Build the new load command (segment_command_64 + one
-    // section_64).
+    // Build the new load command (segment_command_64, with a
+    // section_64 iff `new_lc_size` is the with-section size).
     let new_lc =
-        build_segment_command_64(&appended, appended_file_offset, NEW_LC_SIZE)?;
-    debug_assert_eq!(new_lc.len(), NEW_LC_SIZE as usize);
+        build_segment_command_64(&appended, appended_file_offset, new_lc_size)?;
+    debug_assert_eq!(new_lc.len(), new_lc_size_usize);
 
     // Splice the new LC into the existing load-command list.
     // Insert before LC_CODE_SIGNATURE if present (so the
     // signature remains the last load command); otherwise
     // append at the end of the LC list.
+    // Read ncmds/sizeofcmds from `bytes` (not `layout`): `reclaim_headerpad`
+    // above may have dropped load commands, so the stale layout would be wrong.
+    let ncmds_now = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
     let lc_start = layout.load_commands_offset as usize;
-    let lc_end = lc_start + layout.sizeofcmds as usize;
+    let lc_end = lc_start + sizeofcmds_now as usize;
     let insert_at = find_insert_offset_for_lc(&bytes, lc_start, lc_end)?;
 
     // Splice. The splice inserts `NEW_LC_SIZE` bytes at
@@ -526,12 +543,12 @@ pub fn write_with_appended_segment_opts(
     // bytes between `lc_end` and the next content are zeros
     // we can overwrite.
     bytes.splice(insert_at..insert_at, new_lc.iter().copied());
-    let post_splice_lc_end = lc_end + NEW_LC_SIZE as usize;
-    bytes.drain(post_splice_lc_end..post_splice_lc_end + NEW_LC_SIZE as usize);
+    let post_splice_lc_end = lc_end + new_lc_size_usize;
+    bytes.drain(post_splice_lc_end..post_splice_lc_end + new_lc_size_usize);
 
-    // Patch mach_header_64.ncmds and sizeofcmds.
-    let new_ncmds = layout.ncmds + 1;
-    let new_sizeofcmds = layout.sizeofcmds + NEW_LC_SIZE as u32;
+    // Patch mach_header_64.ncmds and sizeofcmds (off the post-reclaim values).
+    let new_ncmds = ncmds_now + 1;
+    let new_sizeofcmds = sizeofcmds_now + new_lc_size as u32;
     bytes[16..20].copy_from_slice(&new_ncmds.to_le_bytes());
     bytes[20..24].copy_from_slice(&new_sizeofcmds.to_le_bytes());
 
@@ -543,13 +560,10 @@ pub fn write_with_appended_segment_opts(
         inject_lc_load_dylibs(&mut bytes, library_deps)?;
     }
 
-    // Strip the existing LC_CODE_SIGNATURE entry. codesign
-    // --force adds a fresh one at the right position (past
-    // the appended segment) when re-signing, and our prior
-    // signature blob's bytes inside __LINKEDIT are now stale
-    // anyway. Removing the LC keeps codesign from getting
-    // confused about strict-validation invariants ("the
-    // signature lives at __LINKEDIT.end" is no longer true).
+    // Ensure no LC_CODE_SIGNATURE entry remains. `reclaim_headerpad` already
+    // removes it above (codesign --force re-adds a fresh one past the appended
+    // segment on re-sign), so this is normally a no-op; kept as a defensive guard
+    // in case reclaim is ever made conditional.
     strip_lc_code_signature(&mut bytes)?;
 
     // Phase 5: extend the export trie + symtab + strtab to
@@ -611,8 +625,11 @@ fn shift_linkedit_offsets(
         }
     };
 
+    // Read sizeofcmds from the header in `bytes` rather than `layout`: a prior
+    // `reclaim_headerpad` may have shortened the load-command list, so the layout
+    // value would be stale and we'd iterate into the (zeroed) headerpad.
     let lc_start = layout.load_commands_offset as usize;
-    let sizeofcmds = layout.sizeofcmds as usize;
+    let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
     let lc_end = lc_start + sizeofcmds;
 
     let mut cursor = lc_start;
@@ -1336,8 +1353,23 @@ fn find_load_command(
 /// either reuse the space or extend `__LINKEDIT` as it sees
 /// fit. Headerpad gains 16 bytes.
 fn strip_lc_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWriteError> {
-    use object::macho;
+    strip_load_command(bytes, object::macho::LC_CODE_SIGNATURE).map(|_| ())
+}
 
+/// Remove the first load command of type `cmd` from the load-command list,
+/// keeping every section/segment file offset stable: the LC's bytes are drained
+/// and the same number of zero bytes are spliced back at the new end of the LC
+/// list, so the removal turns into extra **headerpad** (the gap between the LC
+/// list and the first section grows by `cmdsize`). `mach_header.ncmds` /
+/// `sizeofcmds` are patched. Returns the number of bytes freed (0 if no such LC),
+/// so callers can reclaim headerpad before an append.
+///
+/// Only valid for load commands whose *data* (if any) lives in `__LINKEDIT` and
+/// is rebuilt or unneeded — e.g. `LC_CODE_SIGNATURE` (codesign rebuilds it),
+/// `LC_FUNCTION_STARTS` / `LC_DATA_IN_CODE` (runtime-optional metadata). It does
+/// NOT move or free the LC's `__LINKEDIT` payload; it only drops the directory
+/// entry, which is what reclaims header space.
+fn strip_load_command(bytes: &mut Vec<u8>, cmd: u32) -> Result<u64, ContainerWriteError> {
     if bytes.len() < 24 {
         return Err(ContainerWriteError::ObjectWrite(
             "Mach-O writer: input too short for mach_header_64".into(),
@@ -1350,7 +1382,7 @@ fn strip_lc_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWriteErro
     let lc_end = lc_start + sizeofcmds;
     let mut cursor = lc_start;
     while cursor + 8 <= lc_end {
-        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let lc_cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
         let cmdsize =
             u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
         if cmdsize == 0 || cursor + cmdsize > lc_end {
@@ -1358,16 +1390,12 @@ fn strip_lc_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWriteErro
                 "Mach-O writer: invalid cmdsize {cmdsize} at offset {cursor}",
             )));
         }
-        if cmd == macho::LC_CODE_SIGNATURE {
+        if lc_cmd == cmd {
             // Splice the LC out of the load-command list.
             bytes.drain(cursor..cursor + cmdsize);
-            // The drained bytes are now zero-padded by writing
-            // zeros at the new tail (since the LC list got
-            // shorter, anything that was after lc_end has now
-            // shifted forward — but the headerpad was already
-            // zeros). To keep all subsequent file offsets
-            // stable, splice back the same number of zero
-            // bytes at the new lc_end.
+            // To keep all subsequent file offsets stable, splice
+            // back the same number of zero bytes at the new
+            // lc_end — they become extra headerpad.
             let new_lc_end = lc_end - cmdsize;
             bytes.splice(new_lc_end..new_lc_end, std::iter::repeat(0u8).take(cmdsize));
             // Update ncmds / sizeofcmds.
@@ -1375,11 +1403,30 @@ fn strip_lc_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWriteErro
             bytes[20..24].copy_from_slice(
                 &((sizeofcmds - cmdsize) as u32).to_le_bytes(),
             );
-            return Ok(());
+            return Ok(cmdsize as u64);
         }
         cursor += cmdsize;
     }
-    Ok(())
+    Ok(0)
+}
+
+/// Reclaim header space before an append by dropping load commands that are safe
+/// to remove: `LC_CODE_SIGNATURE` (always — codesign rebuilds it on re-sign), and
+/// `LC_FUNCTION_STARTS` / `LC_DATA_IN_CODE` (runtime-optional metadata a loader
+/// doesn't need to execute the image). Returns the total bytes freed (which
+/// become headerpad). Used so binaries built with a tight headerpad — e.g. the
+/// system tools, which ship with almost none — can still take an appended segment.
+fn reclaim_headerpad(bytes: &mut Vec<u8>) -> Result<u64, ContainerWriteError> {
+    use object::macho;
+    let mut freed = 0;
+    for cmd in [
+        macho::LC_CODE_SIGNATURE,
+        macho::LC_FUNCTION_STARTS,
+        macho::LC_DATA_IN_CODE,
+    ] {
+        freed += strip_load_command(bytes, cmd)?;
+    }
+    Ok(freed)
 }
 
 /// Find the byte offset of an `LC_SEGMENT_64` whose segname
@@ -1461,13 +1508,29 @@ fn find_insert_offset_for_lc(
     Ok(lc_end)
 }
 
-/// Build a 152-byte (segment_command_64 + one section_64) load
-/// command for the appended segment.
+/// Load-command size for the appended segment WITH a `section_64`
+/// (segment_command_64 = 72 + section_64 = 80).
+const SEGMENT_LC_SIZE_WITH_SECTION: u64 = 152;
+/// Load-command size for a section-less appended segment (bare
+/// `segment_command_64`, `nsects == 0`). Used when headerpad is too
+/// tight for the 152-byte form; the `__appended` section is only a
+/// disassembler hint, so dropping it is behaviour-preserving.
+const SEGMENT_LC_SIZE_NO_SECTION: u64 = 72;
+
+/// Build the load command for the appended segment: a
+/// `segment_command_64`, plus one `section_64` unless `cmdsize` is
+/// [`SEGMENT_LC_SIZE_NO_SECTION`] (then `nsects == 0`).
 fn build_segment_command_64(
     appended: &AppendedSegment,
     file_offset: u64,
     cmdsize: u64,
 ) -> Result<Vec<u8>, ContainerWriteError> {
+    // `cmdsize == SEGMENT_LC_SIZE_NO_SECTION` selects the section-less form (a
+    // bare R-X segment, `nsects == 0`). The `__appended` section is only a
+    // disassembler hint — code branches to absolute VAs inside the segment, not
+    // through a section symbol — so dropping it is behaviour-preserving and
+    // halves the load-command growth (72 vs 152 bytes) when headerpad is tight.
+    let with_section = cmdsize != SEGMENT_LC_SIZE_NO_SECTION;
     use object::macho;
 
     let segname = "__APPENDED";
@@ -1496,28 +1559,30 @@ fn build_segment_command_64(
     out.extend_from_slice(&bytes_len.to_le_bytes()); // filesize
     out.extend_from_slice(&prot.to_le_bytes()); // maxprot
     out.extend_from_slice(&prot.to_le_bytes()); // initprot
-    out.extend_from_slice(&1u32.to_le_bytes()); // nsects
+    out.extend_from_slice(&(if with_section { 1u32 } else { 0u32 }).to_le_bytes()); // nsects
     out.extend_from_slice(&0u32.to_le_bytes()); // segment flags
 
-    // section_64
-    let mut sect_field = [0u8; 16];
-    let bytes_sect = sectname.as_bytes();
-    sect_field[..bytes_sect.len().min(16)]
-        .copy_from_slice(&bytes_sect[..bytes_sect.len().min(16)]);
-    out.extend_from_slice(&sect_field);
-    out.extend_from_slice(&name_field); // segname (matches segment)
-    out.extend_from_slice(&appended.vaddr.to_le_bytes()); // addr
-    out.extend_from_slice(&bytes_len.to_le_bytes()); // size
-    out.extend_from_slice(&(file_offset as u32).to_le_bytes()); // offset (32-bit!)
-    out.extend_from_slice(&2u32.to_le_bytes()); // align 2^2 = 4
-    out.extend_from_slice(&0u32.to_le_bytes()); // reloff
-    out.extend_from_slice(&0u32.to_le_bytes()); // nreloc
-    // S_REGULAR section type with S_ATTR_SOME_INSTRUCTIONS so
-    // disassemblers know this region holds code.
-    out.extend_from_slice(&macho::S_ATTR_SOME_INSTRUCTIONS.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // reserved1
-    out.extend_from_slice(&0u32.to_le_bytes()); // reserved2
-    out.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+    if with_section {
+        // section_64
+        let mut sect_field = [0u8; 16];
+        let bytes_sect = sectname.as_bytes();
+        sect_field[..bytes_sect.len().min(16)]
+            .copy_from_slice(&bytes_sect[..bytes_sect.len().min(16)]);
+        out.extend_from_slice(&sect_field);
+        out.extend_from_slice(&name_field); // segname (matches segment)
+        out.extend_from_slice(&appended.vaddr.to_le_bytes()); // addr
+        out.extend_from_slice(&bytes_len.to_le_bytes()); // size
+        out.extend_from_slice(&(file_offset as u32).to_le_bytes()); // offset (32-bit!)
+        out.extend_from_slice(&2u32.to_le_bytes()); // align 2^2 = 4
+        out.extend_from_slice(&0u32.to_le_bytes()); // reloff
+        out.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+        // S_REGULAR section type with S_ATTR_SOME_INSTRUCTIONS so
+        // disassemblers know this region holds code.
+        out.extend_from_slice(&macho::S_ATTR_SOME_INSTRUCTIONS.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+    }
 
     Ok(out)
 }
