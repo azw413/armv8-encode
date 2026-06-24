@@ -923,27 +923,35 @@ impl X86DecodedInstruction {
         Some((signed, size_log2, dst.is_gpr64(), gpr64_index(dst)?, base, index, scale, disp))
     }
 
-    /// `mov [mem], imm` (non-RIP) at a 32/64-bit width → `(is64, base, index,
-    /// scale_log2, disp, imm)`. For VM STORE_IMM. `None` for 8/16-bit, RIP, or
-    /// a non-immediate source.
-    pub fn store_imm_mem(&self) -> Option<(bool, Option<u8>, Option<u8>, u8, u32, u32)> {
+    /// `mov [mem], imm` (non-RIP) → `(size_log2, base, index, scale_log2, disp, imm)`,
+    /// where `size_log2` is 0/1/2/3 for byte/word/dword/qword (e.g. `mov byte[p],0`).
+    /// For VM STORE_IMM. `None` for RIP, segment, or a non-immediate source.
+    pub fn store_imm_mem(&self) -> Option<(u8, Option<u8>, Option<u8>, u8, u32, u32)> {
         use iced_x86::{Mnemonic, OpKind};
-        if self.instr.mnemonic() != Mnemonic::Mov || self.instr.op_count() != 2 {
+        if self.instr.mnemonic() != Mnemonic::Mov
+            || self.instr.op_count() != 2
+            || self.instr.op0_kind() != OpKind::Memory
+        {
             return None;
         }
-        let imm = match (self.instr.op0_kind(), self.instr.op1_kind()) {
-            (OpKind::Memory, OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate8) => {
-                self.instr.immediate(1) as u32
-            }
+        if !matches!(
+            self.instr.op1_kind(),
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32
+                | OpKind::Immediate8to64 | OpKind::Immediate16 | OpKind::Immediate32
+                | OpKind::Immediate32to64
+        ) {
+            return None;
+        }
+        let size_log2 = match self.instr.memory_size().size() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
             _ => return None,
         };
-        let is64 = match self.instr.memory_size().size() {
-            4 => false,
-            8 => true,
-            _ => return None,
-        };
+        let imm = self.instr.immediate(1) as u32;
         let (base, index, scale, disp) = self.mem_addr()?; // None for RIP/segment
-        Some((is64, base, index, scale, disp, imm))
+        Some((size_log2, base, index, scale, disp, imm))
     }
 
     /// `mov [rip+disp], imm` at a 32/64-bit width → `(is64, target_vaddr, imm)`.
@@ -1961,10 +1969,14 @@ mod effects_tests {
 
     #[test]
     fn store_imm_and_mem_cmp_projections() {
-        // mov dword[rdi],5 (c7 07 05 ..) -> STORE_IMM 32, base=7, imm=5.
-        assert_eq!(decode(&[0xc7, 0x07, 0x05, 0, 0, 0]).store_imm_mem(), Some((false, Some(7), None, 0, 0, 5)));
-        // mov qword[rdi],0 (48 c7 07 ..) -> STORE_IMM 64.
-        assert_eq!(decode(&[0x48, 0xc7, 0x07, 0, 0, 0, 0]).store_imm_mem(), Some((true, Some(7), None, 0, 0, 0)));
+        // mov dword[rdi],5 (c7 07 05 ..) -> STORE_IMM size_log2=2 (dword), base=7, imm=5.
+        assert_eq!(decode(&[0xc7, 0x07, 0x05, 0, 0, 0]).store_imm_mem(), Some((2, Some(7), None, 0, 0, 5)));
+        // mov qword[rdi],0 (48 c7 07 ..) -> qword (size_log2=3).
+        assert_eq!(decode(&[0x48, 0xc7, 0x07, 0, 0, 0, 0]).store_imm_mem(), Some((3, Some(7), None, 0, 0, 0)));
+        // mov byte[rdi],0x41 (c6 07 41) -> byte (size_log2=0).
+        assert_eq!(decode(&[0xc6, 0x07, 0x41]).store_imm_mem(), Some((0, Some(7), None, 0, 0, 0x41)));
+        // mov word[rdi],0x1234 (66 c7 07 34 12) -> word (size_log2=1).
+        assert_eq!(decode(&[0x66, 0xc7, 0x07, 0x34, 0x12]).store_imm_mem(), Some((1, Some(7), None, 0, 0, 0x1234)));
         // cmp [rdi],esi (39 37) -> CMP_MEM_REG mem_left, size_log2=2 (dword), base=7, reg=6.
         assert_eq!(
             decode(&[0x39, 0x37]).cmp_mem_reg(),
