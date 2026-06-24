@@ -770,6 +770,79 @@ impl LiftedTextSectionAny {
 // `BinaryEditor::text` stores [`LiftedTextSectionAny`]; the
 // aarch64 short-form is at [`BinaryEditor::aarch64_text_mut`].
 
+/// An appended [`RewritePlan`](crate::rewrite::RewritePlan) with its source
+/// [`Isa`] erased, so the heterogeneous `add_function*` paths can all retain
+/// their plan in one `Vec`. Mirrors the "generic `I` → erased enum" mechanism
+/// [`LiftedTextSectionAny`] uses for lifted sections: a variant per concrete
+/// ISA, each holding the ISA-typed value. The commit-time re-emit pass
+/// ([`AppendedFunctionsState::rebase`]) matches on the variant to recover the
+/// concrete `I` for `lay_out::<I>` / `emit::<I>`.
+#[derive(Debug, Clone)]
+enum RetainedPlanAny {
+    Aarch64(RewritePlanGeneric<Aarch64Isa>),
+    Thumb(RewritePlanGeneric<ThumbIsa>),
+    Arm(RewritePlanGeneric<ArmIsa>),
+    X86(RewritePlanGeneric<crate::isa::x86::X86Isa>),
+}
+
+/// Erases a generic `RewritePlan<I>` into [`RetainedPlanAny`] from a context
+/// that only knows `I: Isa` (e.g. `add_function_generic::<I>`), so the retained
+/// plan can live in the heterogeneous `RetainedAppend` vec. Solves the same
+/// "generic `I` → erased enum" problem `LiftedTextSectionAny` solves at its
+/// construction sites — but here `I` is a type parameter, not a matched
+/// concrete type, so we recover the concrete ISA by `Any`-downcasting (every
+/// `Isa` is `'static`, so this is a `TypeId` check). Panics only if a new ISA
+/// is added without a matching arm here, which is caught immediately by the
+/// `add_function*` tests.
+fn wrap_retained_plan<I: Isa>(plan: RewritePlanGeneric<I>) -> RetainedPlanAny {
+    use std::any::Any;
+    // `Option<RewritePlan<I>>` lets us `take` the concrete value out of the
+    // `&mut dyn Any` once a downcast matches, without cloning or transmuting.
+    let mut held: Option<RewritePlanGeneric<I>> = Some(plan);
+    let any: &mut dyn Any = &mut held;
+    if let Some(p) = any.downcast_mut::<Option<RewritePlanGeneric<Aarch64Isa>>>() {
+        return RetainedPlanAny::Aarch64(p.take().expect("plan present"));
+    }
+    if let Some(p) = any.downcast_mut::<Option<RewritePlanGeneric<ThumbIsa>>>() {
+        return RetainedPlanAny::Thumb(p.take().expect("plan present"));
+    }
+    if let Some(p) = any.downcast_mut::<Option<RewritePlanGeneric<ArmIsa>>>() {
+        return RetainedPlanAny::Arm(p.take().expect("plan present"));
+    }
+    if let Some(p) =
+        any.downcast_mut::<Option<RewritePlanGeneric<crate::isa::x86::X86Isa>>>()
+    {
+        return RetainedPlanAny::X86(p.take().expect("plan present"));
+    }
+    unreachable!("RetainedPlanAny has no variant for this Isa — add one");
+}
+
+/// One appended item retained so the Mach-O commit fallback can re-emit it at a
+/// fresh segment base when the optimistic intra-`__TEXT` base doesn't fit. The
+/// emitted bytes can't simply be shifted — `adrp`/page-relative and
+/// cross-symbol references are absolute — so functions are re-laid-out and
+/// re-emitted at the new base. Raw data is base-independent and copied verbatim.
+#[derive(Debug, Clone)]
+enum RetainedAppend {
+    /// A function appended via `add_function*`: re-emittable at any base by
+    /// `lay_out` + `emit` of `plan` at `base + offset`.
+    Function {
+        name: String,
+        offset: u64,
+        plan: RetainedPlanAny,
+    },
+    /// Raw appended data ([`BinaryState::add_data`]): base-independent bytes
+    /// copied verbatim at `offset`. The bytes don't move relative to the base,
+    /// but the blob's *symbol* address does — appended functions reference it by
+    /// `adrp`/`add` against `Target::Symbol(name)`, which resolves to the symbol
+    /// address — so `name` is retained to rebase that symbol with the segment.
+    Data {
+        name: String,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+}
+
 /// Cumulative state for functions appended via
 /// [`TextEditor::add_function`]. Lives behind an `Option` on the
 /// editor so callers who never add functions stay on the cheaper
@@ -790,6 +863,123 @@ struct AppendedFunctionsState {
     /// regenerates `.gnu.hash` to expose these for dlopen/dlsym.
     /// Empty when callers only use the unexported `add_function`.
     exports: Vec<ExportedSymbol>,
+    /// Per-item re-emit information, in addition order, used by the
+    /// Mach-O commit fallback ([`Self::rebase`]) when the optimistic
+    /// intra-`__TEXT` base doesn't fit and the payload must be
+    /// re-emitted at a fresh segment base. Each entry records its
+    /// 0-based `offset` into `bytes` so the rebased buffer can be
+    /// reconstructed (including alignment padding) from offsets
+    /// alone. Empty until the first `add_function` / `add_data`.
+    items: Vec<RetainedAppend>,
+}
+
+impl AppendedFunctionsState {
+    /// Re-emit every appended function at `new_base` (the Mach-O fallback when
+    /// the optimistic intra-`__TEXT` base baked into the emitted bytes doesn't
+    /// fit a `__TEXT` free region). The bytes can't simply be shifted —
+    /// `adrp`/page-relative and cross-symbol references are absolute — so each
+    /// function is re-laid-out + re-emitted at `new_base + offset`.
+    ///
+    /// Operates on `container`: it updates each appended symbol's address there
+    /// (so the *caller* must pass the very container whose symbols / `macho_image`
+    /// the writer consumes) and uses it as the emit context so cross-function
+    /// references resolve to the rebased addresses. Updates
+    /// `self.segment_vaddr` / `self.bytes` and returns the rebuilt concatenated
+    /// bytes (which equal the new `self.bytes`).
+    fn rebase(
+        &mut self,
+        new_base: u64,
+        container: &mut Container,
+    ) -> Result<Vec<u8>, TextEditorError> {
+        let old_base = self.segment_vaddr;
+
+        // Phase 1: move every appended symbol — functions AND data blobs — to its
+        // rebased address FIRST, so references emitted in phase 2 resolve to the
+        // new addresses (not the stale intra-`__TEXT` ones). This must include
+        // data: appended functions reach an `add_data` blob (e.g. a VM's bytecode)
+        // by `adrp`/`add` against its `Target::Symbol`, which folds to the symbol
+        // address at emit — a stale data symbol sends that load to the old page.
+        // Match by name *and* old address (`old_base + offset`) so we never
+        // disturb an unrelated homonym elsewhere in the symbol table.
+        for item in &self.items {
+            let (name, offset) = match item {
+                RetainedAppend::Function { name, offset, .. } => (name, *offset),
+                RetainedAppend::Data { name, offset, .. } => (name, *offset),
+            };
+            let old_addr = old_base + offset;
+            let new_addr = new_base + offset;
+            if let Some(sym) = container
+                .symbols
+                .iter_mut()
+                .find(|s| s.name == *name && s.address == old_addr)
+            {
+                sym.address = new_addr;
+            }
+        }
+
+        // Phase 2: rebuild the concatenated buffer at `new_base`. Functions are
+        // re-laid-out + re-emitted at their rebased vaddr; data is copied
+        // verbatim. Inter-item alignment padding is reconstructed implicitly
+        // from each item's recorded offset (the buffer is zero-filled to the
+        // offset before each item is written).
+        let mut bytes = vec![0u8; self.bytes.len()];
+        for item in &self.items {
+            match item {
+                RetainedAppend::Function { offset, plan, .. } => {
+                    let vaddr = new_base + offset;
+                    let emitted = match plan {
+                        RetainedPlanAny::Aarch64(p) => {
+                            let layout = lay_out::<Aarch64Isa>(p, vaddr, Some(container))?;
+                            emit::<Aarch64Isa>(p, &layout, Some(container))?
+                        }
+                        RetainedPlanAny::Thumb(p) => {
+                            let layout = lay_out::<ThumbIsa>(p, vaddr, Some(container))?;
+                            emit::<ThumbIsa>(p, &layout, Some(container))?
+                        }
+                        RetainedPlanAny::Arm(p) => {
+                            let layout = lay_out::<ArmIsa>(p, vaddr, Some(container))?;
+                            emit::<ArmIsa>(p, &layout, Some(container))?
+                        }
+                        RetainedPlanAny::X86(p) => {
+                            let layout =
+                                lay_out::<crate::isa::x86::X86Isa>(p, vaddr, Some(container))?;
+                            emit::<crate::isa::x86::X86Isa>(p, &layout, Some(container))?
+                        }
+                    };
+                    // Same invariant as the append path: a re-emitted body that
+                    // still carries relocations references something we cannot
+                    // place — fail loudly rather than ship a wrong jump.
+                    if !emitted.relocations.is_empty() {
+                        return Err(TextEditorError::AppendNeedsUnsupportedRelocation {
+                            name: match item {
+                                RetainedAppend::Function { name, .. } => name.clone(),
+                                RetainedAppend::Data { .. } => String::new(),
+                            },
+                            count: emitted.relocations.len(),
+                        });
+                    }
+                    let start = *offset as usize;
+                    let end = start + emitted.bytes.len();
+                    if end > bytes.len() {
+                        bytes.resize(end, 0);
+                    }
+                    bytes[start..end].copy_from_slice(&emitted.bytes);
+                }
+                RetainedAppend::Data { offset, bytes: data, .. } => {
+                    let start = *offset as usize;
+                    let end = start + data.len();
+                    if end > bytes.len() {
+                        bytes.resize(end, 0);
+                    }
+                    bytes[start..end].copy_from_slice(data);
+                }
+            }
+        }
+
+        self.segment_vaddr = new_base;
+        self.bytes = bytes.clone();
+        Ok(bytes)
+    }
 }
 
 /// Accumulated runtime-writable appended data (see
@@ -1907,6 +2097,7 @@ impl BinaryState {
                 segment_vaddr,
                 bytes: Vec::new(),
                 exports: Vec::new(),
+                items: Vec::new(),
             });
             state.bytes.resize(cumulative_offset as usize, 0);
         }
@@ -1946,6 +2137,15 @@ impl BinaryState {
             segment_vaddr,
             bytes: Vec::new(),
             exports: Vec::new(),
+            items: Vec::new(),
+        });
+        // Retain the plan (ISA-erased) so the Mach-O commit fallback can
+        // re-emit this function at a fresh base if the intra-`__TEXT` base
+        // doesn't fit. `cumulative_offset` is this body's 0-based start.
+        state.items.push(RetainedAppend::Function {
+            name: name.to_string(),
+            offset: cumulative_offset,
+            plan: wrap_retained_plan(plan),
         });
         state.bytes.extend_from_slice(&output.bytes);
 
@@ -2002,6 +2202,7 @@ impl BinaryState {
                 segment_vaddr,
                 bytes: Vec::new(),
                 exports: Vec::new(),
+                items: Vec::new(),
             });
             state.bytes.resize(cumulative_offset as usize, 0);
         }
@@ -2045,6 +2246,15 @@ impl BinaryState {
             segment_vaddr,
             bytes: Vec::new(),
             exports: Vec::new(),
+            items: Vec::new(),
+        });
+        // Retain the plan (ISA-erased) so the Mach-O commit fallback can
+        // re-emit this function at a fresh base if the intra-`__TEXT` base
+        // doesn't fit. `cumulative_offset` is this body's 0-based start.
+        state.items.push(RetainedAppend::Function {
+            name: name.to_string(),
+            offset: cumulative_offset,
+            plan: wrap_retained_plan(plan),
         });
         state.bytes.extend_from_slice(&output.bytes);
 
@@ -2674,6 +2884,7 @@ impl BinaryState {
             segment_vaddr,
             bytes: Vec::new(),
             exports: Vec::new(),
+            items: Vec::new(),
         });
         let cumulative = state.bytes.len() as u64;
         let aligned_cumulative = if align <= 1 {
@@ -2686,6 +2897,14 @@ impl BinaryState {
         }
 
         let blob_vaddr = state.segment_vaddr + aligned_cumulative;
+        // Retain the raw bytes (base-independent) at their aligned offset so
+        // the Mach-O commit fallback can copy them verbatim when re-emitting
+        // the payload at a fresh segment base.
+        state.items.push(RetainedAppend::Data {
+            name: name.to_string(),
+            offset: aligned_cumulative,
+            bytes: bytes.to_vec(),
+        });
         state.bytes.extend_from_slice(bytes);
 
         // Register the symbol after we know the blob's vaddr.
@@ -3737,11 +3956,15 @@ impl BinaryEditor {
                 segment_vaddr,
                 bytes: Vec::new(),
                 exports: Vec::new(),
+                items: Vec::new(),
             });
         }
         // Take the lifted section and the binary state out so
-        // we can consume both.
-        let BinaryEditor { binary, text } = self;
+        // we can consume both. `binary` is bound mutably because
+        // the Mach-O append fallback may need to rebase the
+        // appended payload (and its symbols in `binary.container`)
+        // BEFORE the lifted-text commit reads that symbol table.
+        let BinaryEditor { mut binary, text } = self;
         match binary.appended {
             None => {
                 // No appended functions — straightforward path.
@@ -3778,6 +4001,86 @@ impl BinaryEditor {
                 }
             }
             Some(mut appended) => {
+                // Mach-O append-fallback rebase, performed BEFORE the
+                // lifted-text commit below. `pick_append_vaddr`
+                // optimistically picks an intra-`__TEXT` base at the
+                // *first* append (before the total payload size is known)
+                // and bakes it into every emitted body / symbol address.
+                // If the finished payload no longer fits a `__TEXT` free
+                // region, an `__APPENDED` segment at that stale base would
+                // overlap `__TEXT`, so we must rebase it above the mapped
+                // range. This MUST happen before `commit_lifted_any`
+                // resolves the lifted `__text`'s symbolic branch targets
+                // (e.g. a trampoline `b <stub>`) against
+                // `binary.container`'s symbol table — otherwise the
+                // trampoline bakes in the OLD (now-unmapped) stub address
+                // and the rebased binary SIGBUSes. The placement decision
+                // reads only the *layout* (`__TEXT` extents, free regions,
+                // max_vaddr_end), which the text commit does not change, so
+                // it is safe to evaluate against the pre-commit container.
+                //
+                // Scalars are read out (and the immutable borrow dropped)
+                // before taking `&mut binary.container` for the rebase, to
+                // avoid overlapping borrows.
+                if is_macho {
+                    let (do_rebase, new_base) = match binary.container.macho_image.as_ref() {
+                        Some(img) => {
+                            // Intra-`__TEXT` placement is eligible iff no
+                            // exports / library deps are queued and some
+                            // `__TEXT` free region holds the whole payload —
+                            // the same test the post-commit branch uses.
+                            let intra_fits = appended.exports.is_empty()
+                                && binary.pending_library_deps.is_empty()
+                                && img
+                                    .layout
+                                    .text_free_regions()
+                                    .iter()
+                                    .any(|r| {
+                                        appended.segment_vaddr >= r.vaddr
+                                            && appended.segment_vaddr
+                                                + appended.bytes.len() as u64
+                                                <= r.vaddr + r.size
+                                    });
+                            let base_in_text = img
+                                .layout
+                                .segments
+                                .iter()
+                                .find(|s| s.name == "__TEXT")
+                                .map(|t| {
+                                    appended.segment_vaddr >= t.vmaddr
+                                        && appended.segment_vaddr < t.vmaddr + t.vmsize
+                                })
+                                .unwrap_or(false);
+                            if base_in_text && !intra_fits {
+                                // Same safe-base computation as
+                                // `pick_append_vaddr`'s Mach-O segment
+                                // fallback: sit a fixed gap above the highest
+                                // mapped vaddr, page-aligned.
+                                const PAGE: u64 = 0x4000; // arm64 macOS page size
+                                const GAP: u64 = 16 * PAGE;
+                                let max_input_vaddr = img.layout.max_vaddr_end();
+                                let new_base = ((max_input_vaddr + GAP + PAGE - 1)
+                                    & !(PAGE - 1))
+                                    .max(PAGE);
+                                (true, new_base)
+                            } else {
+                                (false, 0)
+                            }
+                        }
+                        None => (false, 0),
+                    };
+                    if do_rebase {
+                        // Rebase against the very container whose symbol
+                        // table `commit_lifted_any` reads below, so the
+                        // lifted-text trampolines resolve to the rebased
+                        // (new-base) stub addresses. After this,
+                        // `appended.segment_vaddr` / `appended.bytes` are
+                        // already at the new base for both the text commit
+                        // and the later `__APPENDED` segment construction.
+                        appended.rebase(new_base, &mut binary.container)?;
+                    }
+                }
+
                 // Run the in-place layout/emit for the lifted
                 // section (if any) so branch redirects to new
                 // functions get folded against the
@@ -3866,6 +4169,19 @@ impl BinaryEditor {
                         )
                         .map_err(TextEditorError::from);
                     }
+
+                    // The intra-`__TEXT` placement above didn't fire, so the
+                    // payload doesn't fit a `__TEXT` free region. When the
+                    // optimistic `pick_append_vaddr` base sits inside `__TEXT`,
+                    // the payload was already rebased to a safe segment base
+                    // above the mapped range at the START of this branch —
+                    // BEFORE the lifted-text commit — so its trampolines
+                    // resolve to the rebased stub addresses. By here,
+                    // `appended.segment_vaddr` / `appended.bytes` (and the
+                    // appended symbols in `updated`, derived from the rebased
+                    // `binary.container`) already carry the new base; the
+                    // `__APPENDED` segment is built directly from them with no
+                    // further rebase.
 
                     // Phase 3+ append-segment fallback. Output
                     // will have an extra `__APPENDED` R-X
