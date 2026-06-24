@@ -1175,6 +1175,41 @@ impl X86DecodedInstruction {
         Some(self.instr.memory_displacement64())
     }
 
+    /// Indirect tail-call `jmp [rip+disp]` (a GOT / PLT-style tail call to an external
+    /// function — `jmp *func@GOTPCREL`) → the GOT-slot vaddr. The VM lowers it as an
+    /// indirect call + ret. For VM CALL_RIP+RET.
+    pub fn tail_jmp_rip(&self) -> Option<u64> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Jmp
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Memory
+            || !self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        Some(self.instr.memory_displacement64())
+    }
+
+    /// Indirect tail-call `jmp [base+disp]` (non-RIP, NO index — a fn-ptr or vtable-slot
+    /// tail call, e.g. `jmp *(%rbx)` / `jmp *0x10(%rax)`) → `(base, scale_log2, disp)`.
+    /// An INDEXED `jmp [base+idx*s]` is a switch jump table (intra-function target) and
+    /// is rejected — lowering it as a tail call would be wrong. For VM CALL_MEM+RET.
+    pub fn tail_jmp_mem(&self) -> Option<(Option<u8>, u8, u32)> {
+        use iced_x86::{Mnemonic, OpKind};
+        if self.instr.mnemonic() != Mnemonic::Jmp
+            || self.instr.op_count() != 1
+            || self.instr.op0_kind() != OpKind::Memory
+            || self.instr.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        let (base, index, scale, disp) = self.mem_addr()?;
+        if index.is_some() {
+            return None; // indexed -> jump table, not a tail call
+        }
+        Some((base, scale, disp))
+    }
+
     /// `push r64` → the GPR index (register form only), else `None`. For the VM
     /// PUSH op (always 64-bit in x86-64).
     pub fn push_reg(&self) -> Option<u8> {
@@ -1994,6 +2029,21 @@ mod effects_tests {
         );
         // mov [rip+0],imm (c7 05 .. dword) -> rip_store_imm (not store_imm_mem).
         assert_eq!(decode(&[0xc7, 0x05, 0, 0, 0, 0, 0x07, 0, 0, 0]).store_imm_mem(), None);
+    }
+
+    #[test]
+    fn indirect_tail_jmp_projections() {
+        // jmp [rdi] (ff 27) -> tail_jmp_mem base=7, no index.
+        assert_eq!(decode(&[0xff, 0x27]).tail_jmp_mem(), Some((Some(7), 0, 0)));
+        // jmp [rbx+0x10] (ff 63 10) -> base=3, disp 0x10 (vtable-slot tail call).
+        assert_eq!(decode(&[0xff, 0x63, 0x10]).tail_jmp_mem(), Some((Some(3), 0, 0x10)));
+        // jmp [rax+rcx*8] (ff 24 c8) -> INDEXED -> rejected (jump table, not a tail call).
+        assert_eq!(decode(&[0xff, 0x24, 0xc8]).tail_jmp_mem(), None);
+        // jmp [rip+0] (ff 25 ..) len 6 -> tail_jmp_rip target 0x1006.
+        assert_eq!(decode(&[0xff, 0x25, 0, 0, 0, 0]).tail_jmp_rip(), Some(0x1006));
+        // jmp rax (ff e0) -> neither (register, not memory).
+        assert_eq!(decode(&[0xff, 0xe0]).tail_jmp_mem(), None);
+        assert_eq!(decode(&[0xff, 0xe0]).tail_jmp_rip(), None);
     }
 
     #[test]
