@@ -971,10 +971,11 @@ impl X86DecodedInstruction {
         Some((is64, self.instr.memory_displacement64(), self.instr.immediate(1) as u32))
     }
 
-    /// `cmp`/`test` of a 32/64-bit register against a (non-RIP) memory operand →
-    /// `(is_test, is64, mem_is_left, base, index, scale_log2, disp, reg)`. For VM
-    /// CMP_MEM_REG. Width is the register's; `None` for 8/16-bit or RIP.
-    pub fn cmp_mem_reg(&self) -> Option<(bool, bool, bool, Option<u8>, Option<u8>, u8, u32, u8)> {
+    /// `cmp`/`test` of a register against a (non-RIP) memory operand →
+    /// `(is_test, size_log2, mem_is_left, base, index, scale_log2, disp, reg)`, where
+    /// `size_log2` is 0/1/2/3 for byte/word/dword/qword (the register's width). For VM
+    /// CMP_MEM_REG. `None` for a high-byte reg or RIP.
+    pub fn cmp_mem_reg(&self) -> Option<(bool, u8, bool, Option<u8>, Option<u8>, u8, u32, u8)> {
         use iced_x86::{Mnemonic, OpKind};
         let is_test = match self.instr.mnemonic() {
             Mnemonic::Cmp => false,
@@ -989,12 +990,9 @@ impl X86DecodedInstruction {
             (OpKind::Register, OpKind::Memory) => (false, self.instr.op0_register()),
             _ => return None,
         };
-        let is64 = reg.is_gpr64();
-        if !reg.is_gpr32() && !is64 {
-            return None;
-        }
+        let size_log2 = gpr_size_log2(reg)?;
         let (base, index, scale, disp) = self.mem_addr()?;
-        Some((is_test, is64, mem_left, base, index, scale, disp, gpr64_index(reg)?))
+        Some((is_test, size_log2, mem_left, base, index, scale, disp, gpr64_index(reg)?))
     }
 
     /// `lea r64, [rip+disp]` → `(rd, target_vaddr)` (the absolute address the `lea`
@@ -1458,10 +1456,10 @@ impl X86DecodedInstruction {
         gpr64_index(l)
     }
 
-    /// `cmp [mem], imm` / `test [mem], imm` at a 32- or 64-bit memory width →
-    /// `(is_test, is64, base, index, scale_log2, disp, imm)`. `None` for 8/16-bit
-    /// widths, RIP-relative, or a non-immediate. For VM CMP_MEM_IMM.
-    pub fn cmp_mem_imm(&self) -> Option<(bool, bool, Option<u8>, Option<u8>, u8, u32, u32)> {
+    /// `cmp [mem], imm` / `test [mem], imm` → `(is_test, size_log2, base, index,
+    /// scale_log2, disp, imm)`, where `size_log2` is 0/1/2/3 for byte/word/dword/
+    /// qword. `None` for RIP-relative or a non-immediate. For VM CMP_MEM_IMM.
+    pub fn cmp_mem_imm(&self) -> Option<(bool, u8, Option<u8>, Option<u8>, u8, u32, u32)> {
         use iced_x86::{Mnemonic, OpKind};
         let is_test = match self.instr.mnemonic() {
             Mnemonic::Cmp => false,
@@ -1471,9 +1469,11 @@ impl X86DecodedInstruction {
         if self.instr.op_count() != 2 || self.instr.op0_kind() != OpKind::Memory {
             return None;
         }
-        let is64 = match self.instr.memory_size().size() {
-            4 => false,
-            8 => true,
+        let size_log2 = match self.instr.memory_size().size() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
             _ => return None,
         };
         if !matches!(
@@ -1486,7 +1486,7 @@ impl X86DecodedInstruction {
         }
         let imm = self.instr.immediate(1) as u32;
         let (base, index, scale, disp) = self.mem_addr()?;
-        Some((is_test, is64, base, index, scale, disp, imm))
+        Some((is_test, size_log2, base, index, scale, disp, imm))
     }
 
     /// A direct near branch: `(None, target)` for `jmp`, `(Some(cc), target)` for a
@@ -1639,6 +1639,26 @@ fn byte_alu_kind(m: iced_x86::Mnemonic) -> Option<u8> {
     })
 }
 
+/// A GPR's operand width as a log2 byte count (gpr8→0, gpr16→1, gpr32→2, gpr64→3);
+/// `None` for a legacy high-byte reg (ah/ch/dh/bh) or a non-GPR. Shared by the
+/// width-aware cmp/test-vs-memory projections.
+fn gpr_size_log2(reg: Register) -> Option<u8> {
+    if matches!(reg, Register::AH | Register::CH | Register::DH | Register::BH) {
+        return None;
+    }
+    if reg.is_gpr8() {
+        Some(0)
+    } else if reg.is_gpr16() {
+        Some(1)
+    } else if reg.is_gpr32() {
+        Some(2)
+    } else if reg.is_gpr64() {
+        Some(3)
+    } else {
+        None
+    }
+}
+
 /// A LOW-byte GPR (al/bl/.../sil/dil/r8b..r15b) → its 0..15 index; `None` for a
 /// legacy high-byte reg (ah/ch/dh/bh — different bit position) or a non-gpr8.
 fn low_gpr8(reg: Register) -> Option<u8> {
@@ -1778,18 +1798,23 @@ mod effects_tests {
         assert_eq!(decode(&[0x48, 0x83, 0xff, 0x05]).cmp_imm64(), Some((7, 5)));
         // test rdi,rdi (48 85 ff) -> test_rr_self64 (7).
         assert_eq!(decode(&[0x48, 0x85, 0xff]).test_rr_self64(), Some(7));
-        // cmpq 42,(rdi) (48 83 3f 2a) -> CMP_MEM_IMM (cmp, is64, base=7, disp 0, imm 42).
+        // cmpq 42,(rdi) (48 83 3f 2a) -> CMP_MEM_IMM (cmp, size_log2=3 qword, base=7, disp 0, imm 42).
         assert_eq!(
             decode(&[0x48, 0x83, 0x3f, 0x2a]).cmp_mem_imm(),
-            Some((false, true, Some(7), None, 0, 0, 42))
+            Some((false, 3, Some(7), None, 0, 0, 42))
         );
-        // cmpl 99,(rdi) (83 3f 63) -> 32-bit memory.
+        // cmpl 99,(rdi) (83 3f 63) -> dword (size_log2=2).
         assert_eq!(
             decode(&[0x83, 0x3f, 0x63]).cmp_mem_imm(),
-            Some((false, false, Some(7), None, 0, 0, 99))
+            Some((false, 2, Some(7), None, 0, 0, 99))
         );
-        // testb (byte) -> 8-bit width rejected.
-        assert_eq!(decode(&[0xf6, 0x07, 0x01]).cmp_mem_imm(), None); // test byte [rdi],1
+        // cmpb 0,(rdi) (80 3f 00) -> byte (size_log2=0).
+        assert_eq!(
+            decode(&[0x80, 0x3f, 0x00]).cmp_mem_imm(),
+            Some((false, 0, Some(7), None, 0, 0, 0))
+        );
+        // test byte [rdi],1 (f6 07 01) -> test, byte.
+        assert_eq!(decode(&[0xf6, 0x07, 0x01]).cmp_mem_imm(), Some((true, 0, Some(7), None, 0, 0, 1)));
         // 32-bit register forms must not match the 64-bit projections.
         assert_eq!(decode(&[0x39, 0xd0]).cmp_rr64(), None); // cmp eax,edx
     }
@@ -1940,15 +1965,20 @@ mod effects_tests {
         assert_eq!(decode(&[0xc7, 0x07, 0x05, 0, 0, 0]).store_imm_mem(), Some((false, Some(7), None, 0, 0, 5)));
         // mov qword[rdi],0 (48 c7 07 ..) -> STORE_IMM 64.
         assert_eq!(decode(&[0x48, 0xc7, 0x07, 0, 0, 0, 0]).store_imm_mem(), Some((true, Some(7), None, 0, 0, 0)));
-        // cmp [rdi],esi (39 37) -> CMP_MEM_REG mem_left, base=7, reg=6.
+        // cmp [rdi],esi (39 37) -> CMP_MEM_REG mem_left, size_log2=2 (dword), base=7, reg=6.
         assert_eq!(
             decode(&[0x39, 0x37]).cmp_mem_reg(),
-            Some((false, false, true, Some(7), None, 0, 0, 6))
+            Some((false, 2, true, Some(7), None, 0, 0, 6))
         );
-        // cmp eax,[rdi] (3b 07) -> reg-left (mem_left=false), reg=0.
+        // cmp eax,[rdi] (3b 07) -> reg-left (mem_left=false), dword, reg=0.
         assert_eq!(
             decode(&[0x3b, 0x07]).cmp_mem_reg(),
-            Some((false, false, false, Some(7), None, 0, 0, 0))
+            Some((false, 2, false, Some(7), None, 0, 0, 0))
+        );
+        // cmp [rdi],sil (40 38 37) -> byte (size_log2=0), mem_left, reg=6.
+        assert_eq!(
+            decode(&[0x40, 0x38, 0x37]).cmp_mem_reg(),
+            Some((false, 0, true, Some(7), None, 0, 0, 6))
         );
         // mov [rip+0],imm (c7 05 .. dword) -> rip_store_imm (not store_imm_mem).
         assert_eq!(decode(&[0xc7, 0x05, 0, 0, 0, 0, 0x07, 0, 0, 0]).store_imm_mem(), None);
