@@ -116,6 +116,15 @@ pub struct MachOLayout {
     /// pointer fields in `__objc_*` sections (the on-disk u64
     /// is a packed fixup descriptor, not the pointer itself).
     pub chained_fixups: Option<MachOLinkeditData>,
+    /// `LC_FUNCTION_STARTS` data range, if present. The contents
+    /// are a ULEB128-encoded stream of *deltas*: the first value
+    /// is the offset of the first function from the text segment's
+    /// vmaddr, each subsequent value the gap to the next function
+    /// start. Present in virtually every linked Mach-O (even
+    /// stripped), so it recovers function bounds when the symbol
+    /// table is gone. The data range is captured here; decoding the
+    /// stream is left to the consumer.
+    pub function_starts: Option<MachOLinkeditData>,
 }
 
 /// Platform + minimum-OS-version triple captured from either
@@ -452,6 +461,7 @@ impl MachOLayout {
         let mut dysymtab: Option<MachODysymtab> = None;
         let mut build_version: Option<MachOBuildVersion> = None;
         let mut chained_fixups: Option<MachOLinkeditData> = None;
+        let mut function_starts: Option<MachOLinkeditData> = None;
 
         let mut cursor = load_commands_offset as usize;
         for _ in 0..ncmds {
@@ -590,6 +600,22 @@ impl MachOLayout {
                             as u64;
                     chained_fixups = Some(MachOLinkeditData { dataoff, datasize });
                 }
+                macho::LC_FUNCTION_STARTS => {
+                    // linkedit_data_command: u32 cmd, cmdsize,
+                    // u32 dataoff, u32 datasize.
+                    if cmdsize < 16 {
+                        return Err(ContainerWriteError::ObjectWrite(
+                            "Mach-O image: LC_FUNCTION_STARTS cmdsize < 16".into(),
+                        ));
+                    }
+                    let dataoff =
+                        u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap())
+                            as u64;
+                    let datasize =
+                        u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap())
+                            as u64;
+                    function_starts = Some(MachOLinkeditData { dataoff, datasize });
+                }
                 macho::LC_BUILD_VERSION => {
                     // build_version_command: u32 cmd, cmdsize,
                     // platform, minos, sdk, ntools. Tool entries
@@ -666,6 +692,7 @@ impl MachOLayout {
             dysymtab,
             build_version,
             chained_fixups,
+            function_starts,
         })
     }
 
