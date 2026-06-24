@@ -331,12 +331,22 @@ pub(crate) fn symbol_needs_relocation(
     use crate::container::SymbolKind;
     let symbol = container.symbol(id);
     if symbol.is_undefined {
-        let has_plt_stub = container
+        // An undefined import is callable without a relocation when the image
+        // carries an in-range trampoline for it: an ELF PLT stub or a Mach-O
+        // `__stubs` entry. `callable_address_of_symbol` folds the branch to that
+        // trampoline's address (in the original text range, so in branch range),
+        // which is what lets a relocated body keep calling libc. Final images have
+        // no subsequent linker, so a deferred relocation would never be applied —
+        // folding is the only correct option.
+        let has_stub = container
             .elf_image
             .as_ref()
-            .map(|img| img.plt_stubs.contains_key(&id))
-            .unwrap_or(false);
-        return !has_plt_stub;
+            .is_some_and(|img| img.plt_stubs.contains_key(&id))
+            || container
+                .macho_image
+                .as_ref()
+                .is_some_and(|img| img.stubs.contains_key(&id));
+        return !has_stub;
     }
     // Appended code (e.g. via `add_function_from_plan`) has no owning section:
     // it's being folded into a final, fully-linked image with no subsequent
