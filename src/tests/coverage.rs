@@ -66,10 +66,14 @@ fn addsub_ext_group_is_complete() {
 fn dp1src_group_is_complete() {
     let summary = aarch64::opcode_class_summary("Dp1src");
 
-    assert_eq!(summary.row_count, 8);
+    assert_eq!(summary.row_count, 26);
     assert_eq!(
         summary.mnemonics,
-        vec!["cls", "clz", "rbit", "rev", "rev16", "rev32", "rev64"]
+        vec![
+            "autda", "autdb", "autdza", "autdzb", "autia", "autib", "autiza", "autizb", "cls",
+            "clz", "pacda", "pacdb", "pacdza", "pacdzb", "pacia", "pacib", "paciza", "pacizb",
+            "rbit", "rev", "rev16", "rev32", "rev64", "xpacd", "xpaci"
+        ]
     );
 
     assert_fixture_covers_exact_cases(
@@ -276,8 +280,14 @@ fn testbranch_group_is_complete() {
 fn branch_reg_group_is_complete() {
     let summary = aarch64::opcode_class_summary("BranchReg");
 
-    assert_eq!(summary.row_count, 5);
-    assert_eq!(summary.mnemonics, vec!["blr", "br", "drps", "eret", "ret"]);
+    assert_eq!(summary.row_count, 15);
+    assert_eq!(
+        summary.mnemonics,
+        vec![
+            "blr", "blraa", "blraaz", "blrab", "blrabz", "br", "braa", "braaz", "brab", "brabz",
+            "drps", "eret", "ret", "retaa", "retab"
+        ]
+    );
 
     assert_fixture_covers_exact_cases(
         BRANCH_OTOOL_FIXTURE,
@@ -435,6 +445,7 @@ fn operand_kind_coverage_snapshot() {
             "Prfop",
             "Pstatefield",
             "RmExt",
+            "RmLow",
             "RtSys",
             "Sd",
             "ShllImm",
@@ -574,7 +585,7 @@ fn operand_kind_coverage_snapshot() {
         "all direct operand-specific tests should be removed from the not-direct-tested list"
     );
     assert_eq!(coverage.unimplemented, Vec::<&'static str>::new());
-    assert_eq!(coverage.table_operand_kinds.len(), 87);
-    assert_eq!(coverage.implemented.len(), 87);
+    assert_eq!(coverage.table_operand_kinds.len(), 88);
+    assert_eq!(coverage.implemented.len(), 88);
     assert_eq!(coverage.unimplemented.len(), 0);
 }

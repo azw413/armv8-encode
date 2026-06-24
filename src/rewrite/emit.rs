@@ -218,7 +218,20 @@ fn verbatim_bytes<I: Isa>(
     }
     let off = usize::try_from(orig_addr.checked_sub(section.address)?).ok()?;
     let tail = section.bytes.get(off..)?;
-    let decoded = I::decode(orig_addr, tail)?;
+    let Some(decoded) = I::decode(orig_addr, tail) else {
+        // The source word doesn't decode (an instruction outside the decoder's
+        // coverage that a tolerant lift carried as a placeholder). At its own
+        // unchanged address its original bytes ARE the correct emission — copy
+        // them verbatim. Only safe at the original address: a relocated copy of
+        // an undecodable word can't be checked for position-independence.
+        if orig_addr != emit_addr {
+            return None;
+        }
+        // The placeholder carries the ISA's instruction width via its mnemonic
+        // (a fixed-width `Nop` on the AArch64 tolerant path → 4 bytes).
+        let size = I::instruction_source_size(instruction.mnemonic) as usize;
+        return tail.get(..size).map(<[u8]>::to_vec);
+    };
 
     // Unmodified: same mnemonic and every operand still matches the original.
     if I::decoded_mnemonic(&decoded) != instruction.mnemonic {

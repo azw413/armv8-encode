@@ -86,6 +86,7 @@ pub(super) const DIRECT_TESTED_OPERAND_KINDS: &[&str] = &[
     "Pstatefield",
     "Prfop",
     "RmExt",
+    "RmLow",
     "RtSys",
     "Sd",
     "Sm",

@@ -11,7 +11,9 @@
 //! padding) belongs in a future recursive-descent pass that has section and
 //! relocation context.
 
-use crate::isa::aarch64::{decode_instruction, DecodeError, DecodedInstruction, Word};
+use crate::isa::aarch64::{
+    decode_instruction, Aarch64Mnemonic, DecodeError, DecodedInstruction, Word,
+};
 
 const INSTRUCTION_BYTES: usize = 4;
 
@@ -62,4 +64,54 @@ pub fn disassemble_bytes(
     }
 
     Ok(out)
+}
+
+/// Best-effort linear sweep: like [`disassemble_bytes`], but instead of aborting
+/// on the first word that doesn't decode, it substitutes a placeholder `NOP`
+/// (preserving the original `word`) and records the failing address, then
+/// continues. Returns the decoded stream plus the sorted list of addresses whose
+/// words could not be decoded.
+///
+/// This lets a caller lift an entire section that contains a few instructions
+/// outside the decoder's coverage (e.g. newer SIMD / atomic encodings) without
+/// failing the whole job. The placeholder is a real `NOP` so CFG construction and
+/// downstream analysis stay well-formed — but it does NOT round-trip the original
+/// bytes, so the caller MUST avoid emitting any function that overlaps a returned
+/// `(address, word)` (leave it native / verbatim). The original `word` is
+/// returned (and retained on the placeholder) so callers can diagnose what was
+/// skipped.
+pub fn disassemble_bytes_tolerant(
+    base_address: u64,
+    bytes: &[u8],
+) -> Result<(Vec<DecodedInstruction>, Vec<(u64, Word)>), DisassembleError> {
+    if bytes.len() % INSTRUCTION_BYTES != 0 {
+        return Err(DisassembleError::UnalignedLength {
+            length: bytes.len(),
+        });
+    }
+
+    let count = bytes.len() / INSTRUCTION_BYTES;
+    let mut out = Vec::with_capacity(count);
+    let mut undecodable = Vec::new();
+
+    for (index, chunk) in bytes.chunks_exact(INSTRUCTION_BYTES).enumerate() {
+        let address = base_address.wrapping_add((index as u64) * INSTRUCTION_BYTES as u64);
+        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        match decode_instruction(address, word) {
+            Ok(instruction) => out.push(instruction),
+            Err(_) => {
+                undecodable.push((address, word));
+                // Placeholder NOP retaining the original word. Never emitted —
+                // the caller excludes any function overlapping `undecodable`.
+                out.push(DecodedInstruction {
+                    address,
+                    word,
+                    mnemonic: Aarch64Mnemonic::Nop,
+                    operands: Vec::new(),
+                });
+            }
+        }
+    }
+
+    Ok((out, undecodable))
 }

@@ -19,7 +19,7 @@ pub use control_flow::{invert_conditional_branch, pcrel_range_bytes};
 pub use recursive::{
     disassemble_recursive, DataRange, DataReason, Disassembly, TimelineEntry,
 };
-pub use sweep::{disassemble_bytes, DisassembleError};
+pub use sweep::{disassemble_bytes, disassemble_bytes_tolerant, DisassembleError};
 
 use operand::{
     decode_operand, encode_operand, w_reg, DecodeContext, EncodeContext, IMPLEMENTED_OPERAND_KINDS,

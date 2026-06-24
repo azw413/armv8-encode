@@ -317,6 +317,8 @@ pub enum Aarch64Opnd {
     Rd,      /* Integer register as destination.  */
     Rn,      /* Integer register as source.  */
     Rm,      /* Integer register as source.  */
+    RmLow,   /* Integer source register in bits[4:0] — the PAuth branch modifier
+                in braa/blraa Xn,Xm, where Rm is the low field not [20:16].  */
     Rt,      /* Integer register used in ld/st instructions.  */
     Rt2,     /* Integer register used in ld/st pair instructions.  */
     Rs,      /* Integer register used in ld/st exclusive.  */
@@ -668,7 +670,7 @@ pub fn operand_bit_ranges(kind: Aarch64Opnd) -> Vec<std::ops::Range<u8>> {
     match kind {
         Nil | Pairreg | Imm0 | Fpimm0 | BarrierPsb | ShllImm => Vec::new(),
         // Rd-family: bits 0..5
-        Rd | RdSp | Rt | RtSys | Fd | Ft | Sd | Vd | VdD1 | Lvt | LvtAl | Let => vec![0..5],
+        Rd | RdSp | RmLow | Rt | RtSys | Fd | Ft | Sd | Vd | VdD1 | Lvt | LvtAl | Let => vec![0..5],
         // Rn-family: bits 5..10
         Rn | RnSp | Fn | Sn | Vn | VnD1 | Lvn => vec![5..10],
         // Rm-family: bits 16..21
@@ -865,7 +867,7 @@ const fn Aarch64Opcode(
     }
 }
 
-static aarch64_opcode_table: [Aarch64Opcode; 1157] = [
+static aarch64_opcode_table: [Aarch64Opcode; 1208] = [
     Aarch64Opcode(
         "adc",
         0x1a000000,
@@ -5868,6 +5870,22 @@ static aarch64_opcode_table: [Aarch64Opcode; 1157] = [
     ),
     Aarch64Opcode("eret", 0xd69f03e0, 0xffffffff, BranchReg, Op0, 0),
     Aarch64Opcode("drps", 0xd6bf03e0, 0xffffffff, BranchReg, Op0, 0),
+    // Pointer-authenticated branch-register forms (FEAT_PAuth). Zero-modifier
+    // (`*z`) forms have `Rm` fixed at `11111` and branch through `Rn`; the
+    // two-register forms authenticate `Rn` against the modifier in `Rm`.
+    // Recognised so a consumer can rewrite them to plain `br`/`blr` when
+    // stripping PAuth from ingested code.
+    Aarch64Opcode("braaz", 0xd61f081f, 0xfffffc1f, BranchReg, Op1(Rn), 0),
+    Aarch64Opcode("brabz", 0xd61f0c1f, 0xfffffc1f, BranchReg, Op1(Rn), 0),
+    Aarch64Opcode("blraaz", 0xd63f081f, 0xfffffc1f, BranchReg, Op1(Rn), 0),
+    Aarch64Opcode("blrabz", 0xd63f0c1f, 0xfffffc1f, BranchReg, Op1(Rn), 0),
+    Aarch64Opcode("braa", 0xd71f0800, 0xffe0fc00, BranchReg, Op2(Rn, RmLow), 0),
+    Aarch64Opcode("brab", 0xd71f0c00, 0xffe0fc00, BranchReg, Op2(Rn, RmLow), 0),
+    Aarch64Opcode("blraa", 0xd73f0800, 0xffe0fc00, BranchReg, Op2(Rn, RmLow), 0),
+    Aarch64Opcode("blrab", 0xd73f0c00, 0xffe0fc00, BranchReg, Op2(Rn, RmLow), 0),
+    // RET-with-auth (zero operands; LR + SP implied).
+    Aarch64Opcode("retaa", 0xd65f0bff, 0xffffffff, BranchReg, Op0, 0),
+    Aarch64Opcode("retab", 0xd65f0fff, 0xffffffff, BranchReg, Op0, 0),
     Aarch64Opcode(
         "cbz",
         0x34000000,
@@ -6095,6 +6113,33 @@ static aarch64_opcode_table: [Aarch64Opcode; 1157] = [
     Aarch64Opcode("clz", 0x5ac01000, 0x7ffffc00, Dp1src, Op2(Rd, Rn), F_SF),
     Aarch64Opcode("cls", 0x5ac01400, 0x7ffffc00, Dp1src, Op2(Rd, Rn), F_SF),
     Aarch64Opcode("rev32", 0xdac00800, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    // Pointer Authentication (FEAT_PAuth), data-processing 1-source forms.
+    // Two-register forms sign/authenticate the pointer in `Rd` against the
+    // modifier in `Rn` (`pacia Xd,Xn`). The decoder recognises them so a
+    // consumer can strip PAuth from ingested code (see the `*z` zero-modifier
+    // variants below); encode is symmetric but unused by that path.
+    Aarch64Opcode("pacia", 0xdac10000, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("pacib", 0xdac10400, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("pacda", 0xdac10800, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("pacdb", 0xdac10c00, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("autia", 0xdac11000, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("autib", 0xdac11400, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("autda", 0xdac11800, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    Aarch64Opcode("autdb", 0xdac11c00, 0xfffffc00, Dp1src, Op2(Rd, Rn), 0),
+    // Zero-modifier variants (`Rn` field is the fixed `11111`; only `Rd` varies).
+    // `paciza Xd` etc. — these dominate real arm64e prologues alongside the
+    // `*sp` hint forms below.
+    Aarch64Opcode("paciza", 0xdac123e0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("pacizb", 0xdac127e0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("pacdza", 0xdac12be0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("pacdzb", 0xdac12fe0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("autiza", 0xdac133e0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("autizb", 0xdac137e0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("autdza", 0xdac13be0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("autdzb", 0xdac13fe0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    // Strip-PAC (no key check), zero-modifier: `xpaci Xd` / `xpacd Xd`.
+    Aarch64Opcode("xpaci", 0xdac143e0, 0xffffffe0, Dp1src, Op1(Rd), 0),
+    Aarch64Opcode("xpacd", 0xdac147e0, 0xffffffe0, Dp1src, Op1(Rd), 0),
     Aarch64Opcode(
         "udiv",
         0x1ac00800,
@@ -8356,6 +8401,49 @@ static aarch64_opcode_table: [Aarch64Opcode; 1157] = [
         Op3(Rs, Rt, AddrSimple),
         F_LSE_SZ,
     ),
+    // LDAPR — Load-Acquire RCpc Register (FEAT_LRCPC). Base register only.
+    // Word/doubleword share one row via F_LSE_SZ (size LSB variable); byte and
+    // halfword are explicit rows.
+    Aarch64Opcode(
+        "ldapr",
+        0xb8bfc000,
+        0xbffffc00,
+        LseAtomic,
+        Op2(Rt, AddrSimple),
+        F_LSE_SZ,
+    ),
+    Aarch64Opcode(
+        "ldaprb",
+        0x38bfc000,
+        0xfffffc00,
+        LseAtomic,
+        Op2(Rt, AddrSimple),
+        0,
+    ),
+    Aarch64Opcode(
+        "ldaprh",
+        0x78bfc000,
+        0xfffffc00,
+        LseAtomic,
+        Op2(Rt, AddrSimple),
+        0,
+    ),
+    // LDAPUR / STLUR — unscaled acquire/release load/store (FEAT_LRCPC2). One row
+    // per size/sign form; `[11:10] = 00` (offset mode, no writeback), so the
+    // `LdstUnscaled` class + `AddrSimm9` decode/encode an offset address. The mask
+    // pins `[11:10] = 00` so these never collide with the pre/post-index
+    // `ldur`/`stur` forms.
+    Aarch64Opcode("stlurb", 0x19000000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapurb", 0x19400000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapursb", 0x19800000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("stlurh", 0x59000000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapurh", 0x59400000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapursh", 0x59800000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("stlur", 0x99000000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapur", 0x99400000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapursw", 0x99800000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("stlur", 0xd9000000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
+    Aarch64Opcode("ldapur", 0xd9400000, 0xffe00c00, LdstUnscaled, Op2(Rt, AddrSimm9), 0),
     Aarch64Opcode(
         "ldaddb",
         0x38200000,
@@ -9587,6 +9675,20 @@ static aarch64_opcode_table: [Aarch64Opcode; 1157] = [
     Aarch64Opcode("sev", 0xd503209f, 0xffffffff, IcSystem, Op0, F_ALIAS),
     Aarch64Opcode("sevl", 0xd50320bf, 0xffffffff, IcSystem, Op0, F_ALIAS),
     Aarch64Opcode("esb", 0xd503221f, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    // Pointer-Authentication hint-space forms (FEAT_PAuth): sign/authenticate
+    // LR (X30) with SP (`*sp`) or zero (`*z`) as the modifier, plus `xpaclri`.
+    // These alias the generic `hint #imm` like the other named hints; they are
+    // the canonical function prologue/epilogue PAuth pair in arm64e. Recognised
+    // so a consumer can `nop` them when stripping PAuth from ingested code.
+    Aarch64Opcode("paciaz", 0xd503231f, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("paciasp", 0xd503233f, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("pacibz", 0xd503235f, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("pacibsp", 0xd503237f, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("autiaz", 0xd503239f, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("autiasp", 0xd50323bf, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("autibz", 0xd50323df, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("autibsp", 0xd50323ff, 0xffffffff, IcSystem, Op0, F_ALIAS),
+    Aarch64Opcode("xpaclri", 0xd50320ff, 0xffffffff, IcSystem, Op0, F_ALIAS),
     Aarch64Opcode(
         "psb",
         0xd503223f,
@@ -9861,48 +9963,54 @@ fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
         "dc" => matches!(system_op_fields(instruction), (3, 7, 4, 1)),
         "ic" => matches!(system_op_fields(instruction), (3, 7, 5, 1) | (0, 7, 5, 0)),
         "tlbi" => matches!(system_op_fields(instruction), (0, 8, 7, 5) | (0, 8, 7, 0)),
-        "ld1" | "st1"
+        "ld1" | "st1" | "ld2" | "st2" | "ld3" | "st3" | "ld4" | "st4"
             if matches!(
                 opcode.iclass,
                 Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
             ) =>
         {
-            matches!(simd_ldst_list_count(instruction), Some(1 | 2))
-        }
-        "ld2" | "st2"
-            if matches!(
-                opcode.iclass,
-                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
-            ) =>
-        {
-            simd_ldst_list_count(instruction) == Some(2)
-        }
-        "ld3" | "st3"
-            if matches!(
-                opcode.iclass,
-                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
-            ) =>
-        {
-            simd_ldst_list_count(instruction) == Some(3)
-        }
-        "ld4" | "st4"
-            if matches!(
-                opcode.iclass,
-                Aarch64InsnClass::Asisdlse | Aarch64InsnClass::Asisdlsep
-            ) =>
-        {
-            simd_ldst_list_count(instruction) == Some(4)
+            // The four ld/st multi-structure rows share one opcode+mask; the
+            // structure form is selected by the opcode[15:12] field. A row
+            // applies iff its structure digit (the `1`..`4` in ld1..ld4 /
+            // st1..st4) matches what that field encodes.
+            simd_ldst_list_digit(instruction)
+                .is_some_and(|d| opcode.mnemonic().ends_with(d))
         }
         _ => true,
     }
 }
 
-fn simd_ldst_list_count(instruction: Aarch64Insn) -> Option<u32> {
-    match (instruction >> 12) & 0xf {
-        0x7 => Some(1),
-        0xa => Some(2),
-        _ => None,
-    }
+/// For an AdvSIMD load/store **multiple structures** instruction, the structure
+/// digit selected by `opcode[15:12]` (`"1".."4"`, the trailing digit of the
+/// ld1..ld4 / st1..st4 mnemonic), or `None` if the field isn't a valid
+/// multi-structure encoding. Per Arm ARM C4.1.96.
+fn simd_ldst_list_digit(instruction: Aarch64Insn) -> Option<&'static str> {
+    Some(match (instruction >> 12) & 0xf {
+        0b0000 => "4", // 4 regs, 4-element structures
+        0b0010 => "1", // 1-element, 4 regs
+        0b0100 => "3", // 3-element structures
+        0b0110 => "1", // 1-element, 3 regs
+        0b0111 => "1", // 1-element, 1 reg
+        0b1000 => "2", // 2-element structures
+        0b1010 => "1", // 1-element, 2 regs
+        _ => return None,
+    })
+}
+
+/// Number of registers in the list for an AdvSIMD load/store multiple-structures
+/// instruction, derived from `opcode[15:12]`. ld2/3/4 list 2/3/4 registers; ld1
+/// lists 1/2/3/4 depending on the encoding.
+pub(crate) fn simd_ldst_list_count(instruction: Aarch64Insn) -> Option<u32> {
+    Some(match (instruction >> 12) & 0xf {
+        0b0000 => 4, // ld4/st4
+        0b0010 => 4, // ld1/st1, 4 regs
+        0b0100 => 3, // ld3/st3
+        0b0110 => 3, // ld1/st1, 3 regs
+        0b0111 => 1, // ld1/st1, 1 reg
+        0b1000 => 2, // ld2/st2
+        0b1010 => 2, // ld1/st1, 2 regs
+        _ => return None,
+    })
 }
 
 fn system_op_fields(instruction: Aarch64Insn) -> (u32, u32, u32, u32) {

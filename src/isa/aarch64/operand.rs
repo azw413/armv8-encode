@@ -200,6 +200,8 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Rd => Ok(DecodedOperand::Register(rd_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::Rn => Ok(DecodedOperand::Register(rn_reg(ctx.word, ctx.opcode))),
             Aarch64Opnd::Rm => Ok(DecodedOperand::Register(rm_reg(ctx.word, ctx.opcode))),
+            // PAuth branch modifier lives in bits[4:0] (always X-class).
+            Aarch64Opnd::RmLow => Ok(DecodedOperand::Register(x_reg(rd(ctx.word)))),
             Aarch64Opnd::RmSft => Ok(DecodedOperand::ShiftedRegister(rm_shifted(ctx.word))),
             Aarch64Opnd::RmExt => Ok(DecodedOperand::ExtendedRegister(rm_extended(ctx.word))),
             Aarch64Opnd::RdSp => Ok(DecodedOperand::Register(gp_or_sp(rd(ctx.word), ctx.word))),
@@ -389,6 +391,7 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Rd => encode_rd_register(self, operand, ctx.opcode),
             Aarch64Opnd::Rn => encode_gp_register(self, operand, 5),
             Aarch64Opnd::Rm => encode_gp_register(self, operand, 16),
+            Aarch64Opnd::RmLow => encode_gp_register(self, operand, 0),
             Aarch64Opnd::RdSp => encode_gp_or_sp_register(self, operand, 0),
             Aarch64Opnd::RnSp => encode_gp_or_sp_register(self, operand, 5),
             Aarch64Opnd::Ra => encode_gp_register(self, operand, 10),
@@ -415,8 +418,8 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::Ed => encode_vector_element(self, operand, ctx.opcode, 0),
             Aarch64Opnd::En => encode_vector_element(self, operand, ctx.opcode, 5),
             Aarch64Opnd::Em => encode_vector_element(self, operand, ctx.opcode, 16),
-            Aarch64Opnd::Lvn => encode_vector_list(self, operand, 5),
-            Aarch64Opnd::Lvt => encode_vector_list(self, operand, 0),
+            Aarch64Opnd::Lvn => encode_vector_list(self, operand, 5, ctx.opcode),
+            Aarch64Opnd::Lvt => encode_vector_list(self, operand, 0, ctx.opcode),
             Aarch64Opnd::LvtAl => encode_vector_list_all_lanes(self, operand),
             Aarch64Opnd::Let => encode_vector_element_list(self, operand),
             Aarch64Opnd::Pairreg => encode_pair_register(self, operand),
@@ -504,6 +507,7 @@ impl Aarch64Opnd {
             Aarch64Opnd::Rd => "Rd",
             Aarch64Opnd::Rn => "Rn",
             Aarch64Opnd::Rm => "Rm",
+            Aarch64Opnd::RmLow => "RmLow",
             Aarch64Opnd::Rt => "Rt",
             Aarch64Opnd::Rt2 => "Rt2",
             Aarch64Opnd::Rs => "Rs",
@@ -597,6 +601,7 @@ pub(crate) const IMPLEMENTED_OPERAND_KINDS: &[&str] = &[
     "Rd",
     "Rn",
     "Rm",
+    "RmLow",
     "RmExt",
     "RmSft",
     "RdSp",
@@ -1340,6 +1345,7 @@ fn encode_vector_list(
     kind: Aarch64Opnd,
     operand: &DecodedOperand,
     bit_offset: u8,
+    opcode_row: &Aarch64Opcode,
 ) -> Result<Word, EncodeError> {
     let DecodedOperand::VectorList(list) = operand else {
         return Err(EncodeError::InvalidOperand { kind: kind.name() });
@@ -1350,12 +1356,27 @@ fn encode_vector_list(
     let (q, size) = vector_arrangement_bits(list.arrangement);
 
     if bit_offset == 0 {
-        let opcode = match list.count {
-            1 => 0x7,
-            2 => 0xa,
-            3 => 0x6,
-            4 => 0x2,
-            _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+        // opcode[15:12] selects the structure form. ld2/ld3/ld4 are interleaved
+        // (one opcode each); ld1/st1 is contiguous and the opcode encodes the
+        // register count. The list count alone can't tell ld1-with-2-regs (0xa)
+        // from ld2 (0x8), so use the mnemonic's structure digit to pick the
+        // interleaved forms.
+        let mnemonic = opcode_row.mnemonic();
+        let opcode = if mnemonic.ends_with('2') {
+            0x8
+        } else if mnemonic.ends_with('3') {
+            0x4
+        } else if mnemonic.ends_with('4') {
+            0x0
+        } else {
+            // ld1 / st1: contiguous, opcode encodes register count.
+            match list.count {
+                1 => 0x7,
+                2 => 0xa,
+                3 => 0x6,
+                4 => 0x2,
+                _ => return Err(EncodeError::InvalidOperand { kind: kind.name() }),
+            }
         };
         return Ok((q << 30)
             | (size << 10)
@@ -2307,10 +2328,10 @@ fn vector_list(word: Word) -> VectorList {
 }
 
 fn simd_ldst_list(word: Word) -> VectorList {
-    let opcode = (word >> 12) & 0xf;
     VectorList {
         first: rt(word),
-        count: if opcode == 0xa { 2 } else { 1 },
+        // Register-list length from opcode[15:12] (ld1: 1/2/3/4, ld2/3/4: 2/3/4).
+        count: super::table::simd_ldst_list_count(word).unwrap_or(1) as u8,
         arrangement: vector_arrangement_from_parts((word >> 30) & 0x1, (word >> 10) & 0x3),
         element: None,
     }

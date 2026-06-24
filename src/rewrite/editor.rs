@@ -1207,6 +1207,51 @@ impl BinaryEditor {
         Ok(())
     }
 
+    /// AArch64 tolerant lift: like [`Self::lift_text_section`], but words the
+    /// decoder doesn't recognise become placeholder `NOP`s (the lift never fails
+    /// on an unsupported encoding), and their addresses are returned. The caller
+    /// MUST NOT rewrite any function overlapping a returned address — the
+    /// placeholders don't round-trip, so those functions must be left verbatim.
+    /// Non-AArch64 containers fall back to the strict [`Self::lift_text_section`]
+    /// and return an empty list (other ISAs have no tolerant sweep yet).
+    pub fn lift_text_section_tolerant(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<(u64, u32)>, TextEditorError> {
+        if !matches!(self.binary.container.architecture, Architecture::Aarch64) {
+            self.lift_text_section(name)?;
+            return Ok(Vec::new());
+        }
+        let section = self
+            .binary
+            .container
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| TextEditorError::SectionNotFound(name.to_string()))?;
+        let (base, code) = section
+            .for_disassembly()
+            .ok_or_else(|| TextEditorError::SectionNotText { name: name.to_string() })?;
+        let section_id = section.id;
+
+        let (instructions, undecodable) = aarch64::disassemble_bytes_tolerant(base, code)?;
+        let cfg = build_cfg(&instructions);
+        let plan = RewritePlanGeneric::<Aarch64Isa>::lift_from_decoded_with_container(
+            &cfg,
+            &instructions,
+            &self.binary.container,
+        );
+        self.text = Some(LiftedTextSectionAny::Aarch64(LiftedTextSection {
+            section_id,
+            base_address: base,
+            instructions,
+            cfg,
+            plan,
+            overlays: Vec::new(),
+        }));
+        Ok(undecodable)
+    }
+
     /// Prepare an x86/x86-64 text section for **byte-patch mode**: record its
     /// id/base/bitness WITHOUT disassembling it (so a real `.text` with embedded
     /// data/jump-tables doesn't trip the fail-fast sweep). The section is written
@@ -1297,6 +1342,22 @@ impl BinaryEditor {
         let mut editor = Self::new(container)?;
         editor.lift_text_section(name)?;
         Ok(editor)
+    }
+
+    /// Like [`Self::for_section`], but tolerant of undecodable instructions
+    /// (AArch64 only): words the decoder doesn't recognise are lifted as
+    /// placeholder `NOP`s and their `(address, word)` returned, instead of failing
+    /// the whole lift. The caller MUST avoid rewriting any function that overlaps a
+    /// returned address — those placeholders don't round-trip, so the function's
+    /// original bytes must be left verbatim. For non-AArch64 containers this is
+    /// identical to [`Self::for_section`] and always returns an empty list.
+    pub fn for_section_tolerant(
+        container: &Container,
+        name: &str,
+    ) -> Result<(Self, Vec<(u64, u32)>), TextEditorError> {
+        let mut editor = Self::new(container)?;
+        let undecodable = editor.lift_text_section_tolerant(name)?;
+        Ok((editor, undecodable))
     }
 
     /// Place raw `data` (e.g. a constant pool or encrypted blob) into a freed

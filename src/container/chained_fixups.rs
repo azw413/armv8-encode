@@ -1239,7 +1239,7 @@ fn build_starts_in_segment(
         payload.extend_from_slice(&22u32.to_le_bytes()); // size
         payload.extend_from_slice(&(sf.page_size as u16).to_le_bytes());
         payload.extend_from_slice(&pointer_format.to_raw().to_le_bytes());
-        payload.extend_from_slice(&0u64.to_le_bytes()); // segment_offset
+        payload.extend_from_slice(&seg.fileoff.to_le_bytes()); // segment_offset (file offset)
         payload.extend_from_slice(&0u32.to_le_bytes()); // max_valid_pointer
         payload.extend_from_slice(&0u16.to_le_bytes()); // page_count
         return Ok(payload);
@@ -1297,7 +1297,10 @@ fn build_starts_in_segment(
     payload.extend_from_slice(&(size as u32).to_le_bytes());
     payload.extend_from_slice(&(sf.page_size as u16).to_le_bytes());
     payload.extend_from_slice(&pointer_format.to_raw().to_le_bytes());
-    payload.extend_from_slice(&0u64.to_le_bytes()); // segment_offset
+    // segment_offset: the segment's FILE offset, where dyld begins walking this
+    // segment's pointer chains. Must be the real fileoff (not 0) or dyld walks
+    // from the start of the file, never touches the slots, and applies no fixups.
+    payload.extend_from_slice(&seg.fileoff.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes()); // max_valid_pointer
     payload.extend_from_slice(&(page_count as u16).to_le_bytes());
     for ps in &page_starts {
