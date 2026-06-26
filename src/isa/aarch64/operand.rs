@@ -54,6 +54,7 @@ pub enum RegisterClass {
     H,
     S,
     D,
+    Q,
     W,
     X,
     WOrSp,
@@ -2171,7 +2172,7 @@ fn rt_reg(word: Word, opcode: &Aarch64Opcode) -> Register {
     match opcode.mnemonic() {
         mnemonic if is_casp(mnemonic) => lse_pair_reg(rt(word), word),
         "cbz" | "cbnz" => gp_reg(rt(word), word),
-        "str" | "ldr" if ((word >> 26) & 0x3f) == 0b111101 => fp_reg(rt(word), word),
+        "str" | "ldr" if ((word >> 26) & 0x3f) == 0b111101 => fp_ldst_reg(rt(word), word),
         "ldr" if (word >> 31) & 1 == 0 && (word >> 30) & 1 == 0 => w_reg(rt(word)),
         "str" | "ldr" if ((word >> 30) & 0x3) == 0b10 => w_reg(rt(word)),
         "strb" | "ldrb" | "strh" | "ldrh" | "sturb" | "ldurb" | "sturh" | "ldurh" => {
@@ -2272,6 +2273,31 @@ fn lse_pair_reg(reg: u8, word: Word) -> Register {
     }
 }
 
+/// The access width (class + scale shift) for a single SIMD&FP *load/store*. The
+/// width is selected by `(opc<1> << 2) | size`: 0=B, 1=H, 2=S, 3=D, 4=Q. This is a
+/// different layout from the `ftype` (bits 23:22) used by FP *arithmetic* — see
+/// [`fp_reg`] — so load/stores must use this, not `fp_reg`.
+fn fp_ldst_width(word: Word) -> (RegisterClass, u32) {
+    let size = (word >> 30) & 0x3;
+    let opc1 = (word >> 23) & 0x1; // bit 23 = opc<1>
+    match (opc1 << 2) | size {
+        0 => (RegisterClass::B, 0),
+        1 => (RegisterClass::H, 1),
+        2 => (RegisterClass::S, 2),
+        3 => (RegisterClass::D, 3),
+        _ => (RegisterClass::Q, 4), // (opc1<<2)|size == 4
+    }
+}
+
+/// The register width for a single SIMD&FP *load/store* (`ldr q0`, `str d0`, …).
+fn fp_ldst_reg(reg: u8, word: Word) -> Register {
+    let (class, _) = fp_ldst_width(word);
+    Register { class, index: reg }
+}
+
+/// The register width for an FP *data-processing* operand (`fmov`/`fadd`/…),
+/// selected by `ftype` (bits 23:22): 01=D, otherwise S (H handled elsewhere).
+/// Load/stores use [`fp_ldst_reg`] — a different width encoding.
 fn fp_reg(reg: u8, word: Word) -> Register {
     let class = if ((word >> 22) & 0x3) == 1 {
         RegisterClass::D
@@ -2287,9 +2313,12 @@ fn ft_reg(reg: u8, word: Word, opcode: &Aarch64Opcode) -> Register {
         opcode.class_name(),
         "LdstnapairOffs" | "LdstpairOff" | "LdstpairIndexed"
     ) {
+        // Load/store *pair*: width from the pair opc field.
         fp_load_store_reg(reg, word)
     } else {
-        fp_reg(reg, word)
+        // Single FP/SIMD load/store (Ft is only used by load/store classes):
+        // width from the (opc<1> << 2) | size selector, not the FP-arith ftype.
+        fp_ldst_reg(reg, word)
     }
 }
 
@@ -2528,10 +2557,13 @@ fn arrangement_from_element_size_and_q(size: VectorElementSize, word: Word) -> V
     }
 }
 
+/// Register width for a SIMD&FP load/store *pair* (`ldp`/`stp`), selected by the
+/// `opc` field (bits 31:30): 0=S (32-bit), 1=D (64-bit), 2=Q (128-bit).
 fn fp_load_store_reg(reg: u8, word: Word) -> Register {
     let class = match (word >> 30) & 0x3 {
         0 => RegisterClass::S,
-        _ => RegisterClass::D,
+        1 => RegisterClass::D,
+        _ => RegisterClass::Q,
     };
 
     Register { class, index: reg }
@@ -2882,7 +2914,15 @@ fn imm26(word: Word) -> i64 {
 }
 
 fn simm7_pair_offset(word: Word) -> i64 {
-    sign_extend(((word >> 15) & 0x7f) as i64, 7) << 3
+    let imm7 = sign_extend(((word >> 15) & 0x7f) as i64, 7);
+    // The pair offset is scaled by the access width. For a GP pair (V bit 26
+    // clear) the width is opc<1> (bit 31): 0=W (<<2), 1=X (<<3). For a SIMD&FP
+    // pair (V set) the width is the full opc field (bits 31:30): 0=S (<<2),
+    // 1=D (<<3), 2=Q (<<4).
+    let opc = (word >> 30) & 0x3;
+    let is_fp = (word >> 26) & 1 == 1;
+    let scale = if is_fp { 2 + opc } else { 2 + (opc >> 1) };
+    imm7 << scale
 }
 
 fn simm9_offset(word: Word) -> i64 {
@@ -2898,14 +2938,27 @@ fn simm9_addressing_mode(word: Word) -> AddressingMode {
 }
 
 fn uimm12_offset(word: Word) -> i64 {
-    let size = ((word >> 30) & 0x3) as i64;
     let imm = ((word >> 10) & 0xfff) as i64;
-    imm << size
+    // The scale is the access width. For a SIMD&FP load/store (V bit 26 set) the
+    // width is selected by (opc<1> << 2) | size — so a 128-bit (Q) access scales
+    // the immediate by 16 (shift 4), not the `size`-only shift a GP access uses.
+    let scale = if (word >> 26) & 1 == 1 {
+        fp_ldst_width(word).1 as i64
+    } else {
+        ((word >> 30) & 0x3) as i64
+    };
+    imm << scale
 }
 
 fn regoff_shift(word: Word) -> Option<Shift> {
-    let amount = if (word >> 12) & 1 == 0 {
-        0
+    // The S bit (12) enables a scaled register offset; the shift amount is the
+    // access-size log2. For a SIMD&FP load/store (V bit 26) that width comes from
+    // the (opc<1> << 2) | size selector (so a Q access shifts by 4), not `size`.
+    if (word >> 12) & 1 == 0 {
+        return None;
+    }
+    let amount = if (word >> 26) & 1 == 1 {
+        fp_ldst_width(word).1 as u8
     } else {
         ((word >> 30) & 0x3) as u8
     };

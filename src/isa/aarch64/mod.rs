@@ -944,6 +944,7 @@ fn format_register(register: &Register) -> String {
         RegisterClass::H => format!("h{}", register.index),
         RegisterClass::S => format!("s{}", register.index),
         RegisterClass::D => format!("d{}", register.index),
+        RegisterClass::Q => format!("q{}", register.index),
         RegisterClass::W if register.index == 31 => "wzr".to_string(),
         RegisterClass::W => format!("w{}", register.index),
         RegisterClass::X if register.index == 31 => "xzr".to_string(),
