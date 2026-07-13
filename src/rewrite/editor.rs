@@ -54,7 +54,7 @@ use crate::rewrite::emit::{emit, EmitError};
 use crate::rewrite::ir::{
     RewriteInstruction as RewriteInstructionGeneric, Target,
 };
-use crate::rewrite::layout::{lay_out, lay_out_scattered, LayoutError};
+use crate::rewrite::layout::{lay_out, lay_out_for_size, lay_out_scattered, LayoutError};
 use crate::rewrite::plan::{EditError, RewritePlan as RewritePlanGeneric};
 use crate::rewrite::EmitOutput;
 
@@ -1075,6 +1075,61 @@ fn take_hole(holes: &mut Vec<(u64, u64)>, need: u64) -> Option<u64> {
     Some(va)
 }
 
+/// Enough state to undo one [`reserve_hole`] without cloning the whole pool.
+/// `removed` is `Some((idx, entry))` when the reservation consumed the hole
+/// entirely (so it was removed); otherwise the hole was shrunk in place.
+struct HoleReservation {
+    va: u64,
+    need: u64,
+    removed: Option<(usize, (u64, u64))>,
+}
+
+/// Best-fit-reserve `need` bytes from `holes`, returning the placement `va` and a
+/// [`HoleReservation`] that [`release_hole`] can roll back — O(holes) once, not a
+/// full clone per call. On success the pool is mutated exactly as [`take_hole`]
+/// would; callers that succeed simply drop the reservation.
+fn reserve_hole(holes: &mut Vec<(u64, u64)>, need: u64) -> Option<(u64, HoleReservation)> {
+    let need = (need + 3) & !3;
+    if need == 0 {
+        return None;
+    }
+    let idx = holes
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, size))| size >= need)
+        .min_by_key(|(_, &(_, size))| size)
+        .map(|(i, _)| i)?;
+    let va = holes[idx].0;
+    let original = holes[idx];
+    holes[idx].0 += need;
+    holes[idx].1 -= need;
+    let removed = if holes[idx].1 < 4 {
+        let entry = original;
+        holes.remove(idx);
+        Some((idx, entry))
+    } else {
+        None
+    };
+    Some((va, HoleReservation { va, need, removed }))
+}
+
+/// Undo a [`reserve_hole`]: restore the consumed bytes so a failed placement
+/// leaves the pool exactly as it was.
+fn release_hole(holes: &mut Vec<(u64, u64)>, r: HoleReservation) {
+    if let Some((idx, entry)) = r.removed {
+        // The hole was fully consumed and removed — reinsert it verbatim.
+        holes.insert(idx.min(holes.len()), entry);
+    } else {
+        // The hole was shrunk in place — find it by its post-reserve start
+        // (`va + need`) and grow it back.
+        let start = r.va + r.need;
+        if let Some(h) = holes.iter_mut().find(|h| h.0 == start) {
+            h.0 = r.va;
+            h.1 += r.need;
+        }
+    }
+}
+
 /// Where each block of a plan landed after [`BinaryEditor::place_plan_scattered`].
 ///
 /// `block_vas[i]` is the scattered virtual address of block `i`; `block_offsets[i]`
@@ -1393,19 +1448,47 @@ impl BinaryEditor {
         plan: &RewritePlanGeneric<I>,
         holes: &mut Vec<(u64, u64)>,
     ) -> Result<Option<SymbolId>, TextEditorError> {
-        // Probe at base 0 for the size and to confirm it emits no relocations
-        // (both are base-independent for a self-contained, non-widening blob).
-        let probe_layout = lay_out::<I>(plan, 0, Some(&self.binary.container))?;
-        let probe = emit::<I>(plan, &probe_layout, Some(&self.binary.container))?;
-        if !probe.relocations.is_empty() {
-            return Ok(None);
-        }
-        let size = probe.bytes.len() as u64;
-        let Some(va) = take_hole(holes, size) else {
+        // Size the blob from a layout alone (no base-0 emit): `lay_out_for_size`
+        // tolerates out-of-range unconditional branches, so a `bl`/`b` to a distant
+        // callee doesn't spuriously fail the sizing (that branch might well be in
+        // range once the blob is placed in a hole near its target). `total_size` is
+        // the byte count including any conditional-branch widening.
+        let size = lay_out_for_size::<I>(plan, 0, Some(&self.binary.container))?.total_size;
+        // Reserve a hole without disturbing the pool on failure. `take_hole` mutates
+        // in place; to keep this O(1) per call (a clone would be O(holes) → O(n²)
+        // across a whole-binary run), we record the reservation and only roll it
+        // back on the rare fallback path.
+        let Some((va, reservation)) = reserve_hole(holes, size) else {
             return Ok(None);
         };
-        let layout = lay_out::<I>(plan, va, Some(&self.binary.container))?;
-        let output = emit::<I>(plan, &layout, Some(&self.binary.container))?;
+        // Authoritative placement at the chosen hole VA: layout (range check) then
+        // emit (encode + relocation check). If a branch is genuinely out of range
+        // from here, or a reference can't be folded, fall back (`Ok(None)`) so the
+        // caller tries scattered / appended placement rather than aborting.
+        let layout = match lay_out::<I>(plan, va, Some(&self.binary.container)) {
+            Ok(l) => l,
+            Err(LayoutError::DisplacementTooLarge { .. }) | Err(LayoutError::DidNotConverge) => {
+                release_hole(holes, reservation);
+                return Ok(None);
+            }
+            Err(other) => {
+                release_hole(holes, reservation);
+                return Err(other.into());
+            }
+        };
+        let output = match emit::<I>(plan, &layout, Some(&self.binary.container)) {
+            Ok(o) if o.relocations.is_empty() => o,
+            // Blob emits a relocation we can't place, OR an out-of-range branch/adrp
+            // the layout's coarser check let through — fall back either way.
+            Ok(_) | Err(EmitError::Encode(_)) => {
+                release_hole(holes, reservation);
+                return Ok(None);
+            }
+            Err(other) => {
+                release_hole(holes, reservation);
+                return Err(TextEditorError::Emit(other));
+            }
+        };
         let text = self
             .text
             .as_mut()

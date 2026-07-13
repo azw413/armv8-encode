@@ -58,6 +58,33 @@ pub fn lay_out<I: Isa>(
     base_address: u64,
     container: Option<&Container>,
 ) -> Result<Layout, LayoutError> {
+    lay_out_inner(plan, base_address, container, false)
+}
+
+/// Lay out `plan` purely to determine its **byte size** (and confirm it emits no
+/// relocations), independent of where it will finally sit. Unlike [`lay_out`],
+/// an out-of-range *unconditional* branch is NOT an error here: such a branch
+/// never changes size, so it can't affect the measured layout, and the size probe
+/// runs at a placeholder base (e.g. `0`) that has no relation to the real
+/// placement — checking its range would be meaningless and rejects blobs that are
+/// perfectly in range once placed near their targets. Out-of-range *conditional*
+/// branches still widen (they DO change size), so the size stays accurate. The
+/// real placement (via [`lay_out`] at the chosen VA) performs the authoritative
+/// range check.
+pub fn lay_out_for_size<I: Isa>(
+    plan: &RewritePlan<I>,
+    base_address: u64,
+    container: Option<&Container>,
+) -> Result<Layout, LayoutError> {
+    lay_out_inner(plan, base_address, container, true)
+}
+
+fn lay_out_inner<I: Isa>(
+    plan: &RewritePlan<I>,
+    base_address: u64,
+    container: Option<&Container>,
+    size_probe: bool,
+) -> Result<Layout, LayoutError> {
     let mut instruction_layouts: Vec<Vec<InstructionLayout>> = plan
         .blocks
         .iter()
@@ -83,6 +110,7 @@ pub fn lay_out<I: Isa>(
             &mut instruction_layouts,
             &block_addresses,
             container,
+            size_probe,
         )?;
 
         if !grew {
@@ -136,7 +164,8 @@ pub fn lay_out_scattered<I: Isa>(
     }
 
     // No widening for a fixed placement — if anything is out of range, bail.
-    let grew = widen_out_of_range::<I>(plan, &mut instruction_layouts, block_addresses, container)?;
+    let grew =
+        widen_out_of_range::<I>(plan, &mut instruction_layouts, block_addresses, container, false)?;
     if grew {
         return Err(LayoutError::DidNotConverge);
     }
@@ -173,6 +202,7 @@ fn widen_out_of_range<I: Isa>(
     instruction_layouts: &mut [Vec<InstructionLayout>],
     block_addresses: &[u64],
     container: Option<&Container>,
+    size_probe: bool,
 ) -> Result<bool, LayoutError> {
     let mut grew = false;
 
@@ -209,6 +239,12 @@ fn widen_out_of_range<I: Isa>(
                         instruction_layouts[block_index][instr_index].size =
                             I::widened_conditional_size();
                         grew = true;
+                    } else if size_probe {
+                        // Size probe: an out-of-range unconditional branch doesn't
+                        // change size, and the probe base is unrelated to the final
+                        // placement, so its range is meaningless here. Skip it — the
+                        // real placement layout validates the range.
+                        continue;
                     } else {
                         return Err(LayoutError::DisplacementTooLarge {
                             instruction_address: here,
@@ -218,6 +254,9 @@ fn widen_out_of_range<I: Isa>(
                     }
                 }
                 EmitStrategy::InvertedConditional => {
+                    if size_probe {
+                        continue;
+                    }
                     return Err(LayoutError::DisplacementTooLarge {
                         instruction_address: here,
                         target_address,
