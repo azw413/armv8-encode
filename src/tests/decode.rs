@@ -265,3 +265,32 @@ fn decoded_whole_functions_match_otool() {
 fn decoded_formatting_cases_match_otool() {
     assert_decoded_fixture_matches_otool(FORMATTING_OTOOL_FIXTURE, |_| None);
 }
+
+/// `csinv Xd, Xn, Xm, cond` with `Xm != Xn` must NOT be decoded as the two-source
+/// `cinv Xd, Xn, cond` alias — that alias is only legal when `Xm == Xn`. Mis-
+/// applying it silently drops the `Xm` operand, so any consumer doing register
+/// dataflow (e.g. liveness) never sees `Xm` read. Regression for the gecko
+/// `pack_instruction` miscompile: `csinv x12, x12, x13, hs` (bytes `8c218dda`)
+/// had `x13` dropped, so a mutation pass clobbered it as "dead". Same class of
+/// bug for `csneg`'s `cneg` alias.
+#[test]
+fn conditional_select_alias_requires_equal_source_registers() {
+    // csinv x12, x12, x13, hs — distinct Rm, must stay csinv (keep x13).
+    let csinv = aarch64::disassemble_bytes(0x1000, &[0x8c, 0x21, 0x8d, 0xda]).unwrap();
+    assert_eq!(
+        format!("{} {}", csinv[0].format_mnemonic(), csinv[0].format_operands()),
+        "csinv x12, x12, x13, hs"
+    );
+    // csneg x5, x6, x7, gt — distinct Rm, must stay csneg (keep x7).
+    let csneg = aarch64::disassemble_bytes(0x1000, &[0xc5, 0xc4, 0x87, 0xda]).unwrap();
+    assert_eq!(
+        format!("{} {}", csneg[0].format_mnemonic(), csneg[0].format_operands()),
+        "csneg x5, x6, x7, gt"
+    );
+
+    // The aliases ARE correct when Rm == Rn: cinv x9, x9, hi / cneg x0, x1, eq.
+    let cinv = aarch64::disassemble_bytes(0x1000, &[0x29, 0x91, 0x89, 0xda]).unwrap();
+    assert_eq!(cinv[0].format_mnemonic(), "cinv");
+    let cneg = aarch64::disassemble_bytes(0x1000, &[0x20, 0x14, 0x81, 0xda]).unwrap();
+    assert_eq!(cneg[0].format_mnemonic(), "cneg");
+}

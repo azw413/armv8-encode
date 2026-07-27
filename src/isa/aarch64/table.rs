@@ -9954,10 +9954,22 @@ fn alias_applies(instruction: Aarch64Insn, opcode: &Aarch64Opcode) -> bool {
         // (csinv with Rm=Rn), and plain CSINC, so we need to filter
         // here to keep the alias from absorbing a non-aliasing form
         // like `csinc Wd, Wn, wzr, cond` (Rm=wzr, Rn≠wzr).
-        "cinc" if opcode.iclass == Aarch64InsnClass::Condsel => {
+        //
+        // `cinv` (vs. csinv) and `cneg` (vs. csneg) have the same shape and
+        // need the same guard: the two-source alias is legal only when Rm==Rn.
+        // Without it, `csinv Xd, Xn, Xm, cond` with Xm≠Xn is mis-decoded as
+        // `cinv Xd, Xn, cond`, silently dropping Xm — corrupting any register
+        // dataflow analysis that reads the decoded operands. `cinv` excludes
+        // Rn==WZR (that form is CSETM); `cneg` permits it.
+        "cinc" | "cinv" if opcode.iclass == Aarch64InsnClass::Condsel => {
             let rn = (instruction >> 5) & 0x1f;
             let rm = (instruction >> 16) & 0x1f;
             rn == rm && rn != 31
+        }
+        "cneg" if opcode.iclass == Aarch64InsnClass::Condsel => {
+            let rn = (instruction >> 5) & 0x1f;
+            let rm = (instruction >> 16) & 0x1f;
+            rn == rm
         }
         "at" => matches!(system_op_fields(instruction), (0, 7, 8, 0)),
         "dc" => matches!(system_op_fields(instruction), (3, 7, 4, 1)),
