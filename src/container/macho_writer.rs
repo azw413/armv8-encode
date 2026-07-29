@@ -1536,6 +1536,14 @@ fn build_segment_command_64(
     let segname = "__APPENDED";
     let sectname = "__appended";
     let bytes_len = appended.bytes.len() as u64;
+    // The App Store rejects any segment whose vm/file size is not a multiple of
+    // the target page size ("Invalid Segment Alignment"). The writer already
+    // zero-pads the on-disk appended region up to the next APPEND_PAGE_ALIGN
+    // boundary (see new_linkedit_fileoff), so those padding bytes are physically
+    // present — extend the SEGMENT's vmsize/filesize to that boundary. The
+    // __appended SECTION keeps the exact code length (sections are not
+    // page-granular; align stays 2^2).
+    let seg_size = (bytes_len + APPEND_PAGE_ALIGN - 1) & !(APPEND_PAGE_ALIGN - 1);
 
     // VM_PROT_READ | VM_PROT_EXECUTE = 0x5.
     // macOS rejects RWX mappings for non-special segments
@@ -1554,9 +1562,9 @@ fn build_segment_command_64(
         .copy_from_slice(&bytes_seg[..bytes_seg.len().min(16)]);
     out.extend_from_slice(&name_field);
     out.extend_from_slice(&appended.vaddr.to_le_bytes());
-    out.extend_from_slice(&bytes_len.to_le_bytes()); // vmsize
+    out.extend_from_slice(&seg_size.to_le_bytes()); // vmsize (page-aligned)
     out.extend_from_slice(&file_offset.to_le_bytes());
-    out.extend_from_slice(&bytes_len.to_le_bytes()); // filesize
+    out.extend_from_slice(&seg_size.to_le_bytes()); // filesize (page-aligned)
     out.extend_from_slice(&prot.to_le_bytes()); // maxprot
     out.extend_from_slice(&prot.to_le_bytes()); // initprot
     out.extend_from_slice(&(if with_section { 1u32 } else { 0u32 }).to_le_bytes()); // nsects
