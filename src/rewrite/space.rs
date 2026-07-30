@@ -378,6 +378,159 @@ fn round_up(value: u64, align: u64) -> Option<u64> {
     }
 }
 
+// ==== Growth geometry (Increment 2) ===================================
+//
+// When free space can't satisfy a reservation, the segment must grow at
+// its tail. This is the *deterministic geometry* of that operation:
+// given the segment to grow, its trailing neighbours, and how much more
+// room is needed, compute how many whole pages to add and where every
+// following segment lands. It is pure — it does not touch the binary,
+// fix up references, or re-sign. The writer applies the plan; reference
+// fixups and the runtime proof are separate steps layered on top.
+//
+// Growth is quantised to whole pages so the file-offset/virtual-address
+// congruence (`vmaddr ≡ fileoff (mod page)`) every following segment
+// relies on is preserved by construction: each shifts by the same
+// page-multiple `delta` in both axes.
+
+/// A segment's placement as the growth planner sees it. Segments are
+/// assumed ordered by `vmaddr` and packed (each starts at or after the
+/// previous one's end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentPlacement {
+    pub vmaddr: u64,
+    pub vmsize: u64,
+    pub fileoff: u64,
+    pub filesize: u64,
+}
+
+/// How far one trailing segment moves when the grown segment expands.
+/// `index` refers to the segment's position in the caller's list, so
+/// the writer can map the shift back to a concrete `LC_SEGMENT_64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentShift {
+    pub index: usize,
+    pub old_vmaddr: u64,
+    pub new_vmaddr: u64,
+    pub old_fileoff: u64,
+    pub new_fileoff: u64,
+}
+
+/// The deterministic geometry of growing one segment (`__TEXT`) at its
+/// tail, from [`plan_text_growth`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextGrowthPlan {
+    /// Page size the growth is quantised to (0x4000 on arm64 macOS).
+    pub page_size: u64,
+    /// Whole pages added to the grown segment.
+    pub pages: u64,
+    /// Bytes added (`pages * page_size`).
+    pub delta: u64,
+    /// New `vmsize` / `filesize` of the grown segment.
+    pub new_vmsize: u64,
+    pub new_filesize: u64,
+    /// The contiguous free region opened up — the existing tail slack
+    /// plus the new pages — which the caller reserves from.
+    pub region_base_address: u64,
+    pub region_base_file_offset: u64,
+    pub region_capacity: u64,
+    /// Trailing segments, each shifted up by `delta`.
+    pub shifts: Vec<SegmentShift>,
+}
+
+/// Why a growth plan couldn't be computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowthError {
+    /// `page_size` was zero.
+    ZeroPageSize,
+    /// The existing tail slack already covers `needed`, so no growth is
+    /// required — the caller should have satisfied this from free space.
+    GrowthNotNeeded,
+    /// Address/size arithmetic overflowed `u64`.
+    Overflow,
+}
+
+/// Plan growing `grow_segment` at its tail so that `needed` contiguous
+/// bytes become available there.
+///
+/// `tail_free_len` is the contiguous free run already present at the
+/// segment's tail (0 if none). `trailing` are the segments that follow
+/// it in `vmaddr` order, each paired with its index in the caller's
+/// segment list. Growth is rounded up to a whole number of `page_size`
+/// pages; every trailing segment shifts up by that amount in both file
+/// and virtual space, preserving page congruence.
+///
+/// Assumes the grown segment is fully file-backed (`vmsize == filesize`,
+/// as `__TEXT` is), so the tail slack and the region base map cleanly
+/// between the two axes.
+pub fn plan_text_growth(
+    grow_segment: SegmentPlacement,
+    tail_free_len: u64,
+    trailing: &[(usize, SegmentPlacement)],
+    needed: u64,
+    page_size: u64,
+) -> Result<TextGrowthPlan, GrowthError> {
+    if page_size == 0 {
+        return Err(GrowthError::ZeroPageSize);
+    }
+    if needed <= tail_free_len {
+        return Err(GrowthError::GrowthNotNeeded);
+    }
+    let deficit = needed - tail_free_len;
+    // pages = ceil(deficit / page_size), overflow-safe.
+    let pages = deficit
+        .checked_add(page_size - 1)
+        .ok_or(GrowthError::Overflow)?
+        / page_size;
+    let delta = pages.checked_mul(page_size).ok_or(GrowthError::Overflow)?;
+
+    let new_vmsize = grow_segment
+        .vmsize
+        .checked_add(delta)
+        .ok_or(GrowthError::Overflow)?;
+    let new_filesize = grow_segment
+        .filesize
+        .checked_add(delta)
+        .ok_or(GrowthError::Overflow)?;
+
+    // The tail slack begins `tail_free_len` before the segment's current
+    // end; the grown region runs from there to the new end.
+    let region_base_address = grow_segment
+        .vmaddr
+        .checked_add(grow_segment.vmsize)
+        .and_then(|end| end.checked_sub(tail_free_len))
+        .ok_or(GrowthError::Overflow)?;
+    let region_base_file_offset = grow_segment
+        .fileoff
+        .checked_add(grow_segment.filesize)
+        .and_then(|end| end.checked_sub(tail_free_len))
+        .ok_or(GrowthError::Overflow)?;
+    let region_capacity = tail_free_len.checked_add(delta).ok_or(GrowthError::Overflow)?;
+
+    let mut shifts = Vec::with_capacity(trailing.len());
+    for &(index, seg) in trailing {
+        shifts.push(SegmentShift {
+            index,
+            old_vmaddr: seg.vmaddr,
+            new_vmaddr: seg.vmaddr.checked_add(delta).ok_or(GrowthError::Overflow)?,
+            old_fileoff: seg.fileoff,
+            new_fileoff: seg.fileoff.checked_add(delta).ok_or(GrowthError::Overflow)?,
+        });
+    }
+
+    Ok(TextGrowthPlan {
+        page_size,
+        pages,
+        delta,
+        new_vmsize,
+        new_filesize,
+        region_base_address,
+        region_base_file_offset,
+        region_capacity,
+        shifts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +853,127 @@ mod tests {
         let plan = plan_reservation(&extents, &ReserveRequest::exact(0)).unwrap();
         assert_eq!(plan.capacity, 0);
         assert_eq!(plan.base_address, 0x4000);
+    }
+
+    // ---- plan_text_growth --------------------------------------------
+
+    fn seg(vmaddr: u64, vmsize: u64, fileoff: u64, filesize: u64) -> SegmentPlacement {
+        SegmentPlacement {
+            vmaddr,
+            vmsize,
+            fileoff,
+            filesize,
+        }
+    }
+
+    #[test]
+    fn growth_rounds_up_to_whole_pages() {
+        // __TEXT one page, no tail slack; need 0x100 -> one page grow.
+        let text = seg(0, 0x4000, 0, 0x4000);
+        let data = seg(0x4000, 0x1000, 0x4000, 0x1000);
+        let plan = plan_text_growth(text, 0, &[(1, data)], 0x100, 0x4000).unwrap();
+        assert_eq!(plan.pages, 1);
+        assert_eq!(plan.delta, 0x4000);
+        assert_eq!(plan.new_vmsize, 0x8000);
+        assert_eq!(plan.new_filesize, 0x8000);
+        // Region opens at the old segment end (no slack) and spans one page.
+        assert_eq!(plan.region_base_address, 0x4000);
+        assert_eq!(plan.region_base_file_offset, 0x4000);
+        assert_eq!(plan.region_capacity, 0x4000);
+        assert!(plan.region_capacity >= 0x100);
+        // __DATA shifts up exactly one page in both axes.
+        assert_eq!(
+            plan.shifts,
+            vec![SegmentShift {
+                index: 1,
+                old_vmaddr: 0x4000,
+                new_vmaddr: 0x8000,
+                old_fileoff: 0x4000,
+                new_fileoff: 0x8000,
+            }],
+        );
+    }
+
+    #[test]
+    fn growth_reuses_tail_slack() {
+        // 0x800 slack free; need 0x900 -> deficit 0x100 -> one page.
+        let text = seg(0, 0x8000, 0, 0x8000);
+        let plan = plan_text_growth(text, 0x800, &[], 0x900, 0x4000).unwrap();
+        assert_eq!(plan.pages, 1);
+        assert_eq!(plan.delta, 0x4000);
+        // Region starts 0x800 before the old end and spans slack + page.
+        assert_eq!(plan.region_base_address, 0x8000 - 0x800);
+        assert_eq!(plan.region_base_file_offset, 0x8000 - 0x800);
+        assert_eq!(plan.region_capacity, 0x800 + 0x4000);
+        assert!(plan.region_capacity >= 0x900);
+    }
+
+    #[test]
+    fn growth_multiple_pages() {
+        let text = seg(0, 0x4000, 0, 0x4000);
+        // deficit 0x9001, page 0x4000 -> ceil = 3 pages.
+        let plan = plan_text_growth(text, 0, &[], 0x9001, 0x4000).unwrap();
+        assert_eq!(plan.pages, 3);
+        assert_eq!(plan.delta, 0xC000);
+        assert!(plan.region_capacity >= 0x9001);
+    }
+
+    #[test]
+    fn growth_preserves_page_congruence_of_trailing() {
+        let text = seg(0, 0x4000, 0, 0x4000);
+        let data = seg(0x4000, 0x2000, 0x4000, 0x2000);
+        let linkedit = seg(0x6000, 0x3000, 0x6000, 0x2500);
+        let plan = plan_text_growth(text, 0, &[(1, data), (2, linkedit)], 0x10, 0x4000).unwrap();
+        assert_eq!(plan.shifts.len(), 2);
+        for s in &plan.shifts {
+            assert_eq!(s.new_vmaddr - s.old_vmaddr, plan.delta);
+            assert_eq!(s.new_fileoff - s.old_fileoff, plan.delta);
+            // Congruence vmaddr ≡ fileoff (mod page) is preserved.
+            assert_eq!(
+                s.new_vmaddr % plan.page_size,
+                s.new_fileoff % plan.page_size,
+            );
+        }
+    }
+
+    #[test]
+    fn growth_not_needed_when_slack_suffices() {
+        let text = seg(0, 0x8000, 0, 0x8000);
+        assert_eq!(
+            plan_text_growth(text, 0x1000, &[], 0x1000, 0x4000),
+            Err(GrowthError::GrowthNotNeeded),
+        );
+        assert_eq!(
+            plan_text_growth(text, 0x1000, &[], 0x800, 0x4000),
+            Err(GrowthError::GrowthNotNeeded),
+        );
+    }
+
+    #[test]
+    fn growth_zero_page_size_rejected() {
+        let text = seg(0, 0x4000, 0, 0x4000);
+        assert_eq!(
+            plan_text_growth(text, 0, &[], 0x10, 0),
+            Err(GrowthError::ZeroPageSize),
+        );
+    }
+
+    #[test]
+    fn growth_empty_trailing_ok() {
+        let text = seg(0, 0x4000, 0, 0x4000);
+        let plan = plan_text_growth(text, 0, &[], 0x10, 0x4000).unwrap();
+        assert!(plan.shifts.is_empty());
+        assert_eq!(plan.pages, 1);
+    }
+
+    #[test]
+    fn growth_overflow_is_caught_not_panicked() {
+        // A trailing segment near u64::MAX whose shift overflows.
+        let text = seg(0, 0x1000, 0, 0x1000);
+        let data = seg(u64::MAX - 0x100, 0x100, 0x1000, 0x100);
+        assert_eq!(
+            plan_text_growth(text, 0, &[(1, data)], 0x10, 0x4000),
+            Err(GrowthError::Overflow),
+        );
     }
 }

@@ -254,6 +254,21 @@ impl From<crate::rewrite::space::CarveError> for TextEditorError {
     }
 }
 
+impl From<crate::rewrite::space::GrowthError> for TextEditorError {
+    fn from(e: crate::rewrite::space::GrowthError) -> Self {
+        use crate::rewrite::space::GrowthError;
+        match e {
+            GrowthError::ZeroPageSize => TextEditorError::InvalidAlignment,
+            // Free space already suffices — no grow needed.
+            GrowthError::GrowthNotNeeded => TextEditorError::WouldRequireTextGrowth { deficit: 0 },
+            GrowthError::Overflow => TextEditorError::RegionFull {
+                requested: u64::MAX,
+                available: 0,
+            },
+        }
+    }
+}
+
 impl From<crate::container::dynsym_extension::DynParseError> for TextEditorError {
     fn from(e: crate::container::dynsym_extension::DynParseError) -> Self {
         TextEditorError::MalformedDynamicData(e)
@@ -2577,6 +2592,80 @@ impl BinaryState {
                 },
             })
             .collect())
+    }
+
+    /// Compute the deterministic geometry of growing `__TEXT` so that
+    /// `needed` contiguous bytes become available at its tail, against
+    /// this binary's real segment layout.
+    ///
+    /// Pure — it modifies nothing. It reports how many whole pages
+    /// `__TEXT` would gain and where every trailing segment
+    /// (`__DATA*`, `__LINKEDIT`) would move. This is the geometry the
+    /// grow writer will apply; exposing it lets callers (and tests)
+    /// inspect the shift before any bytes are written. Mach-O only.
+    pub fn plan_text_growth_for(
+        &self,
+        needed: u64,
+    ) -> Result<crate::rewrite::space::TextGrowthPlan, TextEditorError> {
+        use crate::rewrite::space::{plan_text_growth, SegmentPlacement};
+        if !matches!(self.container.format, crate::container::BinaryFormat::Macho) {
+            return Err(TextEditorError::ReserveUnsupportedFormat(self.container.format));
+        }
+        let image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let layout = &image.layout;
+        let text = layout
+            .segments
+            .iter()
+            .find(|s| s.name == "__TEXT")
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let seg_end = text.vmaddr.saturating_add(text.vmsize);
+        // Contiguous free run abutting the segment's tail (0 if none).
+        let tail_free = layout
+            .text_free_regions()
+            .iter()
+            .filter(|r| {
+                r.segment_name == "__TEXT" && r.vaddr.saturating_add(r.size) == seg_end
+            })
+            .map(|r| r.size)
+            .max()
+            .unwrap_or(0);
+        // Segments after __TEXT, with their index in the layout list so
+        // the writer can map each shift back to its LC_SEGMENT_64.
+        let trailing: Vec<(usize, SegmentPlacement)> = layout
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.vmaddr > text.vmaddr)
+            .map(|(i, s)| {
+                (
+                    i,
+                    SegmentPlacement {
+                        vmaddr: s.vmaddr,
+                        vmsize: s.vmsize,
+                        fileoff: s.fileoff,
+                        filesize: s.filesize,
+                    },
+                )
+            })
+            .collect();
+        let text_placement = SegmentPlacement {
+            vmaddr: text.vmaddr,
+            vmsize: text.vmsize,
+            fileoff: text.fileoff,
+            filesize: text.filesize,
+        };
+        const MACOS_ARM64_PAGE: u64 = 0x4000;
+        Ok(plan_text_growth(
+            text_placement,
+            tail_free,
+            &trailing,
+            needed,
+            MACOS_ARM64_PAGE,
+        )?)
     }
 
     pub fn add_function(
