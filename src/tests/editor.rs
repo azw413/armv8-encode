@@ -1208,3 +1208,110 @@ fn plan_text_growth_for_non_macho_is_rejected() {
         "got {err:?}"
     );
 }
+
+/// Read a segment's (vmaddr, vmsize, fileoff, filesize).
+fn macho_seg(c: &Container, name: &str) -> Option<(u64, u64, u64, u64)> {
+    c.macho_image
+        .as_ref()?
+        .layout
+        .segments
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| (s.vmaddr, s.vmsize, s.fileoff, s.filesize))
+}
+
+#[test]
+fn write_with_text_growth_applies_geometry_structurally() {
+    // Increment 2a: the writer applies the growth geometry — extend
+    // __TEXT, shift __DATA*/__LINKEDIT (and their sections) down by
+    // delta. This checks the load-command bookkeeping via a re-parse.
+    // It does NOT prove the output loads (references into the shifted
+    // __DATA* are unfixed — that's 2b/2c); it proves the shift is
+    // structurally coherent.
+    use crate::container::macho_writer::{write_with_text_growth_opts, MachOWriteOptions};
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let old_text = macho_seg(&container, "__TEXT").expect("__TEXT");
+    let old_linkedit = macho_seg(&container, "__LINKEDIT").expect("__LINKEDIT");
+
+    let editor = BinaryEditor::new(&container).expect("editor");
+    let plan = editor.binary.plan_text_growth_for(0x40_000).expect("plan");
+    // growth_point is the old __TEXT file end.
+    let growth_point = plan.region_base_file_offset + (plan.region_capacity - plan.delta);
+    assert_eq!(growth_point, old_text.2 + old_text.3);
+
+    let payload = 0xd65f03c0u32.to_le_bytes(); // ret, at the region base
+    let opts = MachOWriteOptions {
+        sign: false,
+        raw_byte_overrides: vec![],
+    };
+    let out = write_with_text_growth_opts(
+        &container,
+        growth_point,
+        plan.delta,
+        plan.region_base_file_offset,
+        &payload,
+        &[],
+        &opts,
+    )
+    .expect("grow write");
+
+    // Exactly delta bytes inserted; payload at the region base.
+    assert_eq!(out.len() as u64, bytes.len() as u64 + plan.delta);
+    let rb = plan.region_base_file_offset as usize;
+    assert_eq!(&out[rb..rb + 4], &payload);
+
+    // Re-parses as a coherent Mach-O whose symbol table still reads.
+    let reparsed = Container::from_bytes(&out).expect("re-parse grown dylib");
+    assert!(!reparsed.symbols.is_empty(), "symtab must still parse");
+
+    // __TEXT grew in place; __LINKEDIT moved by delta, unchanged in size.
+    let new_text = macho_seg(&reparsed, "__TEXT").expect("__TEXT after");
+    let new_linkedit = macho_seg(&reparsed, "__LINKEDIT").expect("__LINKEDIT after");
+    assert_eq!(new_text.0, old_text.0, "__TEXT vmaddr unchanged");
+    assert_eq!(new_text.1, old_text.1 + plan.delta, "__TEXT vmsize += delta");
+    assert_eq!(new_text.2, old_text.2, "__TEXT fileoff unchanged");
+    assert_eq!(new_text.3, old_text.3 + plan.delta, "__TEXT filesize += delta");
+    assert_eq!(new_linkedit.0, old_linkedit.0 + plan.delta, "__LINKEDIT vmaddr");
+    assert_eq!(new_linkedit.2, old_linkedit.2 + plan.delta, "__LINKEDIT fileoff");
+    assert_eq!(new_linkedit.1, old_linkedit.1, "__LINKEDIT vmsize unchanged");
+    assert_eq!(new_linkedit.3, old_linkedit.3, "__LINKEDIT filesize unchanged");
+
+    // Every trailing segment moved by delta; file-backed segments stay
+    // ordered and non-overlapping.
+    let segs = &reparsed.macho_image.as_ref().unwrap().layout.segments;
+    let mut file_backed: Vec<_> = segs.iter().filter(|s| s.filesize > 0).collect();
+    file_backed.sort_by_key(|s| s.fileoff);
+    for w in file_backed.windows(2) {
+        assert!(
+            w[0].fileoff + w[0].filesize <= w[1].fileoff,
+            "file overlap between {} and {}",
+            w[0].name,
+            w[1].name,
+        );
+    }
+}
+
+#[test]
+fn write_with_text_growth_rejects_bad_params() {
+    use crate::container::macho_writer::{write_with_text_growth_opts, MachOWriteOptions};
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let opts = MachOWriteOptions {
+        sign: false,
+        raw_byte_overrides: vec![],
+    };
+    // Zero delta is rejected.
+    assert!(write_with_text_growth_opts(&container, 0x1000, 0, 0x1000, &[], &[], &opts).is_err());
+    // A payload that overruns the grown region is rejected, not a panic.
+    let text = macho_seg(&container, "__TEXT").expect("__TEXT");
+    let gp = text.2 + text.3;
+    let too_big = vec![0u8; 0x5000]; // > one 0x4000 page
+    assert!(
+        write_with_text_growth_opts(&container, gp, 0x4000, gp, &too_big, &[], &opts).is_err()
+    );
+}

@@ -1038,6 +1038,230 @@ pub fn write_with_intra_text_append_opts(
     Ok(bytes)
 }
 
+/// Grow `__TEXT` by inserting `delta` bytes (a whole number of pages) at
+/// `growth_point` — the segment's old file end — shifting every segment
+/// after it (`__DATA*`, `__LINKEDIT`) and their sections down by `delta`
+/// in both file offset and virtual address, and placing `appended_bytes`
+/// at `appended_file_offset` inside the grown region.
+///
+/// This is the **geometry application** of a text grow (Increment 2a):
+/// it fixes the load-command bookkeeping so the output is a structurally
+/// coherent Mach-O, but it deliberately does NOT fix references that
+/// point into the shifted `__DATA*` — chained-fixup rebase targets, data
+/// symbol values, or the `adrp`/GOT immediates in `__text`. Those are
+/// separate steps (2b/2c). On its own the output re-parses cleanly but
+/// is not yet runtime-loadable.
+///
+/// `growth_point` must be `__TEXT.fileoff + __TEXT.filesize` and `delta`
+/// a page multiple — both come from the growth planner.
+// Not yet wired into the commit path: `Exhaustion::Grow` won't emit
+// until the 2b/2c reference fixups make the grown output loadable, so
+// this is exercised by tests only for now.
+#[allow(dead_code)]
+pub fn write_with_text_growth_opts(
+    container: &Container,
+    growth_point: u64,
+    delta: u64,
+    appended_file_offset: u64,
+    appended_bytes: &[u8],
+    section_overrides: &[(usize, Vec<u8>)],
+    options: &MachOWriteOptions,
+) -> Result<Vec<u8>, ContainerWriteError> {
+    let image = container
+        .macho_image
+        .as_ref()
+        .ok_or(ContainerWriteError::ElfImageMissing)?;
+    let layout = &image.layout;
+    let raw = &image.raw_bytes;
+
+    if delta == 0 {
+        return Err(ContainerWriteError::ObjectWrite(
+            "Mach-O grow: delta must be greater than zero".into(),
+        ));
+    }
+    let gp = growth_point as usize;
+    if gp > raw.len() {
+        return Err(ContainerWriteError::ObjectWrite(format!(
+            "Mach-O grow: growth_point 0x{growth_point:x} past end of file ({} bytes)",
+            raw.len(),
+        )));
+    }
+
+    // Reassemble: prefix (header + load commands + __TEXT) ++ `delta`
+    // fresh bytes ++ the shifted tail (__DATA*/__LINKEDIT).
+    let mut bytes = Vec::with_capacity(raw.len() + delta as usize);
+    bytes.extend_from_slice(&raw[..gp]);
+    bytes.resize(bytes.len() + delta as usize, 0);
+    bytes.extend_from_slice(&raw[gp..]);
+
+    // Place the appended payload inside the grown region.
+    let region_end = gp + delta as usize;
+    let ao = appended_file_offset as usize;
+    if ao + appended_bytes.len() > region_end {
+        return Err(ContainerWriteError::ObjectWrite(format!(
+            "Mach-O grow: appended payload at 0x{appended_file_offset:x} + {} bytes \
+             overruns the grown region end 0x{region_end:x}",
+            appended_bytes.len(),
+        )));
+    }
+    bytes[ao..ao + appended_bytes.len()].copy_from_slice(appended_bytes);
+
+    // Section-byte overrides, at their (possibly shifted) offsets.
+    for (idx, override_bytes) in section_overrides {
+        let section = &container.sections[*idx];
+        let Some(entry) = layout
+            .sections
+            .iter()
+            .find(|s| s.vaddr == section.address && s.file_offset > 0)
+        else {
+            continue;
+        };
+        if override_bytes.len() as u64 != entry.size {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "Mach-O grow: override for {:?} ({} bytes) doesn't match captured \
+                 size ({} bytes); length-changing in-place edits aren't supported",
+                section.name,
+                override_bytes.len(),
+                entry.size,
+            )));
+        }
+        let start = if entry.file_offset >= growth_point {
+            (entry.file_offset + delta) as usize
+        } else {
+            entry.file_offset as usize
+        };
+        bytes[start..start + override_bytes.len()].copy_from_slice(override_bytes);
+    }
+
+    // Patch the load commands: grow __TEXT and shift everything after it.
+    apply_growth_to_load_commands(&mut bytes, layout, growth_point, delta)?;
+
+    apply_raw_byte_overrides(&mut bytes, &options.raw_byte_overrides)?;
+    if options.sign {
+        sign_ad_hoc(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
+/// Patch the load-command header after `delta` bytes were inserted at
+/// `growth_point`: grow the `__TEXT` segment, and shift every segment
+/// whose file offset is at or past `growth_point` — plus its sections
+/// and every `__LINKEDIT` sub-table offset — up by `delta`.
+///
+/// Generalises [`shift_linkedit_offsets`] from "shift only __LINKEDIT's
+/// fileoff" to "grow __TEXT and shift all trailing segments (fileoff and
+/// vmaddr), their section addr/offset, and the linkedit-data offsets."
+fn apply_growth_to_load_commands(
+    bytes: &mut [u8],
+    layout: &crate::container::macho_image::MachOLayout,
+    growth_point: u64,
+    delta: u64,
+) -> Result<(), ContainerWriteError> {
+    use object::macho;
+
+    // Add `delta` to a non-zero little-endian field. Zero means "no
+    // data" (e.g. a zerofill section's file offset), so it's left alone.
+    let add_u64 = |bytes: &mut [u8], off: usize| {
+        let v = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        if v != 0 {
+            bytes[off..off + 8].copy_from_slice(&(v + delta).to_le_bytes());
+        }
+    };
+    let add_u32 = |bytes: &mut [u8], off: usize| {
+        let v = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        if v != 0 {
+            bytes[off..off + 4].copy_from_slice(&((v as u64 + delta) as u32).to_le_bytes());
+        }
+    };
+
+    let lc_start = layout.load_commands_offset as usize;
+    let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let lc_end = lc_start + sizeofcmds;
+
+    let mut cursor = lc_start;
+    while cursor + 8 <= lc_end {
+        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if cmdsize == 0 || cursor + cmdsize > lc_end {
+            return Err(ContainerWriteError::ObjectWrite(format!(
+                "Mach-O grow: invalid cmdsize {cmdsize} at offset {cursor}",
+            )));
+        }
+        match cmd {
+            macho::LC_SEGMENT_64 => {
+                // segment_command_64: segname[16] @ +8, vmaddr @ +24,
+                // vmsize @ +32, fileoff @ +40, filesize @ +48,
+                // nsects @ +64; section_64 array @ +72 (80 bytes each).
+                let name = &bytes[cursor + 8..cursor + 24];
+                let name_len = name.iter().position(|&b| b == 0).unwrap_or(16);
+                let is_text = &name[..name_len] == b"__TEXT";
+                let fileoff =
+                    u64::from_le_bytes(bytes[cursor + 40..cursor + 48].try_into().unwrap());
+                if is_text {
+                    // __TEXT grows in place: it keeps its vmaddr/fileoff
+                    // but gains `delta` of vm and file size.
+                    add_u64(bytes, cursor + 32); // vmsize
+                    add_u64(bytes, cursor + 48); // filesize
+                } else if fileoff >= growth_point {
+                    // A trailing segment: it moves wholesale by `delta`.
+                    add_u64(bytes, cursor + 24); // vmaddr
+                    add_u64(bytes, cursor + 40); // fileoff
+                    let nsects = u32::from_le_bytes(
+                        bytes[cursor + 64..cursor + 68].try_into().unwrap(),
+                    ) as usize;
+                    for i in 0..nsects {
+                        let sec = cursor + 72 + i * 80;
+                        if sec + 80 > lc_end {
+                            break;
+                        }
+                        add_u64(bytes, sec + 32); // addr
+                        add_u32(bytes, sec + 48); // offset (0 for zerofill)
+                        add_u32(bytes, sec + 56); // reloff (usually 0)
+                    }
+                }
+            }
+            macho::LC_DYLD_INFO | macho::LC_DYLD_INFO_ONLY => {
+                if cmdsize >= 48 {
+                    add_u32(bytes, cursor + 8); // rebase_off
+                    add_u32(bytes, cursor + 16); // bind_off
+                    add_u32(bytes, cursor + 24); // weak_bind_off
+                    add_u32(bytes, cursor + 32); // lazy_bind_off
+                    add_u32(bytes, cursor + 40); // export_off
+                }
+            }
+            macho::LC_DYLD_CHAINED_FIXUPS
+            | macho::LC_DYLD_EXPORTS_TRIE
+            | macho::LC_FUNCTION_STARTS
+            | macho::LC_DATA_IN_CODE
+            | macho::LC_CODE_SIGNATURE => {
+                if cmdsize >= 16 {
+                    add_u32(bytes, cursor + 8); // dataoff
+                }
+            }
+            macho::LC_SYMTAB => {
+                if cmdsize >= 24 {
+                    add_u32(bytes, cursor + 8); // symoff
+                    add_u32(bytes, cursor + 16); // stroff
+                }
+            }
+            macho::LC_DYSYMTAB => {
+                if cmdsize >= 76 {
+                    add_u32(bytes, cursor + 32); // tocoff
+                    add_u32(bytes, cursor + 40); // modtaboff
+                    add_u32(bytes, cursor + 48); // extrefsymoff
+                    add_u32(bytes, cursor + 56); // indirectsymoff
+                    add_u32(bytes, cursor + 64); // extreloff
+                    add_u32(bytes, cursor + 72); // locreloff
+                }
+            }
+            _ => {}
+        }
+        cursor += cmdsize;
+    }
+    Ok(())
+}
+
 /// Append a rebuilt export trie + extended symtab/strtab to
 /// the file and patch the relevant load commands to point at
 /// the new copies. The new blobs go past the (already-shifted)
