@@ -1474,3 +1474,65 @@ fn build_grown_macho_shifts_chained_fixups_in_output() {
         assert_eq!(nt, ot + delta, "rebase target in grown output shifted by delta");
     }
 }
+
+#[test]
+fn build_grown_macho_shifts_export_trie_in_output() {
+    // The exports-critical fixup: after a grow, each regular export's
+    // trie offset must be +delta (the symbol moved but the image base
+    // didn't). Re-read the trie from the grown OUTPUT to prove it.
+    use crate::container::macho_export_trie;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let macho = container.macho_image.as_ref().unwrap();
+    let Some(trie) = macho.layout.exports_trie else {
+        eprintln!("skip: fixture has no export trie");
+        return;
+    };
+    let read_trie = |raw: &[u8], off: u64, size: u64| {
+        macho_export_trie::parse(&raw[off as usize..(off + size) as usize])
+            .expect("parse export trie")
+    };
+    let orig_exports = read_trie(&macho.raw_bytes, trie.dataoff, trie.datasize);
+    let orig: std::collections::HashMap<String, (u64, u64)> = orig_exports
+        .iter()
+        .map(|e| (e.name.clone(), (e.flags, e.address_offset)))
+        .collect();
+
+    let editor = BinaryEditor::new(&container).expect("editor");
+    let gp = first_text_section_offset(&container);
+    let delta = 0x4000u64;
+    let out = editor
+        .binary
+        .build_grown_macho(gp, delta, gp, &0xd65f03c0u32.to_le_bytes(), false)
+        .expect("grow");
+    let reparsed = Container::from_bytes(&out).expect("re-parse");
+    let rtrie = reparsed
+        .macho_image
+        .as_ref()
+        .unwrap()
+        .layout
+        .exports_trie
+        .expect("output has export trie");
+    let new_exports = read_trie(&out, rtrie.dataoff, rtrie.datasize);
+
+    assert_eq!(new_exports.len(), orig_exports.len(), "export count preserved");
+    const REEXPORT: u64 = 0x08;
+    let mut regular_checked = 0;
+    for e in &new_exports {
+        let Some(&(oflags, oaddr)) = orig.get(&e.name) else {
+            panic!("export {} appeared/renamed unexpectedly", e.name);
+        };
+        if oflags & REEXPORT == 0 {
+            assert_eq!(
+                e.address_offset,
+                oaddr + delta,
+                "regular export {} offset += delta",
+                e.name
+            );
+            regular_checked += 1;
+        }
+    }
+    assert!(regular_checked > 0, "expected at least one regular export");
+}

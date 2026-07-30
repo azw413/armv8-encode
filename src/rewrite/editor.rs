@@ -2720,28 +2720,83 @@ impl BinaryState {
 
         // The load-critical fixup: shift every chained-fixup slot + rebase
         // target by `delta` and re-emit blob + slots at shifted offsets.
+        // A minimal dylib can declare LC_DYLD_CHAINED_FIXUPS yet carry no
+        // chains (no rebases/binds) — `read` reports that as `Truncated`;
+        // there's nothing to shift, so skip it. Other read errors are real.
         if let Some(cfhdr) = image.layout.chained_fixups {
-            let mut cf = crate::container::ChainedFixups::read(image)
-                .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
-            cf.shift_by(delta);
-            let slots = cf
-                .slot_bytes(&shifted)
-                .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
-            for (file_off, word) in slots {
-                raw_overrides.push((file_off, word.to_vec()));
+            match crate::container::ChainedFixups::read(image) {
+                Ok(mut cf) => {
+                    if cf.segments.iter().any(|s| !s.fixups.is_empty()) {
+                        cf.shift_by(delta);
+                        let slots = cf
+                            .slot_bytes(&shifted)
+                            .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+                        for (file_off, word) in slots {
+                            raw_overrides.push((file_off, word.to_vec()));
+                        }
+                        let ser = cf
+                            .serialize(&shifted)
+                            .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+                        let mut blob = ser.bytes;
+                        if blob.len() as u64 > cfhdr.datasize {
+                            return Err(TextEditorError::ChainedFixupsBlobTooLarge {
+                                new_size: blob.len() as u64,
+                                capacity: cfhdr.datasize,
+                            });
+                        }
+                        blob.resize(cfhdr.datasize as usize, 0);
+                        raw_overrides.push((cfhdr.dataoff + delta, blob));
+                    }
+                }
+                Err(crate::container::chained_fixups::ChainedFixupsError::Truncated(_)) => {
+                    // No parseable chains — nothing to shift.
+                }
+                Err(e) => return Err(TextEditorError::ContainerWrite(e.into())),
             }
-            let ser = cf
-                .serialize(&shifted)
-                .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
-            let mut blob = ser.bytes;
-            if blob.len() as u64 > cfhdr.datasize {
-                return Err(TextEditorError::ChainedFixupsBlobTooLarge {
-                    new_size: blob.len() as u64,
-                    capacity: cfhdr.datasize,
-                });
+        }
+
+        // Exports-critical fixup: the export trie stores each symbol's
+        // address as an offset from the (fixed) image base, but the
+        // symbols moved +delta — so every regular export's offset shifts.
+        // Without this, dlsym / linked callers resolve moved exports at
+        // their old addresses.
+        if let Some(trie) = image.layout.exports_trie {
+            let start = trie.dataoff as usize;
+            let end = start + trie.datasize as usize;
+            let blob = image
+                .raw_bytes
+                .get(start..end)
+                .ok_or_else(|| {
+                    TextEditorError::ContainerWrite(ContainerWriteError::ObjectWrite(
+                        "grow: export trie range out of bounds".into(),
+                    ))
+                })?;
+            let mut exports = crate::container::macho_export_trie::parse(blob)
+                .map_err(TextEditorError::ContainerWrite)?;
+            const EXPORT_SYMBOL_FLAGS_REEXPORT: u64 = 0x08;
+            for e in &mut exports {
+                // Reexports reference another dylib (no local address);
+                // regular / stub-and-resolver exports moved by delta.
+                if e.flags & EXPORT_SYMBOL_FLAGS_REEXPORT == 0 {
+                    e.address_offset = e.address_offset.saturating_add(delta);
+                }
             }
-            blob.resize(cfhdr.datasize as usize, 0);
-            raw_overrides.push((cfhdr.dataoff + delta, blob));
+            let mut rebuilt = crate::container::macho_export_trie::build(&exports);
+            if rebuilt.len() as u64 > trie.datasize {
+                // The +delta ULEB expansion outgrew the original slot;
+                // relocating the trie into a grown __LINKEDIT is a
+                // follow-up. Surface it rather than truncate.
+                return Err(TextEditorError::ContainerWrite(
+                    ContainerWriteError::ObjectWrite(format!(
+                        "grow: rebuilt export trie ({} bytes) outgrew its \
+                         {}-byte slot; trie relocation is not yet implemented",
+                        rebuilt.len(),
+                        trie.datasize,
+                    )),
+                ));
+            }
+            rebuilt.resize(trie.datasize as usize, 0);
+            raw_overrides.push((trie.dataoff + delta, rebuilt));
         }
 
         let opts = MachOWriteOptions {
