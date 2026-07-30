@@ -186,6 +186,72 @@ pub enum TextEditorError {
     /// malformed. Surfaced instead of panicking so a hostile input
     /// is a caught error.
     MalformedDynamicData(crate::container::dynsym_extension::DynParseError),
+    /// [`BinaryState::reserve_text_region`] was asked for space on a
+    /// format that doesn't support the reserve/carve API yet (only
+    /// Mach-O is wired up in this increment).
+    ReserveUnsupportedFormat(crate::container::BinaryFormat),
+    /// A text-space reservation was requested but one already exists.
+    /// The current increment supports a single reserved region at a
+    /// time; release or commit before reserving again.
+    TextRegionAlreadyReserved,
+    /// A `RegionId` was passed that doesn't match the active
+    /// reservation (stale handle, or none reserved).
+    NoSuchRegion,
+    /// The free-space policy ([`Exhaustion::Fail`]) couldn't satisfy
+    /// the reservation: `needed` bytes requested, `available` was the
+    /// largest contiguous free run found.
+    InsufficientTextSpace { needed: u64, available: u64 },
+    /// The reservation needs more room than free space offers and the
+    /// policy is [`Exhaustion::Grow`] — extending `__TEXT` by `deficit`
+    /// bytes (shifting `__DATA*`/`__LINKEDIT`) is required. The growth
+    /// path is not implemented in this increment.
+    WouldRequireTextGrowth { deficit: u64 },
+    /// A placement/carve exceeded its region's capacity: `requested`
+    /// bytes, `available` remained.
+    RegionFull { requested: u64, available: u64 },
+    /// `reserve_text_region` requires load-command / front edits
+    /// (`add_library_dependency`, exported-symbol appends) to be
+    /// resolved first, because they can move `__text` and invalidate a
+    /// handed-out region base. Reserve before those, or after they've
+    /// been committed.
+    ReserveNeedsFrontEditsFirst,
+    /// A caller-supplied alignment was zero.
+    InvalidAlignment,
+}
+
+impl From<crate::rewrite::space::ReserveError> for TextEditorError {
+    fn from(e: crate::rewrite::space::ReserveError) -> Self {
+        use crate::rewrite::space::ReserveError;
+        match e {
+            ReserveError::ZeroAlign => TextEditorError::InvalidAlignment,
+            ReserveError::InsufficientFreeSpace {
+                needed,
+                largest_available,
+            } => TextEditorError::InsufficientTextSpace {
+                needed,
+                available: largest_available,
+            },
+            ReserveError::GrowthRequired { deficit } => {
+                TextEditorError::WouldRequireTextGrowth { deficit }
+            }
+        }
+    }
+}
+
+impl From<crate::rewrite::space::CarveError> for TextEditorError {
+    fn from(e: crate::rewrite::space::CarveError) -> Self {
+        use crate::rewrite::space::CarveError;
+        match e {
+            CarveError::ZeroAlign => TextEditorError::InvalidAlignment,
+            CarveError::RegionFull { requested, available } => {
+                TextEditorError::RegionFull { requested, available }
+            }
+            CarveError::Overflow => TextEditorError::RegionFull {
+                requested: u64::MAX,
+                available: 0,
+            },
+        }
+    }
 }
 
 impl From<crate::container::dynsym_extension::DynParseError> for TextEditorError {
@@ -275,6 +341,40 @@ impl std::fmt::Display for TextEditorError {
             Self::MalformedDynamicData(err) => {
                 write!(f, "malformed dynamic linking data in input: {err}")
             }
+            Self::ReserveUnsupportedFormat(fmt) => write!(
+                f,
+                "reserve_text_region is only implemented for Mach-O; \
+                 container format is {fmt:?}",
+            ),
+            Self::TextRegionAlreadyReserved => write!(
+                f,
+                "a text-space region is already reserved; this increment \
+                 supports one region at a time",
+            ),
+            Self::NoSuchRegion => write!(f, "no such reserved text region (stale handle?)"),
+            Self::InsufficientTextSpace { needed, available } => write!(
+                f,
+                "reserve_text_region: need {needed} contiguous free bytes in \
+                 __TEXT but the largest free run is {available}; allow a grow \
+                 or reduce the request",
+            ),
+            Self::WouldRequireTextGrowth { deficit } => write!(
+                f,
+                "reserve_text_region: satisfying this needs __TEXT grown by \
+                 {deficit} more bytes (shifting __DATA*/__LINKEDIT); the grow \
+                 path is not yet implemented",
+            ),
+            Self::RegionFull { requested, available } => write!(
+                f,
+                "carve/placement of {requested} bytes exceeds the region's \
+                 remaining {available} bytes",
+            ),
+            Self::ReserveNeedsFrontEditsFirst => write!(
+                f,
+                "reserve_text_region must run before load-command/front edits \
+                 (add_library_dependency, exported appends) that can move __text",
+            ),
+            Self::InvalidAlignment => write!(f, "alignment must be non-zero"),
             Self::ChainedFixupsBlobTooLarge { new_size, capacity } => write!(
                 f,
                 "commit_chained_fixups: new blob is {new_size} bytes but the \
@@ -627,6 +727,42 @@ pub struct BinaryState {
     /// for "the LC_DYLD_CHAINED_FIXUPS blob," so this is the
     /// least-invasive way to land it.
     macho_raw_byte_overrides: Vec<(u64, Vec<u8>)>,
+    /// The active text-space reservation, if any. Established by
+    /// [`Self::reserve_text_region`] and consumed by the region-scoped
+    /// placement methods (`add_function_in` / `add_data_in` /
+    /// `add_raw_code_in`). The [`space::Region`] is the bump allocator
+    /// whose cursor stays in lockstep with the shared `appended`
+    /// buffer's length, so the two never disagree about where the next
+    /// item lands. `None` until the first reservation; a single region
+    /// is supported per edit in this increment.
+    reserved_text_region: Option<(RegionId, crate::rewrite::space::Region)>,
+}
+
+/// Opaque handle to a reserved text-space region. Passed back to the
+/// region-scoped placement methods. `Copy` so it composes with the
+/// `binary`/`text` borrow split the way `SymbolId`/`SectionId` do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionId(pub u32);
+
+/// The result of a successful [`BinaryState::reserve_text_region`]: a
+/// contiguous R-X span you can carve functions/data out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    /// Handle to pass to `add_function_in` / `add_data_in` /
+    /// `add_raw_code_in` / `next_address_in`.
+    pub region: RegionId,
+    /// Virtual address of the span start. Stable for the life of the
+    /// reservation (provided front/load-command edits were settled
+    /// first — see [`TextEditorError::ReserveNeedsFrontEditsFirst`]).
+    pub base_address: u64,
+    /// File offset of the span start.
+    pub base_file_offset: u64,
+    /// Total bytes reserved (`min_bytes + headroom`).
+    pub capacity: u64,
+    /// What free space fulfilled the reservation, and how much of each.
+    /// A single contiguous run today, so one entry — but shaped as a
+    /// list so scattered fulfilment can report multiple sources later.
+    pub sources: Vec<(crate::rewrite::space::SpaceSource, u64)>,
 }
 
 /// A text section lifted into editable IR form.
@@ -1175,6 +1311,7 @@ impl BinaryEditor {
                 force_segment_placement: false,
                 no_new_segments: false,
                 macho_raw_byte_overrides: Vec::new(),
+                reserved_text_region: None,
             },
             text: None,
         })
@@ -2175,6 +2312,273 @@ impl BinaryState {
     /// - Calls to undefined externs (e.g. `printf` via the PLT)
     ///   are not yet supported — emit can't yet produce the
     ///   PLT-aware relocation an ET_DYN runtime linker expects.
+    // ---- Reserve / carve text-space API -------------------------------
+    //
+    // A controlled front-end over the same intra-`__TEXT` placement the
+    // region-less `add_function` uses. `reserve_text_region` pins a
+    // contiguous R-X span (harvested from `__TEXT` free space via the
+    // pure `space` allocator) and bounds total placement to its
+    // capacity; the `*_in` methods carve functions/data out of it. This
+    // increment fulfils reservations from free space only — the
+    // `Exhaustion::Grow` path (extend `__TEXT`, shift `__DATA*`) reports
+    // `WouldRequireTextGrowth` rather than growing.
+
+    /// Reserve a contiguous R-X region inside `__TEXT`'s free space.
+    ///
+    /// Harvests the segment's inter-section holes and tail pad, picks a
+    /// span via [`space::plan_reservation`], and returns a
+    /// [`Reservation`] you can carve out of. Fails (rather than moving
+    /// anything) unless `req.on_exhaustion` is [`Exhaustion::Grow`], in
+    /// which case it reports [`TextEditorError::WouldRequireTextGrowth`]
+    /// (the grow path is a later increment).
+    ///
+    /// Mach-O only for now. Must run before front/load-command edits
+    /// (`add_library_dependency`, exported appends) so the region base
+    /// it hands out can't be invalidated by `__text` moving.
+    pub fn reserve_text_region(
+        &mut self,
+        req: crate::rewrite::space::ReserveRequest,
+    ) -> Result<Reservation, TextEditorError> {
+        if !matches!(self.container.format, crate::container::BinaryFormat::Macho) {
+            return Err(TextEditorError::ReserveUnsupportedFormat(self.container.format));
+        }
+        if !self.pending_library_deps.is_empty() || self.force_segment_placement {
+            return Err(TextEditorError::ReserveNeedsFrontEditsFirst);
+        }
+        if self.reserved_text_region.is_some() || self.appended.is_some() {
+            return Err(TextEditorError::TextRegionAlreadyReserved);
+        }
+        let extents = self.macho_text_free_extents()?;
+        let plan = crate::rewrite::space::plan_reservation(&extents, &req)?;
+        // Seed the appended state at the reserved base so the existing
+        // intra-`__TEXT` commit path places the carved content.
+        self.appended = Some(AppendedFunctionsState {
+            segment_vaddr: plan.base_address,
+            bytes: Vec::new(),
+            exports: Vec::new(),
+            items: Vec::new(),
+        });
+        let id = RegionId(0);
+        self.reserved_text_region = Some((id, plan.region()));
+        Ok(Reservation {
+            region: id,
+            base_address: plan.base_address,
+            base_file_offset: plan.base_file_offset,
+            capacity: plan.capacity,
+            sources: vec![(plan.source, plan.capacity)],
+        })
+    }
+
+    /// The address the next `align`-aligned carve in `region` would
+    /// land at, without consuming anything. Lets a caller that encodes
+    /// its own machine code target a stable address before placing it
+    /// with [`Self::add_raw_code_in`].
+    pub fn next_address_in(&self, region: RegionId, align: u64) -> Result<u64, TextEditorError> {
+        if align == 0 {
+            return Err(TextEditorError::InvalidAlignment);
+        }
+        let (id, r) = self
+            .reserved_text_region
+            .as_ref()
+            .ok_or(TextEditorError::NoSuchRegion)?;
+        if *id != region {
+            return Err(TextEditorError::NoSuchRegion);
+        }
+        let cur = r
+            .base_address()
+            .checked_add(r.used())
+            .ok_or(TextEditorError::RegionFull { requested: 0, available: r.remaining() })?;
+        let rem = cur % align;
+        if rem == 0 {
+            Ok(cur)
+        } else {
+            cur.checked_add(align - rem)
+                .ok_or(TextEditorError::RegionFull { requested: 0, available: r.remaining() })
+        }
+    }
+
+    /// Remaining free bytes in `region`, or `None` if the handle is
+    /// stale.
+    pub fn region_remaining(&self, region: RegionId) -> Option<u64> {
+        self.reserved_text_region
+            .as_ref()
+            .filter(|(id, _)| *id == region)
+            .map(|(_, r)| r.remaining())
+    }
+
+    /// Append a new function's (typed) body into `region`. Lays out and
+    /// emits at the region's next 4-aligned address, so its internal
+    /// branches and PC-relative references resolve against where it
+    /// actually lands. Returns the new function's symbol.
+    ///
+    /// The body may reference *other* already-registered symbols but not
+    /// itself (its own symbol is minted after emit) in this increment.
+    pub fn add_function_in(
+        &mut self,
+        region: RegionId,
+        name: &str,
+        instructions: Vec<RewriteInstruction>,
+    ) -> Result<SymbolId, TextEditorError> {
+        if instructions.is_empty() {
+            return Err(TextEditorError::EmptyFunction(name.to_string()));
+        }
+        let target_addr = self.next_address_in(region, 4)?;
+        // Lay out + emit at the target address (pure — no state change,
+        // so a RegionFull carve below rolls nothing back).
+        let plan =
+            RewritePlanGeneric::<Aarch64Isa>::from_instructions(instructions, Some(&self.container));
+        let layout = lay_out(&plan, target_addr, Some(&self.container))?;
+        let output = emit(&plan, &layout, Some(&self.container))?;
+        let carve = {
+            let r = self.active_region_mut(region)?;
+            r.carve(output.bytes.len() as u64, 4)?
+        };
+        debug_assert_eq!(carve.address, target_addr);
+        {
+            let state = self.appended.as_mut().ok_or(TextEditorError::NoSuchRegion)?;
+            state.bytes.resize(carve.offset_in_region as usize, 0);
+            state.bytes.extend_from_slice(&output.bytes);
+            state.items.push(RetainedAppend::Function {
+                name: name.to_string(),
+                offset: carve.offset_in_region,
+                plan: wrap_retained_plan(plan),
+            });
+        }
+        let symbol_id = SymbolId(self.container.symbols.len());
+        self.container.symbols.push(crate::container::Symbol {
+            id: symbol_id,
+            name: name.to_string(),
+            address: carve.address,
+            size: output.bytes.len() as u64,
+            kind: SymbolKind::Function,
+            binding: crate::container::SymbolBinding::Global,
+            section: None,
+            is_undefined: false,
+            flags: None,
+        });
+        Ok(symbol_id)
+    }
+
+    /// Append read-only data into `region`, aligned to `align`. Returns
+    /// its symbol (kind `Object`).
+    pub fn add_data_in(
+        &mut self,
+        region: RegionId,
+        name: &str,
+        bytes: &[u8],
+        align: u64,
+    ) -> Result<SymbolId, TextEditorError> {
+        self.place_raw_in_region(region, name, bytes, align, SymbolKind::Object)
+    }
+
+    /// Append pre-encoded raw machine code into `region`, aligned to
+    /// `align`. The caller is responsible for having encoded the bytes
+    /// against the address [`Self::next_address_in`] reports for the
+    /// same `align` — the region places them verbatim and never rebases
+    /// a free-space reservation, so a stable target address is
+    /// guaranteed. Returns its symbol (kind `Function`).
+    pub fn add_raw_code_in(
+        &mut self,
+        region: RegionId,
+        name: &str,
+        bytes: &[u8],
+        align: u64,
+    ) -> Result<SymbolId, TextEditorError> {
+        self.place_raw_in_region(region, name, bytes, align, SymbolKind::Function)
+    }
+
+    /// Shared raw-bytes placement for [`Self::add_data_in`] /
+    /// [`Self::add_raw_code_in`]. Keeps the region cursor and the shared
+    /// `appended` buffer in lockstep.
+    fn place_raw_in_region(
+        &mut self,
+        region: RegionId,
+        name: &str,
+        bytes: &[u8],
+        align: u64,
+        kind: SymbolKind,
+    ) -> Result<SymbolId, TextEditorError> {
+        if align == 0 {
+            return Err(TextEditorError::InvalidAlignment);
+        }
+        let carve = {
+            let r = self.active_region_mut(region)?;
+            r.carve(bytes.len() as u64, align)?
+        };
+        {
+            let state = self.appended.as_mut().ok_or(TextEditorError::NoSuchRegion)?;
+            state.bytes.resize(carve.offset_in_region as usize, 0);
+            state.bytes.extend_from_slice(bytes);
+            state.items.push(RetainedAppend::Data {
+                name: name.to_string(),
+                offset: carve.offset_in_region,
+                bytes: bytes.to_vec(),
+            });
+        }
+        let symbol_id = SymbolId(self.container.symbols.len());
+        self.container.symbols.push(crate::container::Symbol {
+            id: symbol_id,
+            name: name.to_string(),
+            address: carve.address,
+            size: bytes.len() as u64,
+            kind,
+            binding: crate::container::SymbolBinding::Global,
+            section: None,
+            is_undefined: false,
+            flags: None,
+        });
+        Ok(symbol_id)
+    }
+
+    /// Look up the active region by handle for a mutable carve.
+    fn active_region_mut(
+        &mut self,
+        region: RegionId,
+    ) -> Result<&mut crate::rewrite::space::Region, TextEditorError> {
+        match &mut self.reserved_text_region {
+            Some((id, r)) if *id == region => Ok(r),
+            _ => Err(TextEditorError::NoSuchRegion),
+        }
+    }
+
+    /// Build the free-space extents the allocator draws on from the
+    /// Mach-O `__TEXT` free regions. The highest-address run is the tail
+    /// pad; earlier ones are inter-section holes. (`text_free_regions`
+    /// skips the header-pad region, so no `HeaderPad` source is offered
+    /// yet — that's a later increment.)
+    fn macho_text_free_extents(
+        &self,
+    ) -> Result<Vec<crate::rewrite::space::FreeExtent>, TextEditorError> {
+        use crate::rewrite::space::{FreeExtent, SpaceSource};
+        let image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+        let mut regions: Vec<_> = image
+            .layout
+            .text_free_regions()
+            .into_iter()
+            .filter(|r| r.segment_name == "__TEXT")
+            .collect();
+        regions.sort_by_key(|r| r.vaddr);
+        let last = regions.len().saturating_sub(1);
+        Ok(regions
+            .iter()
+            .enumerate()
+            .map(|(i, r)| FreeExtent {
+                address: r.vaddr,
+                file_offset: r.file_offset,
+                len: r.size,
+                source: if i == last {
+                    SpaceSource::TailPad
+                } else {
+                    SpaceSource::InterSectionHole
+                },
+            })
+            .collect())
+    }
+
     pub fn add_function(
         &mut self,
         name: &str,

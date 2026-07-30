@@ -823,3 +823,325 @@ fn commit_chained_fixups_rejects_blob_too_large() {
         "expected ChainedFixupsBlobTooLarge, got {err:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reserve / carve text-space API (Mach-O, free-space path)
+// ---------------------------------------------------------------------------
+
+fn macho_lib_demo_bytes() -> Option<Vec<u8>> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/macho_runtime/fixtures/lib_demo/libgreet.dylib");
+    std::fs::read(path).ok()
+}
+
+/// A one-instruction `ret` body for placement round-trips.
+fn ret_body() -> Vec<crate::rewrite::RewriteInstruction> {
+    use crate::isa::aarch64::{DecodedOperand, Register, RegisterClass};
+    use crate::rewrite::{RewriteInstruction, RewriteOperand};
+    let x30 = Register {
+        class: RegisterClass::X,
+        index: 30,
+    };
+    vec![RewriteInstruction {
+        mnemonic: Aarch64Mnemonic::Ret,
+        operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+        original_address: None,
+        source_size: None,
+    }]
+}
+
+#[test]
+fn reserve_text_region_lands_in_text_free_space() {
+    use crate::rewrite::space::{ReserveRequest, SpaceSource};
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        eprintln!("skip: macho fixture absent");
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let image = container.macho_image.as_ref().expect("macho image");
+    let free = image.layout.text_free_regions();
+    let total_free: u64 = free
+        .iter()
+        .filter(|r| r.segment_name == "__TEXT")
+        .map(|r| r.size)
+        .sum();
+    assert!(
+        total_free >= 0x40,
+        "fixture should carry __TEXT free space; got {total_free}"
+    );
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x20))
+        .expect("reserve");
+    // The reserved span must sit fully inside a real __TEXT free region,
+    // with the file offset matching that region's vaddr→fileoff skew.
+    let containing = free
+        .iter()
+        .find(|r| {
+            r.segment_name == "__TEXT"
+                && res.base_address >= r.vaddr
+                && res.base_address + res.capacity <= r.vaddr + r.size
+        })
+        .expect("reservation lies inside one free region");
+    assert_eq!(
+        res.base_file_offset,
+        containing.file_offset + (res.base_address - containing.vaddr),
+    );
+    assert_eq!(res.capacity, 0x20);
+    assert!(matches!(
+        res.sources.as_slice(),
+        [(SpaceSource::TailPad | SpaceSource::InterSectionHole, 0x20)]
+    ));
+    assert_eq!(editor.binary.region_remaining(res.region), Some(0x20));
+}
+
+#[test]
+fn reserve_free_only_rejects_oversize_without_growth() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    // 4 GiB fits no free region; the Fail policy must error, not grow.
+    let err = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x1_0000_0000))
+        .unwrap_err();
+    assert!(
+        matches!(err, TextEditorError::InsufficientTextSpace { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn reserve_grow_policy_reports_growth_required() {
+    use crate::rewrite::space::{Exhaustion, ReserveRequest};
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let req = ReserveRequest {
+        min_bytes: 0x1_0000_0000,
+        headroom: 0,
+        align: 4,
+        allow_headerpad: false,
+        on_exhaustion: Exhaustion::Grow,
+    };
+    let err = editor.binary.reserve_text_region(req).unwrap_err();
+    assert!(
+        matches!(err, TextEditorError::WouldRequireTextGrowth { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn reserve_then_add_data_in_round_trips_macho() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x40))
+        .expect("reserve");
+    let blob = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+    let sym = editor
+        .binary
+        .add_data_in(res.region, "reserved_blob", &blob, 4)
+        .expect("add_data_in");
+    // First 4-aligned carve lands at the region base.
+    assert_eq!(editor.binary.symbol_address(sym), res.base_address);
+    let written = editor.commit_to_bytes_unsigned().expect("commit");
+    // Output is still a valid Mach-O.
+    let _ = Container::from_bytes(&written).expect("re-parse");
+    // The blob is physically at the reserved file offset.
+    let off = res.base_file_offset as usize;
+    assert_eq!(&written[off..off + blob.len()], &blob);
+}
+
+#[test]
+fn reserve_then_add_function_in_round_trips_macho() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x40))
+        .expect("reserve");
+    let sym = editor
+        .binary
+        .add_function_in(res.region, "reserved_ret", ret_body())
+        .expect("add_function_in");
+    let addr = editor.binary.symbol_address(sym);
+    assert_eq!(addr, res.base_address);
+    let written = editor.commit_to_bytes_unsigned().expect("commit");
+    let _ = Container::from_bytes(&written).expect("re-parse");
+    // The emitted word decodes back to `ret` at its placed address.
+    let off = res.base_file_offset as usize;
+    let word = u32::from_le_bytes(written[off..off + 4].try_into().unwrap());
+    let insn = aarch64::decode_instruction(addr, word).expect("decode placed word");
+    assert_eq!(insn.mnemonic, Aarch64Mnemonic::Ret);
+}
+
+#[test]
+fn next_address_then_add_raw_code_round_trips_macho() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x40))
+        .expect("reserve");
+    // Peek the address, then hand it pre-encoded `ret` bytes.
+    let addr = editor.binary.next_address_in(res.region, 4).expect("peek");
+    assert_eq!(addr, res.base_address);
+    let raw = 0xd65f03c0u32.to_le_bytes(); // ret
+    let sym = editor
+        .binary
+        .add_raw_code_in(res.region, "raw_ret", &raw, 4)
+        .expect("add_raw_code_in");
+    assert_eq!(editor.binary.symbol_address(sym), addr);
+    let written = editor.commit_to_bytes_unsigned().expect("commit");
+    let _ = Container::from_bytes(&written).expect("re-parse");
+    let off = res.base_file_offset as usize;
+    assert_eq!(&written[off..off + 4], &raw, "raw code placed verbatim");
+}
+
+#[test]
+fn region_full_is_a_clean_error() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x8))
+        .expect("reserve");
+    editor
+        .binary
+        .add_data_in(res.region, "a", &[0u8; 8], 1)
+        .expect("first fills the region exactly");
+    let err = editor
+        .binary
+        .add_data_in(res.region, "b", &[0u8; 8], 1)
+        .unwrap_err();
+    assert!(
+        matches!(err, TextEditorError::RegionFull { .. }),
+        "overflow must be a caught error, got {err:?}"
+    );
+}
+
+#[test]
+fn stale_region_handle_is_rejected() {
+    use crate::rewrite::space::ReserveRequest;
+    use crate::rewrite::RegionId;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let _res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x20))
+        .expect("reserve");
+    let bogus = RegionId(999);
+    assert!(matches!(
+        editor.binary.add_data_in(bogus, "x", &[0u8; 4], 4),
+        Err(TextEditorError::NoSuchRegion)
+    ));
+    assert!(matches!(
+        editor.binary.next_address_in(bogus, 4),
+        Err(TextEditorError::NoSuchRegion)
+    ));
+    assert_eq!(editor.binary.region_remaining(bogus), None);
+}
+
+#[test]
+fn double_reserve_is_rejected() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x10))
+        .expect("first reserve");
+    let err = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x10))
+        .unwrap_err();
+    assert!(
+        matches!(err, TextEditorError::TextRegionAlreadyReserved),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn multiple_carves_are_contiguous_and_round_trip() {
+    use crate::rewrite::space::ReserveRequest;
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x20).with_headroom(0x20))
+        .expect("reserve");
+    // A function, then data, then raw code — packed back to back.
+    let f = editor
+        .binary
+        .add_function_in(res.region, "f0", ret_body())
+        .expect("f");
+    let d = editor
+        .binary
+        .add_data_in(res.region, "d0", &[1u8, 2, 3, 4], 4)
+        .expect("d");
+    let r = editor
+        .binary
+        .add_raw_code_in(res.region, "r0", &0xd65f03c0u32.to_le_bytes(), 4)
+        .expect("r");
+    let (fa, da, ra) = (
+        editor.binary.symbol_address(f),
+        editor.binary.symbol_address(d),
+        editor.binary.symbol_address(r),
+    );
+    // Strictly increasing, non-overlapping, all inside the reservation.
+    assert!(fa < da && da < ra);
+    assert!(fa >= res.base_address);
+    assert!(ra + 4 <= res.base_address + res.capacity);
+    let written = editor.commit_to_bytes_unsigned().expect("commit");
+    let _ = Container::from_bytes(&written).expect("re-parse");
+}
+
+#[test]
+fn reserve_on_non_macho_is_rejected() {
+    use crate::rewrite::space::ReserveRequest;
+    // `fixture_container` is an ELF ET_REL — not Mach-O.
+    let container = fixture_container();
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let err = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x10))
+        .unwrap_err();
+    assert!(
+        matches!(err, TextEditorError::ReserveUnsupportedFormat(_)),
+        "got {err:?}"
+    );
+}

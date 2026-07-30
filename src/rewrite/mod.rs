@@ -42,6 +42,7 @@ pub mod emit;
 pub mod ir;
 pub mod layout;
 pub mod plan;
+pub mod space;
 
 pub use commit::commit_to_container;
 pub use data::{
@@ -49,8 +50,8 @@ pub use data::{
     DataLift, DataLiftError, DataPayload, DataSection,
 };
 pub use editor::{
-    BinaryEditor, BinaryState, InitialiserPosition, LiftedTextSection, ScatterPlacement,
-    TextEditorError,
+    BinaryEditor, BinaryState, InitialiserPosition, LiftedTextSection, RegionId, Reservation,
+    ScatterPlacement, TextEditorError,
 };
 #[allow(deprecated)]
 pub use editor::TextEditor;
@@ -85,5 +86,9 @@ pub use layout::{
     lay_out, lay_out_scattered, EmitStrategy, InstructionLayout, Layout, LayoutError,
 };
 pub use plan::EditError;
+pub use space::{
+    Carve, CarveError, Exhaustion, FreeExtent, PlannedReservation, Region, ReserveError,
+    ReserveRequest, SpaceSource,
+};
 
 pub use crate::mc::ControlFlowGraph;

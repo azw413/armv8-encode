@@ -404,6 +404,130 @@ fn et_dyn_appended_function_changes_observable_output() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn reserve_text_region_add_function_in_runs_under_dyld() {
+    // Increment-1 runtime acceptance for the reserve/carve API:
+    // reserve a region in `__TEXT` free space, place _greet_quintuple
+    // into it via `add_function_in`, and redirect _greet_double to it.
+    // Same observable outcome as the add_function path
+    // (double=21*5=105), but driven through reserve_text_region +
+    // add_function_in — proving the reserved-region placement produces
+    // a dyld-loadable, runnable dylib that stays a single R-X segment
+    // (no `__APPENDED`).
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::isa::aarch64::{
+        Aarch64Mnemonic, DecodedOperand, Register, RegisterClass, Shift, ShiftKind,
+        ShiftedRegister,
+    };
+    use armv8_encode::rewrite::space::ReserveRequest;
+    use armv8_encode::rewrite::{BinaryEditor, RewriteInstruction, RewriteOperand, Target};
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor =
+        BinaryEditor::for_section(&container, "__text").expect("open editor on __text");
+
+    // Reserve room for the new 3-instruction function from __TEXT free
+    // space (0x20 is comfortably more than the ~12 bytes it needs, and
+    // the structural tests confirm this fixture has the room).
+    let reservation = editor
+        .binary
+        .reserve_text_region(ReserveRequest::exact(0x20))
+        .expect("reserve __TEXT region");
+
+    // greet_quintuple(n) = n * 5: lsl w8,w0,#2; add w0,w8,w0; ret.
+    let w0 = Register { class: RegisterClass::W, index: 0 };
+    let w8 = Register { class: RegisterClass::W, index: 8 };
+    let x30 = Register { class: RegisterClass::X, index: 30 };
+    let new_function = vec![
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Lsl,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w8.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
+            ],
+            original_address: None,
+            source_size: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Add,
+            operands: vec![
+                RewriteOperand::Decoded(DecodedOperand::Register(w0.clone())),
+                RewriteOperand::Decoded(DecodedOperand::Register(w8)),
+                RewriteOperand::Decoded(DecodedOperand::ShiftedRegister(ShiftedRegister {
+                    register: w0,
+                    shift: Shift { kind: ShiftKind::Lsl, amount: 0 },
+                })),
+            ],
+            original_address: None,
+            source_size: None,
+        },
+        RewriteInstruction {
+            mnemonic: Aarch64Mnemonic::Ret,
+            operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
+            original_address: None,
+            source_size: None,
+        },
+    ];
+
+    let quintuple_id = editor
+        .binary
+        .add_function_in(reservation.region, "_greet_quintuple", new_function)
+        .expect("add_function_in");
+
+    let greet_double_addr = editor
+        .binary
+        .function_address("_greet_double")
+        .expect("_greet_double symbol");
+    editor
+        .text
+        .as_mut()
+        .unwrap()
+        .aarch64_mut()
+        .unwrap()
+        .replace_instruction_at(
+            greet_double_addr,
+            RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::B,
+                operands: vec![RewriteOperand::Branch(Target::Symbol(quintuple_id))],
+                original_address: Some(greet_double_addr),
+                source_size: None,
+            },
+        )
+        .expect("replace_instruction_at");
+
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let rewritten = Container::from_bytes(&written).expect("re-parse rewritten libgreet.dylib");
+
+    // Reserved-region placement stays intra-`__TEXT`: no `__APPENDED`.
+    let segment_names: Vec<&str> = rewritten
+        .macho_image
+        .as_ref()
+        .expect("macho_image")
+        .layout
+        .segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !segment_names.iter().any(|n| *n == "__APPENDED"),
+        "reserved-region placement should stay intra-__TEXT; got {segment_names:?}",
+    );
+
+    std::fs::write(&lib_path, &written).expect("write rewritten libgreet.dylib");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=105 offset=107\n",
+        "reserved _greet_quintuple should make greet_double() \
+         tail-call into it, returning 21*5=105",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_appended_data_referenced_by_appended_function() {
     // Phase 4 acceptance: `add_data` lays a read-only blob in
     // the same appended segment as `add_function`; the
