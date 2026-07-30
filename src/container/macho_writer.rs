@@ -396,19 +396,17 @@ pub fn write_with_appended_segment_opts(
         .iter()
         .map(|name| dylib_command_size(name))
         .sum();
-    let headerpad = layout.headerpad() + reclaimed;
-    let new_lc_size = if headerpad >= SEGMENT_LC_SIZE_WITH_SECTION + dep_lc_total {
-        SEGMENT_LC_SIZE_WITH_SECTION
-    } else if headerpad >= SEGMENT_LC_SIZE_NO_SECTION + dep_lc_total {
-        SEGMENT_LC_SIZE_NO_SECTION
-    } else {
-        return Err(ContainerWriteError::ObjectWrite(format!(
-            "Mach-O append: not enough headerpad room ({headerpad} bytes, need {}). \
-             Rebuild the input with `-Wl,-headerpad,0x1000` (or larger) so the \
-             writer has space to grow the load-command list in place.",
-            SEGMENT_LC_SIZE_NO_SECTION + dep_lc_total,
-        )));
-    };
+    let new_lc_size = choose_append_lc_size(layout.headerpad(), reclaimed, dep_lc_total)
+        .ok_or_else(|| {
+            let usable =
+                (layout.headerpad() + reclaimed).saturating_sub(CODE_SIGNATURE_LC_SIZE);
+            ContainerWriteError::ObjectWrite(format!(
+                "Mach-O append: not enough headerpad room ({usable} bytes, need {}). \
+                 Rebuild the input with `-Wl,-headerpad,0x1000` (or larger) so the \
+                 writer has space to grow the load-command list in place.",
+                SEGMENT_LC_SIZE_NO_SECTION + dep_lc_total,
+            ))
+        })?;
     let new_lc_size_usize = new_lc_size as usize;
 
     // Apply section-byte overrides at original file offsets.
@@ -1516,6 +1514,80 @@ const SEGMENT_LC_SIZE_WITH_SECTION: u64 = 152;
 /// tight for the 152-byte form; the `__appended` section is only a
 /// disassembler hint, so dropping it is behaviour-preserving.
 const SEGMENT_LC_SIZE_NO_SECTION: u64 = 72;
+
+/// Bytes of header space `codesign` re-consumes after this writer runs: a
+/// `LC_CODE_SIGNATURE` (`linkedit_data_command`). `reclaim_headerpad` strips any
+/// existing signature LC and counts its bytes as free, but codesign rebuilds one
+/// on re-sign (adding one even to a previously-unsigned input), so the fit check
+/// must reserve this — otherwise the re-added LC overruns the first section's file
+/// offset and silently clobbers its opening instructions (a protected function's
+/// entry) with load-command bytes.
+const CODE_SIGNATURE_LC_SIZE: u64 = 16;
+
+/// Pick the appended-segment load-command size that fits the available header
+/// space, reserving [`CODE_SIGNATURE_LC_SIZE`] for the signature codesign re-adds.
+/// Prefers the 152-byte form (with a `section_64`), falls back to the 72-byte
+/// section-less form, and returns `None` if even that (plus the dylib-dependency
+/// commands) won't fit — the caller then errors with headerpad guidance.
+fn choose_append_lc_size(raw_headerpad: u64, reclaimed: u64, dep_lc_total: u64) -> Option<u64> {
+    let usable = (raw_headerpad + reclaimed).saturating_sub(CODE_SIGNATURE_LC_SIZE);
+    if usable >= SEGMENT_LC_SIZE_WITH_SECTION + dep_lc_total {
+        Some(SEGMENT_LC_SIZE_WITH_SECTION)
+    } else if usable >= SEGMENT_LC_SIZE_NO_SECTION + dep_lc_total {
+        Some(SEGMENT_LC_SIZE_NO_SECTION)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod headerpad_tests {
+    use super::{
+        choose_append_lc_size, CODE_SIGNATURE_LC_SIZE, SEGMENT_LC_SIZE_NO_SECTION,
+        SEGMENT_LC_SIZE_WITH_SECTION,
+    };
+
+    /// The exact bug scenario: a clang-default binary with 32 bytes of headerpad,
+    /// after reclaiming LC_CODE_SIGNATURE + LC_FUNCTION_STARTS + LC_DATA_IN_CODE
+    /// (48 bytes). Naive accounting (32 + 48 = 80 ≥ 72) would place the 72-byte
+    /// section-less segment, but codesign then re-adds the 16-byte signature LC and
+    /// overruns `__text` by 8 bytes. Reserving CODE_SIGNATURE_LC_SIZE makes the
+    /// usable pad 64 < 72, so this is correctly REJECTED (loud error) not corrupted.
+    #[test]
+    fn reserves_codesign_lc_and_rejects_tight_headerpad() {
+        assert_eq!(choose_append_lc_size(32, 48, 0), None);
+        // Sanity: without the reservation it would (wrongly) have fit.
+        assert!(32 + 48 >= SEGMENT_LC_SIZE_NO_SECTION);
+    }
+
+    #[test]
+    fn fits_when_enough_pad_after_reservation() {
+        // 32 + 64 - 16 = 80 ≥ 72: section-less form fits.
+        assert_eq!(
+            choose_append_lc_size(32, 64, 0),
+            Some(SEGMENT_LC_SIZE_NO_SECTION)
+        );
+        // Generous pad: the 152-byte form with a section fits.
+        assert_eq!(
+            choose_append_lc_size(200, 0, 0),
+            Some(SEGMENT_LC_SIZE_WITH_SECTION)
+        );
+    }
+
+    #[test]
+    fn accounts_for_dylib_dependency_commands() {
+        // Just enough for the section-less form with no deps...
+        assert_eq!(
+            choose_append_lc_size(SEGMENT_LC_SIZE_NO_SECTION + CODE_SIGNATURE_LC_SIZE, 0, 0),
+            Some(SEGMENT_LC_SIZE_NO_SECTION)
+        );
+        // ...but a 32-byte dylib command tips it over the edge → rejected.
+        assert_eq!(
+            choose_append_lc_size(SEGMENT_LC_SIZE_NO_SECTION + CODE_SIGNATURE_LC_SIZE, 0, 32),
+            None
+        );
+    }
+}
 
 /// Build the load command for the appended segment: a
 /// `segment_command_64`, plus one `section_64` unless `cmdsize` is
