@@ -181,6 +181,17 @@ pub enum TextEditorError {
     /// resolves to it). The caller should check the existing
     /// dependency list first if the name is dynamic.
     LibraryDependencyNotFound(String),
+    /// An input `.dynsym` / `.dynamic` section had a byte length
+    /// that isn't a whole number of entries — the binary is
+    /// malformed. Surfaced instead of panicking so a hostile input
+    /// is a caught error.
+    MalformedDynamicData(crate::container::dynsym_extension::DynParseError),
+}
+
+impl From<crate::container::dynsym_extension::DynParseError> for TextEditorError {
+    fn from(e: crate::container::dynsym_extension::DynParseError) -> Self {
+        TextEditorError::MalformedDynamicData(e)
+    }
 }
 
 impl std::fmt::Display for TextEditorError {
@@ -261,6 +272,9 @@ impl std::fmt::Display for TextEditorError {
                 "commit_chained_fixups: input has no LC_DYLD_CHAINED_FIXUPS \
                  load command — nothing to overwrite",
             ),
+            Self::MalformedDynamicData(err) => {
+                write!(f, "malformed dynamic linking data in input: {err}")
+            }
             Self::ChainedFixupsBlobTooLarge { new_size, capacity } => write!(
                 f,
                 "commit_chained_fixups: new blob is {new_size} bytes but the \
@@ -3454,7 +3468,7 @@ impl BinaryState {
             .ok_or(TextEditorError::AppendMissingElfImage)?;
 
         // Walk source dynsym; we'll append one entry per export.
-        let mut dynsym_entries = dx::parse_dynsym(&source_dynsym.bytes);
+        let mut dynsym_entries = dx::parse_dynsym(&source_dynsym.bytes)?;
         let mut dynstr_bytes = source_dynstr.bytes.clone();
         let mut versym_bytes = source_versym.bytes.clone();
 
@@ -3786,7 +3800,7 @@ impl BinaryState {
             .position(|s| s.name == ".dynamic")
             .ok_or(TextEditorError::AppendMissingElfImage)?;
         let starting_dynamic: Vec<crate::container::DynamicEntry> = match overrides.get(&dynamic_index) {
-            Some(bytes) => dx::parse_dynamic(bytes, container.is_64()),
+            Some(bytes) => dx::parse_dynamic(bytes, container.is_64())?,
             None => image.dynamic.clone(),
         };
         let has_init_array_tag = starting_dynamic
@@ -3916,7 +3930,7 @@ impl BinaryState {
         // without another relocation. 32 spare slots × 16 bytes
         // = 512 extra bytes; small relative to page alignment.
         const HEADROOM_NULL_SLOTS: usize = 32;
-        let entries = dx::parse_dynamic(&override_bytes, container.is_64());
+        let entries = dx::parse_dynamic(&override_bytes, container.is_64())?;
         // Strip trailing nulls and re-append exactly one
         // terminator plus the headroom slots.
         let mut grown: Vec<crate::container::DynamicEntry> = entries

@@ -55,7 +55,8 @@ fn main() {
     use armv8_encode::container::dynsym_extension as dx;
     let dyn_off = pt_dynamic.p_offset as usize;
     let dyn_size = pt_dynamic.p_filesz as usize;
-    let parsed = dx::parse_dynamic(&written[dyn_off..dyn_off + dyn_size]);
+    let parsed = dx::parse_dynamic(&written[dyn_off..dyn_off + dyn_size], reparsed.is_64())
+        .expect("parse relocated .dynamic");
     let dt_needed_count = parsed
         .iter()
         .filter(|e| e.tag == object::elf::DT_NEEDED as u64)

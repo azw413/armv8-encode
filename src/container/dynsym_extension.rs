@@ -93,16 +93,56 @@ impl DynsymEntry {
     }
 }
 
-/// Parse `.dynsym` bytes into a list of [`DynsymEntry`]s. Caller
-/// is responsible for the byte length being a multiple of 24.
-pub fn parse_dynsym(bytes: &[u8]) -> Vec<DynsymEntry> {
-    assert!(bytes.len() % 24 == 0, ".dynsym byte length must be a multiple of 24");
+/// Malformed input surfaced while parsing a `.dynsym` or
+/// `.dynamic` blob out of an untrusted binary.
+///
+/// These sections are fixed-width arrays; a byte length that isn't
+/// a whole number of entries means the input is corrupt (or was
+/// mis-sliced upstream). Parsing returns this instead of panicking
+/// so a hostile file degrades to a caught error rather than
+/// aborting the process.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DynParseError {
+    /// `.dynsym` byte length is not a whole number of 24-byte
+    /// `Elf64_Sym` entries.
+    MisalignedDynsym { len: usize },
+    /// `.dynamic` byte length is not a whole number of entries.
+    /// `entry_size` is 16 for ELF64 (`Elf64_Dyn`), 8 for ELF32
+    /// (`Elf32_Dyn`).
+    MisalignedDynamic { len: usize, entry_size: usize },
+}
+
+impl std::fmt::Display for DynParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DynParseError::MisalignedDynsym { len } => write!(
+                f,
+                ".dynsym byte length {len} is not a multiple of 24"
+            ),
+            DynParseError::MisalignedDynamic { len, entry_size } => write!(
+                f,
+                ".dynamic byte length {len} is not a multiple of {entry_size}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DynParseError {}
+
+/// Parse `.dynsym` bytes into a list of [`DynsymEntry`]s. Returns
+/// [`DynParseError::MisalignedDynsym`] if the byte length isn't a
+/// multiple of 24 (`Elf64_Sym` width), so malformed input is a
+/// caught error rather than a panic.
+pub fn parse_dynsym(bytes: &[u8]) -> Result<Vec<DynsymEntry>, DynParseError> {
+    if bytes.len() % 24 != 0 {
+        return Err(DynParseError::MisalignedDynsym { len: bytes.len() });
+    }
     let mut out = Vec::with_capacity(bytes.len() / 24);
     for chunk in bytes.chunks_exact(24) {
         let arr: [u8; 24] = chunk.try_into().unwrap();
         out.push(DynsymEntry::from_le_bytes(&arr));
     }
-    out
+    Ok(out)
 }
 
 /// Encode a list of dynsym entries into bytes.
@@ -241,17 +281,22 @@ pub fn insert_dynamic_tags_growing(
 /// Parse `.dynamic` bytes back into a tag list.
 /// Inverse of [`encode_dynamic`]. `is_64` selects the entry
 /// width: ELF64 uses `Elf64_Dyn` (16 bytes), ELF32 uses
-/// `Elf32_Dyn` (8 bytes). Caller is responsible for the byte
-/// length being a multiple of the entry width.
-pub fn parse_dynamic(bytes: &[u8], is_64: bool) -> Vec<crate::container::DynamicEntry> {
+/// `Elf32_Dyn` (8 bytes). Returns
+/// [`DynParseError::MisalignedDynamic`] if the byte length isn't a
+/// multiple of the entry width, so malformed input is a caught
+/// error rather than a panic.
+pub fn parse_dynamic(
+    bytes: &[u8],
+    is_64: bool,
+) -> Result<Vec<crate::container::DynamicEntry>, DynParseError> {
     use crate::container::DynamicEntry;
     let entry_size = if is_64 { 16 } else { 8 };
-    assert!(
-        bytes.len() % entry_size == 0,
-        ".dynamic byte length must be a multiple of the per-class entry size \
-         ({entry_size} for {})",
-        if is_64 { "ELF64" } else { "ELF32" },
-    );
+    if bytes.len() % entry_size != 0 {
+        return Err(DynParseError::MisalignedDynamic {
+            len: bytes.len(),
+            entry_size,
+        });
+    }
     let mut out = Vec::with_capacity(bytes.len() / entry_size);
     for chunk in bytes.chunks_exact(entry_size) {
         let (tag, value) = if is_64 {
@@ -267,7 +312,7 @@ pub fn parse_dynamic(bytes: &[u8], is_64: bool) -> Vec<crate::container::Dynamic
         };
         out.push(DynamicEntry { tag, value });
     }
-    out
+    Ok(out)
 }
 
 /// Read a NUL-terminated string out of a `.dynstr` blob at the
@@ -365,6 +410,50 @@ mod tests {
         let bytes = entry.to_le_bytes();
         let decoded = DynsymEntry::from_le_bytes(&bytes);
         assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn parse_dynsym_reads_whole_entries() {
+        let entry = DynsymEntry {
+            st_name: 7,
+            st_info: 0x12,
+            st_other: 0,
+            st_shndx: 1,
+            st_value: 0x400,
+            st_size: 8,
+        };
+        let bytes = encode_dynsym(&[entry, entry]);
+        let parsed = parse_dynsym(&bytes).unwrap();
+        assert_eq!(parsed, vec![entry, entry]);
+    }
+
+    #[test]
+    fn parse_dynsym_rejects_misaligned_length_without_panicking() {
+        // 25 bytes is not a whole number of 24-byte Elf64_Sym
+        // entries — a malformed/truncated .dynsym. Must be a caught
+        // error, never a panic.
+        let bytes = vec![0u8; 25];
+        assert_eq!(
+            parse_dynsym(&bytes),
+            Err(DynParseError::MisalignedDynsym { len: 25 }),
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_rejects_misaligned_length_without_panicking() {
+        // 24 bytes is misaligned for the ELF64 16-byte entry width
+        // (24 % 16 == 8) — a malformed/truncated .dynamic. Must be a
+        // caught error, never a panic.
+        let bytes = vec![0u8; 24];
+        assert_eq!(
+            parse_dynamic(&bytes, true),
+            Err(DynParseError::MisalignedDynamic {
+                len: 24,
+                entry_size: 16,
+            }),
+        );
+        // The same length is a whole number of ELF32 8-byte entries.
+        assert!(parse_dynamic(&bytes, false).is_ok());
     }
 
     #[test]

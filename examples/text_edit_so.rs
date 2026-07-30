@@ -87,7 +87,12 @@ fn main() -> ExitCode {
     // Step 2: open a TextEditor over the .text section.
     // ---------------------------------------------------------------
     let mut editor = BinaryEditor::for_section(&container, ".text").expect("open editor");
-    let text = editor.text.as_ref().expect("text section lifted");
+    let text = editor
+        .text
+        .as_ref()
+        .expect("text section lifted")
+        .aarch64()
+        .expect("aarch64 text section");
     println!(
         "editor opened: base=0x{:x}, {} instructions",
         text.base_address(),
@@ -160,6 +165,7 @@ fn main() -> ExitCode {
             RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
         ],
         original_address: Some(lsl_address),
+        source_size: None,
     };
 
     // ---------------------------------------------------------------
@@ -168,6 +174,8 @@ fn main() -> ExitCode {
     editor
         .text
         .as_mut()
+        .unwrap()
+        .aarch64_mut()
         .unwrap()
         .replace_instruction_at(lsl_address, new_instruction)
         .expect("replace_instruction_at");

@@ -490,6 +490,7 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
             RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
         ],
         original_address: Some(lsl_address),
+        source_size: None,
     };
     editor
         .text.as_mut().unwrap().aarch64_mut().unwrap().replace_instruction_at(lsl_address, new_instruction)
@@ -547,6 +548,7 @@ fn et_dyn_appended_function_changes_observable_output() {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Add,
@@ -559,11 +561,13 @@ fn et_dyn_appended_function_changes_observable_output() {
                 })),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
 
@@ -583,6 +587,7 @@ fn et_dyn_appended_function_changes_observable_output() {
                 mnemonic: Aarch64Mnemonic::B,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(quintuple_id))],
                 original_address: Some(greet_double_addr),
+                source_size: None,
             },
         )
         .expect("replace_instruction_at");
@@ -673,6 +678,7 @@ fn et_dyn_appended_function_resolves_extern_via_dlsym() {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     // Helper: build an `adrp Rd, <symbol>` by template + symbolic
@@ -736,6 +742,7 @@ fn et_dyn_appended_function_resolves_extern_via_dlsym() {
                 mnemonic: Aarch64Mnemonic::B,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(log_id))],
                 original_address: Some(greet_double_addr),
+                source_size: None,
             },
         )
         .expect("replace_instruction_at");
@@ -794,6 +801,7 @@ fn et_dyn_exported_function_resolves_via_dlopen() {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Add,
@@ -806,11 +814,13 @@ fn et_dyn_exported_function_resolves_via_dlopen() {
                 })),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
 
@@ -903,6 +913,7 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {
@@ -956,6 +967,7 @@ fn et_dyn_appended_function_calls_unimported_extern_via_dlsym() {
                 mnemonic: Aarch64Mnemonic::B,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(log_id))],
                 original_address: Some(greet_double_addr),
+                source_size: None,
             },
         )
         .expect("replace_instruction_at");
@@ -990,6 +1002,7 @@ fn build_marker_init_body(
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {
@@ -1235,7 +1248,7 @@ fn et_dyn_add_library_dependency_forces_extra_load() {
         .expect(".dynamic section");
     let dynamic_bytes = &rewritten.sections[dynamic_index].bytes;
     use armv8_encode::container::dynsym_extension as dx;
-    let new_dynamic = dx::parse_dynamic(dynamic_bytes);
+    let new_dynamic = dx::parse_dynamic(dynamic_bytes, true).expect("parse .dynamic");
     let dt_needed_count = new_dynamic
         .iter()
         .filter(|e| e.tag == object::elf::DT_NEEDED as u64)
@@ -1450,7 +1463,8 @@ fn build_one_null_dynamic_container() -> Container {
         .iter()
         .position(|s| s.name == ".dynamic")
         .expect(".dynamic section");
-    let parsed = dx::parse_dynamic(&container.sections[dynamic_idx].bytes);
+    let parsed = dx::parse_dynamic(&container.sections[dynamic_idx].bytes, true)
+        .expect("parse .dynamic");
     // Strip trailing DT_NULLs and add exactly one.
     let mut compact: Vec<armv8_encode::container::DynamicEntry> = parsed
         .iter()
@@ -1461,7 +1475,7 @@ fn build_one_null_dynamic_container() -> Container {
         tag: object::elf::DT_NULL as u64,
         value: 0,
     });
-    container.sections[dynamic_idx].bytes = dx::encode_dynamic(&compact);
+    container.sections[dynamic_idx].bytes = dx::encode_dynamic(&compact, true);
     container.sections[dynamic_idx].size =
         container.sections[dynamic_idx].bytes.len() as u64;
     if let Some(image) = container.elf_image.as_mut() {
@@ -1606,7 +1620,7 @@ fn et_dyn_add_library_dependency_handles_many_deps_via_relocation() {
     let dyn_off = pt_dynamic.p_offset as usize;
     let dyn_size = pt_dynamic.p_filesz as usize;
     let dyn_bytes = &written[dyn_off..dyn_off + dyn_size];
-    let parsed = dx::parse_dynamic(dyn_bytes);
+    let parsed = dx::parse_dynamic(dyn_bytes, true).expect("parse .dynamic");
     let dt_needed_count = parsed
         .iter()
         .filter(|e| e.tag == object::elf::DT_NEEDED as u64)

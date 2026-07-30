@@ -251,6 +251,7 @@ fn et_dyn_inplace_text_edit_changes_observable_output() {
             RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
         ],
         original_address: Some(lsl_address),
+        source_size: None,
     };
     editor
         .text
@@ -319,6 +320,7 @@ fn et_dyn_appended_function_changes_observable_output() {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Add,
@@ -331,11 +333,13 @@ fn et_dyn_appended_function_changes_observable_output() {
                 })),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
 
@@ -362,6 +366,7 @@ fn et_dyn_appended_function_changes_observable_output() {
                 mnemonic: Aarch64Mnemonic::B,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(quintuple_id))],
                 original_address: Some(greet_double_addr),
+                source_size: None,
             },
         )
         .expect("replace_instruction_at");
@@ -453,6 +458,7 @@ fn et_dyn_appended_data_referenced_by_appended_function() {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {
@@ -491,6 +497,7 @@ fn et_dyn_appended_data_referenced_by_appended_function() {
                 mnemonic: Aarch64Mnemonic::B,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(func_id))],
                 original_address: Some(greet_double_addr),
+                source_size: None,
             },
         )
         .expect("replace_instruction_at");
@@ -566,6 +573,7 @@ fn et_dyn_exported_function_resolves_via_dlopen() {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Add,
@@ -578,11 +586,13 @@ fn et_dyn_exported_function_resolves_via_dlopen() {
                 })),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
 
@@ -884,6 +894,7 @@ fn et_dyn_add_initialiser_hijacks_init_offsets_slot() {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {
@@ -986,11 +997,13 @@ fn prohibit_new_segments_rejects_add_function_exported() {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
     let result = editor
@@ -1075,6 +1088,7 @@ fn prohibit_new_segments_allows_initialiser_that_fits() {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {

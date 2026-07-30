@@ -116,6 +116,7 @@ fn main() -> ExitCode {
                 RewriteOperand::Decoded(DecodedOperand::Immediate(2)),
             ],
             original_address: None,
+            source_size: None,
         },
         // add w0, w8, w0
         RewriteInstruction {
@@ -129,12 +130,14 @@ fn main() -> ExitCode {
                 })),
             ],
             original_address: None,
+            source_size: None,
         },
         // ret
         RewriteInstruction {
             mnemonic: Aarch64Mnemonic::Ret,
             operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(x30))],
             original_address: None,
+            source_size: None,
         },
     ];
 
@@ -165,10 +168,13 @@ fn main() -> ExitCode {
         mnemonic: Aarch64Mnemonic::B,
         operands: vec![RewriteOperand::Branch(Target::Symbol(quintuple_id))],
         original_address: Some(greet_double_addr),
+        source_size: None,
     };
     editor
         .text
         .as_mut()
+        .unwrap()
+        .aarch64_mut()
         .unwrap()
         .replace_instruction_at(greet_double_addr, tail_call)
         .expect("replace_instruction_at");

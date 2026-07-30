@@ -104,6 +104,7 @@ fn main() -> ExitCode {
                 .map(RewriteOperand::Decoded)
                 .collect(),
             original_address: None,
+            source_size: None,
         }
     };
     let symbolic_adrp = |word: u32, target: Target| {
@@ -177,12 +178,15 @@ fn main() -> ExitCode {
         .text
         .as_mut()
         .unwrap()
+        .aarch64_mut()
+        .unwrap()
         .replace_instruction_at(
             greet_double_addr,
             RewriteInstruction {
                 mnemonic: Aarch64Mnemonic::B,
                 operands: vec![RewriteOperand::Branch(Target::Symbol(log_id))],
                 original_address: Some(greet_double_addr),
+                source_size: None,
             },
         )
         .expect("replace_instruction_at");
