@@ -2668,6 +2668,98 @@ impl BinaryState {
         )?)
     }
 
+    /// Build a grown Mach-O under the uniform-shift model *with* the
+    /// load-critical chained-fixup `+delta` fixup applied.
+    ///
+    /// Inserts `delta` pages at `growth_point` (the first `__TEXT`
+    /// section offset), places `appended_bytes` at
+    /// `appended_file_offset` in the new gap, and — because the whole
+    /// image past the insert moves by `delta` — reads the chained
+    /// fixups, shifts every slot location and rebase target by `delta`,
+    /// and splices the re-encoded slots (into `__DATA*`) and blob (into
+    /// `__LINKEDIT`) at their shifted offsets. All PC-relative code is
+    /// preserved by the geometry, so no instruction re-encode is needed.
+    ///
+    /// The result is structurally coherent *and* fixup-correct. Its
+    /// runtime proof is the `macho_runtime` harness. Export-trie /
+    /// symbol-value `+delta` (tooling correctness, not load-blocking)
+    /// are follow-ups.
+    // Exercised by tests; wired into the `Exhaustion::Grow` commit path
+    // (which routes reserve/carve growth here) in the next step.
+    #[allow(dead_code)]
+    pub(crate) fn build_grown_macho(
+        &self,
+        growth_point: u64,
+        delta: u64,
+        appended_file_offset: u64,
+        appended_bytes: &[u8],
+        sign: bool,
+    ) -> Result<Vec<u8>, TextEditorError> {
+        use crate::container::macho_writer::{write_with_text_growth_opts, MachOWriteOptions};
+        let image = self
+            .container
+            .macho_image
+            .as_ref()
+            .ok_or(TextEditorError::AppendMissingElfImage)?;
+
+        // Segment list as it will look post-grow: segments at/after the
+        // insert move by `delta`; the straddling __TEXT keeps its base
+        // and grows. Used to re-encode the fixups at their new offsets.
+        let mut shifted = image.layout.segments.clone();
+        for s in &mut shifted {
+            if s.fileoff >= growth_point {
+                s.vmaddr += delta;
+                s.fileoff += delta;
+            } else if s.fileoff + s.filesize > growth_point {
+                s.vmsize += delta;
+                s.filesize += delta;
+            }
+        }
+
+        let mut raw_overrides: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        // The load-critical fixup: shift every chained-fixup slot + rebase
+        // target by `delta` and re-emit blob + slots at shifted offsets.
+        if let Some(cfhdr) = image.layout.chained_fixups {
+            let mut cf = crate::container::ChainedFixups::read(image)
+                .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+            cf.shift_by(delta);
+            let slots = cf
+                .slot_bytes(&shifted)
+                .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+            for (file_off, word) in slots {
+                raw_overrides.push((file_off, word.to_vec()));
+            }
+            let ser = cf
+                .serialize(&shifted)
+                .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
+            let mut blob = ser.bytes;
+            if blob.len() as u64 > cfhdr.datasize {
+                return Err(TextEditorError::ChainedFixupsBlobTooLarge {
+                    new_size: blob.len() as u64,
+                    capacity: cfhdr.datasize,
+                });
+            }
+            blob.resize(cfhdr.datasize as usize, 0);
+            raw_overrides.push((cfhdr.dataoff + delta, blob));
+        }
+
+        let opts = MachOWriteOptions {
+            sign,
+            raw_byte_overrides: raw_overrides,
+        };
+        write_with_text_growth_opts(
+            &self.container,
+            growth_point,
+            delta,
+            appended_file_offset,
+            appended_bytes,
+            &[],
+            &opts,
+        )
+        .map_err(TextEditorError::ContainerWrite)
+    }
+
     pub fn add_function(
         &mut self,
         name: &str,

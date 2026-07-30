@@ -1423,3 +1423,54 @@ fn chained_fixups_shift_by_serialises_against_shifted_segments() {
     cf.serialize(&segs)
         .expect("shifted fixups serialise against shifted segments");
 }
+
+#[test]
+fn build_grown_macho_shifts_chained_fixups_in_output() {
+    // End-to-end (structural): grow a fixup-carrying dylib and re-read
+    // the chained fixups FROM THE GROWN OUTPUT — their rebase targets
+    // are shifted by delta and the count is preserved, proving the
+    // load-critical fixup splice landed correctly. (dyld applying them
+    // is the macho_runtime harness's job.)
+    use crate::container::chained_fixups::FixupTarget;
+    use crate::container::ChainedFixups;
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let macho = container.macho_image.as_ref().unwrap();
+    let orig_cf = ChainedFixups::read(macho).expect("fixture has chained fixups");
+    let first_rebase = |cf: &ChainedFixups| -> Option<u64> {
+        cf.segments
+            .iter()
+            .flat_map(|s| s.fixups.iter())
+            .find_map(|fx| match &fx.target {
+                FixupTarget::Rebase { target_vaddr } => Some(*target_vaddr),
+                _ => None,
+            })
+    };
+    let count = |cf: &ChainedFixups| cf.segments.iter().map(|s| s.fixups.len()).sum::<usize>();
+    let orig_target = first_rebase(&orig_cf);
+    let orig_count = count(&orig_cf);
+
+    let editor = BinaryEditor::new(&container).expect("editor");
+    let gp = first_text_section_offset(&container);
+    let delta = 0x4000u64;
+    let payload = 0xd65f03c0u32.to_le_bytes(); // ret
+    let out = editor
+        .binary
+        .build_grown_macho(gp, delta, gp, &payload, false)
+        .expect("grow + fixup splice");
+
+    // File grew by delta; payload placed; still a valid Mach-O.
+    assert_eq!(out.len() as u64, bytes.len() as u64 + delta);
+    assert_eq!(&out[gp as usize..gp as usize + 4], &payload);
+    let reparsed = Container::from_bytes(&out).expect("re-parse grown");
+
+    // Re-read the fixups from the OUTPUT: targets shifted, count intact.
+    let new_cf =
+        ChainedFixups::read(reparsed.macho_image.as_ref().unwrap()).expect("read grown fixups");
+    assert_eq!(count(&new_cf), orig_count, "fixup count preserved");
+    if let (Some(ot), Some(nt)) = (orig_target, first_rebase(&new_cf)) {
+        assert_eq!(nt, ot + delta, "rebase target in grown output shifted by delta");
+    }
+}
