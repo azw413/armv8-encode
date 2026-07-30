@@ -1342,3 +1342,84 @@ fn write_with_text_growth_rejects_bad_params() {
         write_with_text_growth_opts(&container, gp, 0x4000, gp, &too_big, &[], &opts).is_err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Chained-fixup +delta shift (the load-critical uniform-shift fixup)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chained_fixups_shift_by_moves_slots_and_rebase_targets() {
+    use crate::container::chained_fixups::FixupTarget;
+    use crate::container::ChainedFixups;
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let macho = container.macho_image.as_ref().expect("macho");
+    let mut cf = ChainedFixups::read(macho).expect("read fixups");
+
+    let snapshot = |cf: &ChainedFixups| -> Vec<(u64, Option<u64>)> {
+        cf.segments
+            .iter()
+            .flat_map(|sf| {
+                sf.fixups.iter().map(|fx| {
+                    let t = match &fx.target {
+                        FixupTarget::Rebase { target_vaddr } => Some(*target_vaddr),
+                        _ => None,
+                    };
+                    (fx.vaddr, t)
+                })
+            })
+            .collect()
+    };
+    let before = snapshot(&cf);
+    if before.is_empty() {
+        eprintln!("skip: fixture has no chained fixups");
+        return;
+    }
+
+    let delta = 0x4000u64;
+    cf.shift_by(delta);
+    let after = snapshot(&cf);
+
+    assert_eq!(before.len(), after.len());
+    let mut rebases = 0;
+    for (b, a) in before.iter().zip(&after) {
+        assert_eq!(a.0, b.0 + delta, "slot vaddr shifts by delta");
+        match (b.1, a.1) {
+            (Some(bt), Some(at)) => {
+                assert_eq!(at, bt + delta, "rebase target shifts by delta");
+                rebases += 1;
+            }
+            (None, None) => {} // bind: target is an import index, unchanged
+            _ => panic!("fixup target kind must not change"),
+        }
+    }
+    assert!(rebases > 0, "objc fixture should carry rebases to exercise");
+}
+
+#[test]
+fn chained_fixups_shift_by_serialises_against_shifted_segments() {
+    use crate::container::ChainedFixups;
+    let Some(bytes) = macho_objc_fixture_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let macho = container.macho_image.as_ref().expect("macho");
+    let mut cf = ChainedFixups::read(macho).expect("read fixups");
+    if cf.segments.iter().all(|s| s.fixups.is_empty()) {
+        return;
+    }
+
+    let delta = 0x4000u64;
+    // The uniform shift moves every segment's vmaddr up by delta; the
+    // shifted fixups must still validate and serialise against them
+    // (each fixup lands inside its segment because both moved by delta).
+    let mut segs = macho.layout.segments.clone();
+    for s in &mut segs {
+        s.vmaddr = s.vmaddr.saturating_add(delta);
+    }
+    cf.shift_by(delta);
+    cf.serialize(&segs)
+        .expect("shifted fixups serialise against shifted segments");
+}

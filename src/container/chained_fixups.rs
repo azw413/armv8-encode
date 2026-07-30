@@ -533,6 +533,29 @@ impl ChainedFixups {
         }
         hits
     }
+
+    /// Shift every fixup up by `delta`: each fixup's slot location
+    /// (`vaddr`) and each `Rebase` target move by the same amount.
+    ///
+    /// This is the chained-fixup half of the uniform-shift text-grow —
+    /// where the whole image past the insert point moves by `delta`, so
+    /// both the fixup slots (in `__DATA*`) and everything they rebase to
+    /// shift together. `Bind` targets are import indices, not addresses,
+    /// so only their slot `vaddr` shifts.
+    ///
+    /// The result serialises against the correspondingly shifted segment
+    /// list (each fixup still lands inside its segment because both moved
+    /// by `delta`).
+    pub fn shift_by(&mut self, delta: u64) {
+        for seg in self.segments.iter_mut() {
+            for fx in seg.fixups.iter_mut() {
+                fx.vaddr = fx.vaddr.saturating_add(delta);
+                if let FixupTarget::Rebase { target_vaddr } = &mut fx.target {
+                    *target_vaddr = target_vaddr.saturating_add(delta);
+                }
+            }
+        }
+    }
 }
 
 /// Convenience target shape — same shape as the legacy
