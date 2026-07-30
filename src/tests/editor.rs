@@ -1151,69 +1151,6 @@ fn reserve_on_non_macho_is_rejected() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Growth geometry against a real Mach-O layout (Increment 2, geometry only)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn plan_text_growth_for_real_dylib_is_page_quantised() {
-    let Some(bytes) = macho_lib_demo_bytes() else {
-        return;
-    };
-    let container = Container::from_bytes(&bytes).expect("parse");
-    let image = container.macho_image.as_ref().expect("macho image");
-    let text = image
-        .layout
-        .segments
-        .iter()
-        .find(|s| s.name == "__TEXT")
-        .expect("__TEXT segment");
-    let after_text = image
-        .layout
-        .segments
-        .iter()
-        .filter(|s| s.vmaddr > text.vmaddr)
-        .count();
-    let (text_vmsize, text_filesize) = (text.vmsize, text.filesize);
-
-    // Request far more than the fixture's few-KB of __TEXT slack so a
-    // grow is genuinely required.
-    let needed = 0x40_000u64; // 256 KiB
-    let editor = BinaryEditor::new(&container).expect("editor");
-    let plan = editor
-        .binary
-        .plan_text_growth_for(needed)
-        .expect("growth plan");
-
-    // Whole-page growth, enough capacity.
-    assert!(plan.pages >= 1);
-    assert_eq!(plan.delta, plan.pages * 0x4000);
-    assert_eq!(plan.delta % 0x4000, 0);
-    assert!(plan.region_capacity >= needed);
-    // __TEXT grows by delta in both axes.
-    assert_eq!(plan.new_vmsize, text_vmsize + plan.delta);
-    assert_eq!(plan.new_filesize, text_filesize + plan.delta);
-    // Every segment after __TEXT (at least __LINKEDIT) shifts by delta,
-    // preserving its file↔vaddr skew.
-    assert_eq!(plan.shifts.len(), after_text);
-    assert!(after_text >= 1, "a dylib always has __LINKEDIT after __TEXT");
-    for s in &plan.shifts {
-        assert_eq!(s.new_vmaddr - s.old_vmaddr, plan.delta);
-        assert_eq!(s.new_fileoff - s.old_fileoff, plan.delta);
-    }
-}
-
-#[test]
-fn plan_text_growth_for_non_macho_is_rejected() {
-    let container = fixture_container(); // ELF ET_REL
-    let editor = BinaryEditor::new(&container).expect("editor");
-    let err = editor.binary.plan_text_growth_for(0x1000).unwrap_err();
-    assert!(
-        matches!(err, TextEditorError::ReserveUnsupportedFormat(_)),
-        "got {err:?}"
-    );
-}
-
 /// Read a segment's (vmaddr, vmsize, fileoff, filesize).
 fn macho_seg(c: &Container, name: &str) -> Option<(u64, u64, u64, u64)> {
     c.macho_image

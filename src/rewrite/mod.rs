@@ -87,8 +87,8 @@ pub use layout::{
 };
 pub use plan::EditError;
 pub use space::{
-    Carve, CarveError, Exhaustion, FreeExtent, GrowthError, PlannedReservation, Region,
-    ReserveError, ReserveRequest, SegmentPlacement, SegmentShift, SpaceSource, TextGrowthPlan,
+    Carve, CarveError, Exhaustion, FreeExtent, PlannedReservation, Region, ReserveError,
+    ReserveRequest, SpaceSource,
 };
 
 pub use crate::mc::ControlFlowGraph;
