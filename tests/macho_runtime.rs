@@ -528,6 +528,55 @@ fn reserve_text_region_add_function_in_runs_under_dyld() {
 #[test]
 #[ignore = "requires native macOS arm64 with clang + codesign on \
             PATH; run with --ignored --nocapture"]
+fn grow_text_is_behavior_preserving_under_dyld() {
+    // Uniform-shift grow acceptance: reserve past __TEXT's free slack
+    // with Exhaustion::Grow (forcing __DATA*/__LINKEDIT to shift), commit
+    // with NO new function, and confirm the host still resolves and runs
+    // greet_double correctly. Output unchanged proves the whole grow
+    // machinery landed under dyld: the page insert + segment/section
+    // shift, the chained-fixup +delta, and — since the host resolves
+    // greet_double through the export trie — the export-trie +delta.
+    // Empty payload isolates the grow itself from any new-code concerns.
+    require_macos_arm64();
+    let (lib_path, _) = build_lib_demo_fixture();
+
+    use armv8_encode::rewrite::space::{Exhaustion, ReserveRequest};
+    use armv8_encode::rewrite::BinaryEditor;
+
+    let lib_bytes = std::fs::read(&lib_path).expect("read libgreet.dylib");
+    let container = Container::from_bytes(&lib_bytes).expect("parse libgreet.dylib");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+
+    editor
+        .binary
+        .reserve_text_region(ReserveRequest {
+            min_bytes: 0x10000, // far more than the __TEXT slack -> forces a grow
+            headroom: 0,
+            align: 4,
+            allow_headerpad: false,
+            on_exhaustion: Exhaustion::Grow,
+        })
+        .expect("reserve with grow");
+    let written = editor.commit_to_bytes().expect("commit grown");
+
+    // Sanity: it did grow.
+    assert!(
+        written.len() > lib_bytes.len(),
+        "grown output should be larger than the input",
+    );
+
+    std::fs::write(&lib_path, &written).expect("write grown libgreet.dylib");
+    let stdout = run_in_lib_demo("host");
+    assert_eq!(
+        stdout, "double=42 offset=107\n",
+        "a behavior-preserving grow must leave host output unchanged \
+         (greet_double resolves + runs at its shifted address)",
+    );
+}
+
+#[test]
+#[ignore = "requires native macOS arm64 with clang + codesign on \
+            PATH; run with --ignored --nocapture"]
 fn et_dyn_appended_data_referenced_by_appended_function() {
     // Phase 4 acceptance: `add_data` lays a read-only blob in
     // the same appended segment as `add_function`; the

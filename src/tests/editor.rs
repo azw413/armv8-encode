@@ -917,25 +917,30 @@ fn reserve_free_only_rejects_oversize_without_growth() {
 }
 
 #[test]
-fn reserve_grow_policy_reports_growth_required() {
-    use crate::rewrite::space::{Exhaustion, ReserveRequest};
+fn reserve_grow_policy_sets_up_a_grow() {
+    // With the grow path wired, a Grow-policy reservation that exceeds
+    // free space now SUCCEEDS with a page-quantised GrewText region
+    // (rather than reporting WouldRequireTextGrowth).
+    use crate::rewrite::space::{Exhaustion, ReserveRequest, SpaceSource};
     let Some(bytes) = macho_lib_demo_bytes() else {
         return;
     };
     let container = Container::from_bytes(&bytes).expect("parse");
     let mut editor = BinaryEditor::new(&container).expect("editor");
     let req = ReserveRequest {
-        min_bytes: 0x1_0000_0000,
+        min_bytes: 0x10000, // exceeds the fixture's few-KB slack
         headroom: 0,
         align: 4,
         allow_headerpad: false,
         on_exhaustion: Exhaustion::Grow,
     };
-    let err = editor.binary.reserve_text_region(req).unwrap_err();
-    assert!(
-        matches!(err, TextEditorError::WouldRequireTextGrowth { .. }),
-        "got {err:?}"
-    );
+    let res = editor.binary.reserve_text_region(req).expect("grow reservation");
+    assert!(matches!(
+        res.sources.as_slice(),
+        [(SpaceSource::GrewText { .. }, _)]
+    ));
+    assert!(res.capacity >= 0x10000);
+    assert_eq!(res.capacity % 0x4000, 0, "grow is page-quantised");
 }
 
 #[test]
@@ -1535,4 +1540,45 @@ fn build_grown_macho_shifts_export_trie_in_output() {
         }
     }
     assert!(regular_checked > 0, "expected at least one regular export");
+}
+
+#[test]
+fn reserve_grow_then_commit_produces_grown_dylib() {
+    // The wired Exhaustion::Grow path end-to-end (structural): reserve
+    // more than free space with Grow, commit, and get a coherent dylib
+    // grown by the whole-page delta.
+    use crate::rewrite::space::{Exhaustion, ReserveRequest, SpaceSource};
+    let Some(bytes) = macho_lib_demo_bytes() else {
+        return;
+    };
+    let container = Container::from_bytes(&bytes).expect("parse");
+    let old_text = macho_seg(&container, "__TEXT").expect("__TEXT");
+
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    let res = editor
+        .binary
+        .reserve_text_region(ReserveRequest {
+            min_bytes: 0x10000, // far more than the fixture's few-KB slack
+            headroom: 0,
+            align: 4,
+            allow_headerpad: false,
+            on_exhaustion: Exhaustion::Grow,
+        })
+        .expect("reserve with grow");
+    // Fulfilled by a grow: page-quantised, enough capacity.
+    assert!(matches!(
+        res.sources.as_slice(),
+        [(SpaceSource::GrewText { .. }, _)]
+    ));
+    assert_eq!(res.capacity % 0x4000, 0);
+    assert!(res.capacity >= 0x10000);
+    let delta = res.capacity;
+
+    let out = editor.commit_to_bytes_unsigned().expect("commit grown");
+    // Grew by exactly delta; still a coherent Mach-O; __TEXT grew.
+    assert_eq!(out.len() as u64, bytes.len() as u64 + delta);
+    let reparsed = Container::from_bytes(&out).expect("re-parse grown");
+    let new_text = macho_seg(&reparsed, "__TEXT").expect("__TEXT after");
+    assert_eq!(new_text.1, old_text.1 + delta, "__TEXT vmsize += delta");
+    assert!(!reparsed.symbols.is_empty(), "symtab still parses");
 }

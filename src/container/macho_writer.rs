@@ -1057,10 +1057,6 @@ pub fn write_with_intra_text_append_opts(
 ///
 /// `growth_point` is the first `__TEXT` section file offset and `delta`
 /// a page multiple — both from the growth planner.
-// Not yet wired into the commit path: `Exhaustion::Grow` won't emit
-// until the chained-fixup (and export-trie) `+delta` fixups make the
-// grown output loadable, so this is exercised by tests only for now.
-#[allow(dead_code)]
 pub fn write_with_text_growth_opts(
     container: &Container,
     growth_point: u64,

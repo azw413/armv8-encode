@@ -751,6 +751,11 @@ pub struct BinaryState {
     /// item lands. `None` until the first reservation; a single region
     /// is supported per edit in this increment.
     reserved_text_region: Option<(RegionId, crate::rewrite::space::Region)>,
+    /// When a reservation needed more room than free space offered and
+    /// the policy was [`crate::rewrite::space::Exhaustion::Grow`], the
+    /// uniform-shift growth geometry `(growth_point, delta)`. Commit
+    /// routes to [`Self::build_grown_macho`] when this is set.
+    pending_text_grow: Option<(u64, u64)>,
 }
 
 /// Opaque handle to a reserved text-space region. Passed back to the
@@ -1327,6 +1332,7 @@ impl BinaryEditor {
                 no_new_segments: false,
                 macho_raw_byte_overrides: Vec::new(),
                 reserved_text_region: None,
+                pending_text_grow: None,
             },
             text: None,
         })
@@ -2364,7 +2370,17 @@ impl BinaryState {
             return Err(TextEditorError::TextRegionAlreadyReserved);
         }
         let extents = self.macho_text_free_extents()?;
-        let plan = crate::rewrite::space::plan_reservation(&extents, &req)?;
+        let plan = match crate::rewrite::space::plan_reservation(&extents, &req) {
+            Ok(plan) => plan,
+            // Free space is insufficient and the caller allowed a grow:
+            // switch to the uniform-shift grow geometry, which commit
+            // routes through build_grown_macho.
+            Err(crate::rewrite::space::ReserveError::GrowthRequired { .. }) => {
+                let needed = req.min_bytes.saturating_add(req.headroom);
+                return self.setup_grow_reservation(needed);
+            }
+            Err(e) => return Err(e.into()),
+        };
         // Seed the appended state at the reserved base so the existing
         // intra-`__TEXT` commit path places the carved content.
         self.appended = Some(AppendedFunctionsState {
@@ -2381,6 +2397,58 @@ impl BinaryState {
             base_file_offset: plan.base_file_offset,
             capacity: plan.capacity,
             sources: vec![(plan.source, plan.capacity)],
+        })
+    }
+
+    /// Set up a reservation fulfilled by growing `__TEXT` (uniform-shift)
+    /// rather than from free space. The reserved region is the inserted
+    /// gap just before `__text`; the pending grow geometry is recorded so
+    /// commit routes through [`Self::build_grown_macho`].
+    fn setup_grow_reservation(&mut self, needed: u64) -> Result<Reservation, TextEditorError> {
+        use crate::rewrite::space::{Region, SpaceSource};
+        const PAGE: u64 = 0x4000;
+        let (growth_point, base_address) = {
+            let image = self
+                .container
+                .macho_image
+                .as_ref()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            let text = image
+                .layout
+                .segments
+                .iter()
+                .find(|s| s.name == "__TEXT")
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            let growth_point = image
+                .layout
+                .sections
+                .iter()
+                .filter(|s| s.segname == "__TEXT" && s.file_offset > 0)
+                .map(|s| s.file_offset)
+                .min()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            (growth_point, text.vmaddr + (growth_point - text.fileoff))
+        };
+        let pages = ((needed + PAGE - 1) / PAGE).max(1);
+        let delta = pages * PAGE;
+        self.pending_text_grow = Some((growth_point, delta));
+        self.appended = Some(AppendedFunctionsState {
+            segment_vaddr: base_address,
+            bytes: Vec::new(),
+            exports: Vec::new(),
+            items: Vec::new(),
+        });
+        let id = RegionId(0);
+        self.reserved_text_region = Some((
+            id,
+            Region::new(base_address, growth_point, delta, SpaceSource::GrewText { pages }),
+        ));
+        Ok(Reservation {
+            region: id,
+            base_address,
+            base_file_offset: growth_point,
+            capacity: delta,
+            sources: vec![(SpaceSource::GrewText { pages }, delta)],
         })
     }
 
@@ -2684,9 +2752,6 @@ impl BinaryState {
     /// runtime proof is the `macho_runtime` harness. Export-trie /
     /// symbol-value `+delta` (tooling correctness, not load-blocking)
     /// are follow-ups.
-    // Exercised by tests; wired into the `Exhaustion::Grow` commit path
-    // (which routes reserve/carve growth here) in the next step.
-    #[allow(dead_code)]
     pub(crate) fn build_grown_macho(
         &self,
         growth_point: u64,
@@ -4731,6 +4796,22 @@ impl BinaryEditor {
             self.binary.container.format,
             crate::container::BinaryFormat::Macho,
         );
+
+        // Uniform-shift grow path: the whole operation (byte insertion,
+        // load-command patch, chained-fixup + export-trie +delta) lives
+        // in build_grown_macho. The reserved region's placed content is
+        // the appended buffer, dropped into the inserted gap.
+        if let Some((growth_point, delta)) = self.binary.pending_text_grow {
+            let payload = self
+                .binary
+                .appended
+                .as_ref()
+                .map(|a| a.bytes.clone())
+                .unwrap_or_default();
+            return self
+                .binary
+                .build_grown_macho(growth_point, delta, growth_point, &payload, sign);
+        }
 
         // Library-dep additions need to land in the appended
         // segment (ELF: they grow `.dynstr`, which can't grow
