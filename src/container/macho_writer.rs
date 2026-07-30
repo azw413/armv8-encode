@@ -1038,25 +1038,28 @@ pub fn write_with_intra_text_append_opts(
     Ok(bytes)
 }
 
-/// Grow `__TEXT` by inserting `delta` bytes (a whole number of pages) at
-/// `growth_point` — the segment's old file end — shifting every segment
-/// after it (`__DATA*`, `__LINKEDIT`) and their sections down by `delta`
-/// in both file offset and virtual address, and placing `appended_bytes`
-/// at `appended_file_offset` inside the grown region.
+/// Grow `__TEXT` under the **uniform-shift** model: insert `delta` bytes
+/// (a whole number of pages) at `growth_point` — the first `__TEXT`
+/// section's file offset — and shift everything after it (the rest of
+/// `__TEXT`'s sections, `__DATA*`, `__LINKEDIT`) up by `delta` in both
+/// file offset and virtual address, keeping only the mach header, load
+/// commands, and `__TEXT.vmaddr`/`fileoff` fixed. The new payload lands
+/// in the inserted gap at `appended_file_offset`.
 ///
-/// This is the **geometry application** of a text grow (Increment 2a):
-/// it fixes the load-command bookkeeping so the output is a structurally
-/// coherent Mach-O, but it deliberately does NOT fix references that
-/// point into the shifted `__DATA*` — chained-fixup rebase targets, data
-/// symbol values, or the `adrp`/GOT immediates in `__text`. Those are
-/// separate steps (2b/2c). On its own the output re-parses cleanly but
-/// is not yet runtime-loadable.
+/// Because `delta` is a page multiple, every PC-relative reference —
+/// code→data, code→code, `ldr`-literal, jump tables — is preserved with
+/// no instruction changes: the code and everything it points at both
+/// move by the same amount. What this does NOT do is fix *absolute*
+/// pointers into the shifted image — chained-fixup rebase targets,
+/// export-trie / symbol / function-starts values. Those are separate
+/// `+delta` fixups applied by the caller before signing; on its own the
+/// output re-parses but rebased pointers are still stale.
 ///
-/// `growth_point` must be `__TEXT.fileoff + __TEXT.filesize` and `delta`
-/// a page multiple — both come from the growth planner.
+/// `growth_point` is the first `__TEXT` section file offset and `delta`
+/// a page multiple — both from the growth planner.
 // Not yet wired into the commit path: `Exhaustion::Grow` won't emit
-// until the 2b/2c reference fixups make the grown output loadable, so
-// this is exercised by tests only for now.
+// until the chained-fixup (and export-trie) `+delta` fixups make the
+// grown output loadable, so this is exercised by tests only for now.
 #[allow(dead_code)]
 pub fn write_with_text_growth_opts(
     container: &Container,
@@ -1144,13 +1147,22 @@ pub fn write_with_text_growth_opts(
 }
 
 /// Patch the load-command header after `delta` bytes were inserted at
-/// `growth_point`: grow the `__TEXT` segment, and shift every segment
-/// whose file offset is at or past `growth_point` — plus its sections
-/// and every `__LINKEDIT` sub-table offset — up by `delta`.
+/// `growth_point` (the first `__TEXT` section's file offset) under the
+/// **uniform-shift** model: everything at file offset `>= growth_point`
+/// moves up by `delta`, so all PC-relative code is preserved and only
+/// absolute pointers need separate fixup.
 ///
-/// Generalises [`shift_linkedit_offsets`] from "shift only __LINKEDIT's
-/// fileoff" to "grow __TEXT and shift all trailing segments (fileoff and
-/// vmaddr), their section addr/offset, and the linkedit-data offsets."
+/// For each `LC_SEGMENT_64`:
+/// - the segment straddling `growth_point` (`__TEXT`) keeps its
+///   `vmaddr`/`fileoff` and grows `vmsize`/`filesize` by `delta`; its
+///   sections at/after the insert move up by `delta`;
+/// - a segment entirely at/after `growth_point` (`__DATA*`,
+///   `__LINKEDIT`) moves wholesale — `vmaddr`/`fileoff` and every
+///   section — by `delta`;
+/// - a segment entirely before the insert (e.g. `__PAGEZERO`) is left.
+///
+/// Every `__LINKEDIT` sub-table offset (which lives past `growth_point`)
+/// also shifts by `delta`.
 fn apply_growth_to_load_commands(
     bytes: &mut [u8],
     layout: &crate::container::macho_image::MachOLayout,
@@ -1190,36 +1202,29 @@ fn apply_growth_to_load_commands(
         }
         match cmd {
             macho::LC_SEGMENT_64 => {
-                // segment_command_64: segname[16] @ +8, vmaddr @ +24,
-                // vmsize @ +32, fileoff @ +40, filesize @ +48,
-                // nsects @ +64; section_64 array @ +72 (80 bytes each).
-                let name = &bytes[cursor + 8..cursor + 24];
-                let name_len = name.iter().position(|&b| b == 0).unwrap_or(16);
-                let is_text = &name[..name_len] == b"__TEXT";
+                // segment_command_64: vmaddr @ +24, vmsize @ +32,
+                // fileoff @ +40, filesize @ +48, nsects @ +64; the
+                // section_64 array follows at +72 (80 bytes each).
+                let vmaddr =
+                    u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
                 let fileoff =
                     u64::from_le_bytes(bytes[cursor + 40..cursor + 48].try_into().unwrap());
-                if is_text {
-                    // __TEXT grows in place: it keeps its vmaddr/fileoff
-                    // but gains `delta` of vm and file size.
-                    add_u64(bytes, cursor + 32); // vmsize
-                    add_u64(bytes, cursor + 48); // filesize
-                } else if fileoff >= growth_point {
-                    // A trailing segment: it moves wholesale by `delta`.
+                let filesize =
+                    u64::from_le_bytes(bytes[cursor + 48..cursor + 56].try_into().unwrap());
+                if fileoff >= growth_point {
+                    // Trailing segment: moves wholesale by `delta`.
                     add_u64(bytes, cursor + 24); // vmaddr
                     add_u64(bytes, cursor + 40); // fileoff
-                    let nsects = u32::from_le_bytes(
-                        bytes[cursor + 64..cursor + 68].try_into().unwrap(),
-                    ) as usize;
-                    for i in 0..nsects {
-                        let sec = cursor + 72 + i * 80;
-                        if sec + 80 > lc_end {
-                            break;
-                        }
-                        add_u64(bytes, sec + 32); // addr
-                        add_u32(bytes, sec + 48); // offset (0 for zerofill)
-                        add_u32(bytes, sec + 56); // reloff (usually 0)
-                    }
+                    shift_segment_sections(bytes, cursor, lc_end, delta, 0);
+                } else if fileoff + filesize > growth_point {
+                    // Segment straddling the insert (__TEXT): grows in
+                    // place; its sections at/after the insert move.
+                    add_u64(bytes, cursor + 32); // vmsize
+                    add_u64(bytes, cursor + 48); // filesize
+                    let insert_vaddr = vmaddr + (growth_point - fileoff);
+                    shift_segment_sections(bytes, cursor, lc_end, delta, insert_vaddr);
                 }
+                // else: entirely before the insert — leave it.
             }
             macho::LC_DYLD_INFO | macho::LC_DYLD_INFO_ONLY => {
                 if cmdsize >= 48 {
@@ -1260,6 +1265,43 @@ fn apply_growth_to_load_commands(
         cursor += cmdsize;
     }
     Ok(())
+}
+
+/// Shift the `addr`/`offset`/`reloff` of every section in the segment
+/// command at `seg_cursor` whose `addr >= addr_threshold`, by `delta`.
+/// Pass `addr_threshold = 0` to shift them all.
+fn shift_segment_sections(
+    bytes: &mut [u8],
+    seg_cursor: usize,
+    lc_end: usize,
+    delta: u64,
+    addr_threshold: u64,
+) {
+    let nsects =
+        u32::from_le_bytes(bytes[seg_cursor + 64..seg_cursor + 68].try_into().unwrap()) as usize;
+    for i in 0..nsects {
+        let sec = seg_cursor + 72 + i * 80;
+        if sec + 80 > lc_end {
+            break;
+        }
+        // section_64: addr @ +32 (u64), offset @ +48 (u32), reloff @ +56.
+        let addr = u64::from_le_bytes(bytes[sec + 32..sec + 40].try_into().unwrap());
+        if addr < addr_threshold {
+            continue;
+        }
+        if addr != 0 {
+            bytes[sec + 32..sec + 40].copy_from_slice(&(addr + delta).to_le_bytes());
+        }
+        let off = u32::from_le_bytes(bytes[sec + 48..sec + 52].try_into().unwrap());
+        if off != 0 {
+            bytes[sec + 48..sec + 52].copy_from_slice(&((off as u64 + delta) as u32).to_le_bytes());
+        }
+        let reloff = u32::from_le_bytes(bytes[sec + 56..sec + 60].try_into().unwrap());
+        if reloff != 0 {
+            bytes[sec + 56..sec + 60]
+                .copy_from_slice(&((reloff as u64 + delta) as u32).to_le_bytes());
+        }
+    }
 }
 
 /// Append a rebuilt export trie + extended symtab/strtab to
