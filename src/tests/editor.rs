@@ -1400,7 +1400,7 @@ fn build_grown_macho_shifts_chained_fixups_in_output() {
     let payload = 0xd65f03c0u32.to_le_bytes(); // ret
     let out = editor
         .binary
-        .build_grown_macho(gp, delta, gp, &payload, false)
+        .build_grown_macho(gp, delta, gp, &payload, &[], false)
         .expect("grow + fixup splice");
 
     // File grew by delta; payload placed; still a valid Mach-O.
@@ -1447,7 +1447,7 @@ fn build_grown_macho_shifts_export_trie_in_output() {
     let delta = 0x4000u64;
     let out = editor
         .binary
-        .build_grown_macho(gp, delta, gp, &0xd65f03c0u32.to_le_bytes(), false)
+        .build_grown_macho(gp, delta, gp, &0xd65f03c0u32.to_le_bytes(), &[], false)
         .expect("grow");
     let reparsed = Container::from_bytes(&out).expect("re-parse");
     let rtrie = reparsed

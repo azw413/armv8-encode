@@ -1136,6 +1136,63 @@ pub fn write_with_text_growth_opts(
     apply_growth_to_load_commands(&mut bytes, layout, growth_point, delta)?;
 
     apply_raw_byte_overrides(&mut bytes, &options.raw_byte_overrides)?;
+
+    // Exports-critical `+delta`: the export trie stores each symbol's address as an
+    // offset from the (fixed) image base, but every regular export moved up by
+    // `delta`, so its offset must too — else dlsym / linked callers resolve moved
+    // exports at their old addresses. The re-encoded ULEB blob can be a few bytes
+    // larger than the original slot; if it still fits (at the shifted offset),
+    // overwrite in place, otherwise RELOCATE it to a fresh slot appended at the end
+    // of __LINKEDIT (grown) and repoint LC_DYLD_EXPORTS_TRIE. (`apply_growth...`
+    // already shifted the LC's dataoff by delta; relocation overrides that.)
+    if let Some(trie) = layout.exports_trie {
+        if trie.datasize > 0 {
+            let start = trie.dataoff as usize;
+            let end = start + trie.datasize as usize;
+            let blob = raw.get(start..end).ok_or_else(|| {
+                ContainerWriteError::ObjectWrite("grow: export trie range out of bounds".into())
+            })?;
+            let mut exports = crate::container::macho_export_trie::parse(blob)?;
+            const EXPORT_SYMBOL_FLAGS_REEXPORT: u64 = 0x08;
+            for e in &mut exports {
+                // Reexports name another dylib (no local address); regular /
+                // stub-and-resolver exports moved by delta.
+                if e.flags & EXPORT_SYMBOL_FLAGS_REEXPORT == 0 {
+                    e.address_offset = e.address_offset.saturating_add(delta);
+                }
+            }
+            let rebuilt = crate::container::macho_export_trie::build(&exports);
+            let shifted_off = (trie.dataoff + delta) as usize;
+            if rebuilt.len() as u64 <= trie.datasize {
+                // Fits the (shifted) slot: overwrite in place, zero the tail.
+                bytes[shifted_off..shifted_off + rebuilt.len()].copy_from_slice(&rebuilt);
+                for b in &mut bytes[shifted_off + rebuilt.len()..shifted_off + trie.datasize as usize]
+                {
+                    *b = 0;
+                }
+            } else {
+                // Relocate: strip the trailing signature (so the trie lands at the
+                // real __LINKEDIT tail, not after the signature), append the trie
+                // 8-aligned, resize __LINKEDIT to cover it, and repoint the load
+                // command. codesign re-signs — extending __LINKEDIT again — after.
+                strip_trailing_code_signature(&mut bytes)?;
+                while bytes.len() % 8 != 0 {
+                    bytes.push(0);
+                }
+                let new_off = bytes.len() as u64;
+                bytes.extend_from_slice(&rebuilt);
+                let new_end = bytes.len() as u64;
+                extend_linkedit_segment(&mut bytes, layout.load_commands_offset, new_end)?;
+                patch_lc_linkedit_data(
+                    &mut bytes,
+                    object::macho::LC_DYLD_EXPORTS_TRIE,
+                    new_off,
+                    rebuilt.len() as u64,
+                )?;
+            }
+        }
+    }
+
     if options.sign {
         sign_ad_hoc(&mut bytes)?;
     }
@@ -1254,6 +1311,19 @@ fn apply_growth_to_load_commands(
                     add_u32(bytes, cursor + 56); // indirectsymoff
                     add_u32(bytes, cursor + 64); // extreloff
                     add_u32(bytes, cursor + 72); // locreloff
+                }
+            }
+            macho::LC_MAIN => {
+                // entry_point_command: entryoff @ +8 (u64), a file offset from the
+                // __TEXT base (0). The entry lives in __text — past the insert — so
+                // it moves by delta. Without this an executable starts in the gap.
+                if cmdsize >= 16 {
+                    let entryoff =
+                        u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+                    if entryoff >= growth_point {
+                        bytes[cursor + 8..cursor + 16]
+                            .copy_from_slice(&(entryoff + delta).to_le_bytes());
+                    }
                 }
             }
             _ => {}
@@ -1550,22 +1620,14 @@ fn extend_linkedit_segment(
                 let fileoff = u64::from_le_bytes(
                     bytes[cursor + 40..cursor + 48].try_into().unwrap(),
                 );
+                // Set filesize/vmsize to cover exactly [fileoff, new_file_end).
+                // The sole caller only ever grows (append), so this is
+                // behaviour-preserving there; it also lets the grow's trie
+                // relocation SHRINK __LINKEDIT after stripping the old signature.
                 let new_filesize = new_file_end.saturating_sub(fileoff);
-                let old_filesize = u64::from_le_bytes(
-                    bytes[cursor + 48..cursor + 56].try_into().unwrap(),
-                );
-                if new_filesize > old_filesize {
-                    bytes[cursor + 48..cursor + 56]
-                        .copy_from_slice(&new_filesize.to_le_bytes());
-                }
-                let old_vmsize = u64::from_le_bytes(
-                    bytes[cursor + 32..cursor + 40].try_into().unwrap(),
-                );
-                if new_filesize > old_vmsize {
-                    let new_vmsize = (new_filesize + 0x4000 - 1) & !(0x4000 - 1);
-                    bytes[cursor + 32..cursor + 40]
-                        .copy_from_slice(&new_vmsize.to_le_bytes());
-                }
+                bytes[cursor + 48..cursor + 56].copy_from_slice(&new_filesize.to_le_bytes());
+                let new_vmsize = (new_filesize + 0x4000 - 1) & !(0x4000 - 1);
+                bytes[cursor + 32..cursor + 40].copy_from_slice(&new_vmsize.to_le_bytes());
                 return Ok(());
             }
         }
@@ -1574,6 +1636,25 @@ fn extend_linkedit_segment(
     Err(ContainerWriteError::ObjectWrite(
         "Mach-O export: __LINKEDIT segment not found".into(),
     ))
+}
+
+/// Remove a trailing `LC_CODE_SIGNATURE` and truncate its blob so the file's real
+/// tail is the last live `__LINKEDIT` sub-table. Needed before appending to
+/// `__LINKEDIT` (e.g. relocating the export trie): a signature left mid-file makes
+/// codesign fail with "internal error". codesign re-adds a fresh signature after.
+fn strip_trailing_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWriteError> {
+    use object::macho;
+    let Some(off) = find_load_command(bytes, macho::LC_CODE_SIGNATURE)? else {
+        return Ok(());
+    };
+    let dataoff = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize;
+    let datasize = u32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap()) as usize;
+    // The signature is conventionally the file tail; drop the blob if so.
+    if datasize > 0 && dataoff + datasize == bytes.len() {
+        bytes.truncate(dataoff);
+    }
+    strip_load_command(bytes, macho::LC_CODE_SIGNATURE)?;
+    Ok(())
 }
 
 /// Find a load command by `cmd` ID and return its offset in

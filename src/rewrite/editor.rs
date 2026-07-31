@@ -474,6 +474,55 @@ fn commit_lifted_any(
     }
 }
 
+/// Emit a lifted fixed-width section as it should appear **after a `__TEXT`
+/// grow** — laid out at `base_address + delta` (its post-shift address) with
+/// `container` already carrying post-shift symbol addresses. Returns the section
+/// index (into `container.sections`) and the edited bytes, for use as a
+/// `section_override` to `write_with_text_growth_opts`.
+///
+/// Laying out at `base + delta` keeps every intra-`__text` branch/adrp correct
+/// (source and target both moved by the page-aligned `delta`, so PC-relative
+/// encodings are unchanged) while resolving trampolines to the **unshifted** gap
+/// (their target symbols were deliberately left un-shifted). Overlays (hole-placed
+/// copies) apply at the same in-section offset `va - base_address` — the `+delta`
+/// on both the emit base and the copy's final address cancels — so their
+/// pre-shift bytes stay valid (a hole and its targets shift together).
+fn emit_lifted_section_shifted<I: Isa>(
+    section: &LiftedTextSection<I>,
+    container: &Container,
+    delta: u64,
+) -> Result<(usize, Vec<u8>), TextEditorError> {
+    let base = section.base_address + delta;
+    let layout = lay_out(&section.plan, base, Some(container))?;
+    let mut output = emit(&section.plan, &layout, Some(container))?;
+    for (va, bytes) in &section.overlays {
+        let off = va.wrapping_sub(section.base_address) as usize;
+        if let Some(slot) = output.bytes.get_mut(off..off + bytes.len()) {
+            slot.copy_from_slice(bytes);
+        }
+    }
+    Ok((section.section_id.0, output.bytes))
+}
+
+/// [`emit_lifted_section_shifted`] over the ISA-erased lifted section. Grow is a
+/// fixed-width-ISA path (Mach-O aarch64/arm); x86 text-growth isn't supported.
+fn emit_lifted_any_shifted(
+    text: &LiftedTextSectionAny,
+    container: &Container,
+    delta: u64,
+) -> Result<(usize, Vec<u8>), TextEditorError> {
+    match text {
+        LiftedTextSectionAny::Aarch64(s) => emit_lifted_section_shifted(s, container, delta),
+        LiftedTextSectionAny::Thumb(s) => emit_lifted_section_shifted(s, container, delta),
+        LiftedTextSectionAny::Arm(s) => emit_lifted_section_shifted(s, container, delta),
+        LiftedTextSectionAny::X86(_) => Err(TextEditorError::ContainerWrite(
+            ContainerWriteError::ObjectWrite(
+                "text-growth commit is fixed-width-ISA only (x86 lifted section)".into(),
+            ),
+        )),
+    }
+}
+
 /// x86 commit: assemble the (possibly edited) instruction list via
 /// iced's `BlockEncoder` and splice the result back into the section.
 /// Unlike the fixed-width ISAs, x86 doesn't go through the generic
@@ -2527,6 +2576,70 @@ impl BinaryState {
         Ok(symbol_id)
     }
 
+    /// Append a pre-built (typed) `plan` into `region` — the plan-based analogue
+    /// of [`Self::add_function_in`], for callers (e.g. a mutation pass) that
+    /// already hold a multi-block [`RewritePlanGeneric`]. Lays out + emits at the
+    /// region's next 4-aligned address, **retains the plan** so a grow commit can
+    /// re-emit it against post-shift symbol addresses (its `bl`/`adrp` targets in
+    /// the shifted `__text`/`__DATA` move by `delta`; the copy sits in the
+    /// unshifted gap), and returns the new function symbol.
+    ///
+    /// Fails (region unchanged) if the plan emits an unplaceable relocation — the
+    /// caller should leave that function native rather than ship a wrong jump.
+    pub fn add_function_from_plan_in<I: Isa>(
+        &mut self,
+        region: RegionId,
+        name: &str,
+        plan: RewritePlanGeneric<I>,
+    ) -> Result<SymbolId, TextEditorError> {
+        if plan.blocks.iter().all(|b| b.ops.is_empty()) {
+            return Err(TextEditorError::EmptyFunction(name.to_string()));
+        }
+        let target_addr = self.next_address_in(region, 4)?;
+        // Pure lay out + emit at the target address (no state change, so a
+        // RegionFull carve below rolls nothing back).
+        let layout = lay_out(&plan, target_addr, Some(&self.container))?;
+        let output = emit(&plan, &layout, Some(&self.container))?;
+        // A resolvable plan folds every reference to a concrete displacement; a
+        // surviving relocation is something we can't place — bail so the caller
+        // can leave the function native (mirrors `add_function_from_plan` and the
+        // hole-placement paths).
+        if !output.relocations.is_empty() {
+            return Err(TextEditorError::AppendNeedsUnsupportedRelocation {
+                name: name.to_string(),
+                count: output.relocations.len(),
+            });
+        }
+        let carve = {
+            let r = self.active_region_mut(region)?;
+            r.carve(output.bytes.len() as u64, 4)?
+        };
+        debug_assert_eq!(carve.address, target_addr);
+        {
+            let state = self.appended.as_mut().ok_or(TextEditorError::NoSuchRegion)?;
+            state.bytes.resize(carve.offset_in_region as usize, 0);
+            state.bytes.extend_from_slice(&output.bytes);
+            state.items.push(RetainedAppend::Function {
+                name: name.to_string(),
+                offset: carve.offset_in_region,
+                plan: wrap_retained_plan(plan),
+            });
+        }
+        let symbol_id = SymbolId(self.container.symbols.len());
+        self.container.symbols.push(crate::container::Symbol {
+            id: symbol_id,
+            name: name.to_string(),
+            address: carve.address,
+            size: output.bytes.len() as u64,
+            kind: SymbolKind::Function,
+            binding: crate::container::SymbolBinding::Global,
+            section: None,
+            is_undefined: false,
+            flags: None,
+        });
+        Ok(symbol_id)
+    }
+
     /// Append read-only data into `region`, aligned to `align`. Returns
     /// its symbol (kind `Object`).
     pub fn add_data_in(
@@ -2669,6 +2782,7 @@ impl BinaryState {
         delta: u64,
         appended_file_offset: u64,
         appended_bytes: &[u8],
+        section_overrides: &[(usize, Vec<u8>)],
         sign: bool,
     ) -> Result<Vec<u8>, TextEditorError> {
         use crate::container::macho_writer::{write_with_text_growth_opts, MachOWriteOptions};
@@ -2731,49 +2845,9 @@ impl BinaryState {
             }
         }
 
-        // Exports-critical fixup: the export trie stores each symbol's
-        // address as an offset from the (fixed) image base, but the
-        // symbols moved +delta — so every regular export's offset shifts.
-        // Without this, dlsym / linked callers resolve moved exports at
-        // their old addresses.
-        if let Some(trie) = image.layout.exports_trie {
-            let start = trie.dataoff as usize;
-            let end = start + trie.datasize as usize;
-            let blob = image
-                .raw_bytes
-                .get(start..end)
-                .ok_or_else(|| {
-                    TextEditorError::ContainerWrite(ContainerWriteError::ObjectWrite(
-                        "grow: export trie range out of bounds".into(),
-                    ))
-                })?;
-            let mut exports = crate::container::macho_export_trie::parse(blob)
-                .map_err(TextEditorError::ContainerWrite)?;
-            const EXPORT_SYMBOL_FLAGS_REEXPORT: u64 = 0x08;
-            for e in &mut exports {
-                // Reexports reference another dylib (no local address);
-                // regular / stub-and-resolver exports moved by delta.
-                if e.flags & EXPORT_SYMBOL_FLAGS_REEXPORT == 0 {
-                    e.address_offset = e.address_offset.saturating_add(delta);
-                }
-            }
-            let mut rebuilt = crate::container::macho_export_trie::build(&exports);
-            if rebuilt.len() as u64 > trie.datasize {
-                // The +delta ULEB expansion outgrew the original slot;
-                // relocating the trie into a grown __LINKEDIT is a
-                // follow-up. Surface it rather than truncate.
-                return Err(TextEditorError::ContainerWrite(
-                    ContainerWriteError::ObjectWrite(format!(
-                        "grow: rebuilt export trie ({} bytes) outgrew its \
-                         {}-byte slot; trie relocation is not yet implemented",
-                        rebuilt.len(),
-                        trie.datasize,
-                    )),
-                ));
-            }
-            rebuilt.resize(trie.datasize as usize, 0);
-            raw_overrides.push((trie.dataoff + delta, rebuilt));
-        }
+        // The exports-critical `+delta` fixup (and its relocation when the trie
+        // outgrows its slot) is handled inside `write_with_text_growth_opts`,
+        // which owns the file-tail geometry the relocation needs.
 
         let opts = MachOWriteOptions {
             sign,
@@ -2785,7 +2859,7 @@ impl BinaryState {
             delta,
             appended_file_offset,
             appended_bytes,
-            &[],
+            section_overrides,
             &opts,
         )
         .map_err(TextEditorError::ContainerWrite)
@@ -4667,6 +4741,103 @@ impl BinaryEditor {
         Ok(edited)
     }
 
+    /// Commit a `__TEXT` grow: emit the in-place `.text` edits (trampolines,
+    /// hole/fold overlays) **and** the carved overflow into the inserted gap, all
+    /// at their post-shift addresses.
+    ///
+    /// The grow inserts `delta` bytes at `growth_point` (the first `__TEXT`
+    /// section offset), pushing `__text` and everything after it up by `delta`;
+    /// the reserved region is the freed gap at the *old* `__text` address. So:
+    ///  1. shift every original symbol at/after the insert by `delta` (the whole
+    ///     image past the gap moves), leaving the carved gap symbols in place;
+    ///  2. re-emit the carved gap copies against those shifted symbols (they sit
+    ///     in the unshifted gap but call/`adrp` into shifted `__text`/`__DATA`);
+    ///  3. re-emit the edited lifted `.text` at `base + delta`, so its trampolines
+    ///     resolve to hole copies (shifted) and gap copies (unshifted) alike;
+    ///  4. hand the edited `.text` (a section override) and the gap payload to the
+    ///     grow writer, which also applies the chained-fixup / export-trie `+delta`.
+    ///
+    /// Hole-placed copies need no re-emit: they and their targets both shift by
+    /// `delta`, so their pre-shift bytes stay correct once placed at `+delta`.
+    fn commit_grown(mut self, growth_point: u64, delta: u64, sign: bool) -> Result<Vec<u8>, TextEditorError> {
+        // The vaddr at the insertion point = the reserved gap base = old __text vaddr.
+        let insert_vaddr = {
+            let image = self
+                .binary
+                .container
+                .macho_image
+                .as_ref()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            let seg = image
+                .layout
+                .segments
+                .iter()
+                .find(|s| s.name == "__TEXT")
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            seg.vmaddr + (growth_point - seg.fileoff)
+        };
+
+        // Carved (gap) symbols must NOT shift. Identify them by (name,
+        // gap_base+offset) as `rebase` does — the gap overlaps original `__text`
+        // pre-shift, so the address alone can't tell a carve from the original
+        // symbol it will displace.
+        let carved: std::collections::HashSet<SymbolId> = match &self.binary.appended {
+            Some(app) => {
+                let gap_base = app.segment_vaddr;
+                app.items
+                    .iter()
+                    .filter_map(|item| {
+                        let (name, offset) = match item {
+                            RetainedAppend::Function { name, offset, .. } => (name.clone(), *offset),
+                            RetainedAppend::Data { name, offset, .. } => (name.clone(), *offset),
+                        };
+                        let addr = gap_base + offset;
+                        self.binary
+                            .container
+                            .symbols
+                            .iter()
+                            .find(|s| s.name == name && s.address == addr)
+                            .map(|s| s.id)
+                    })
+                    .collect()
+            }
+            None => std::collections::HashSet::new(),
+        };
+
+        // (1) Shift originals past the insert.
+        for s in &mut self.binary.container.symbols {
+            if s.address >= insert_vaddr && !carved.contains(&s.id) {
+                s.address += delta;
+            }
+        }
+
+        // (2) Re-emit the gap copies against the shifted symbols (new_base == the
+        // existing gap base, so this only re-encodes their references). Move the
+        // state out to split the `appended` / `container` borrows.
+        let payload = if let Some(mut app) = self.binary.appended.take() {
+            let gap_base = app.segment_vaddr;
+            app.rebase(gap_base, &mut self.binary.container)?
+        } else {
+            Vec::new()
+        };
+
+        // (3) Emit the edited lifted `__text` at its post-shift base.
+        let section_overrides: Vec<(usize, Vec<u8>)> = match &self.text {
+            Some(text) => vec![emit_lifted_any_shifted(text, &self.binary.container, delta)?],
+            None => Vec::new(),
+        };
+
+        // (4) Assemble via the grow writer (chained-fixup / export-trie +delta inside).
+        self.binary.build_grown_macho(
+            growth_point,
+            delta,
+            growth_point,
+            &payload,
+            &section_overrides,
+            sign,
+        )
+    }
+
     /// Like [`Self::commit`] but also serializes the resulting
     /// container to bytes. Convenience for the common case where
     /// the caller wants a runnable `.so`/`.o` blob immediately.
@@ -4713,15 +4884,7 @@ impl BinaryEditor {
         // in build_grown_macho. The reserved region's placed content is
         // the appended buffer, dropped into the inserted gap.
         if let Some((growth_point, delta)) = self.binary.pending_text_grow {
-            let payload = self
-                .binary
-                .appended
-                .as_ref()
-                .map(|a| a.bytes.clone())
-                .unwrap_or_default();
-            return self
-                .binary
-                .build_grown_macho(growth_point, delta, growth_point, &payload, sign);
+            return self.commit_grown(growth_point, delta, sign);
         }
 
         // Library-dep additions need to land in the appended
