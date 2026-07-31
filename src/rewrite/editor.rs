@@ -52,7 +52,7 @@ use crate::mc::{build_cfg, ControlFlowGraph};
 use crate::rewrite::commit::commit_to_container;
 use crate::rewrite::emit::{emit, EmitError};
 use crate::rewrite::ir::{
-    RewriteInstruction as RewriteInstructionGeneric, Target,
+    RewriteInstruction as RewriteInstructionGeneric, RewriteOp, RewriteOperand, Target,
 };
 use crate::rewrite::layout::{lay_out, lay_out_for_size, lay_out_scattered, LayoutError};
 use crate::rewrite::plan::{EditError, RewritePlan as RewritePlanGeneric};
@@ -520,6 +520,60 @@ fn emit_lifted_any_shifted(
                 "text-growth commit is fixed-width-ISA only (x86 lifted section)".into(),
             ),
         )),
+    }
+}
+
+/// Add `delta` to every `Target::Absolute(a)` with `a >= threshold` in a plan.
+/// Used by the `__TEXT` grow for gap-placed copies: references with no symbol are
+/// baked as absolutes by `resolve_address` (a `__cstring` load, a `__stubs` call
+/// in a linked binary), and re-emitting them verbatim would leave a gap copy —
+/// which sits at the OLD `__text` base — pointing at the pre-shift address (now
+/// inside the inserted gap). Every referent at/after the insert moved by `delta`;
+/// gap copies never reference each other by absolute, so this only follows the
+/// shift. Symbolic and block targets are untouched (handled by the symbol shift /
+/// intra-copy layout).
+fn shift_plan_absolute_targets<I: Isa>(
+    plan: &mut RewritePlanGeneric<I>,
+    threshold: u64,
+    delta: u64,
+) {
+    let bump = |a: &mut u64| {
+        if *a >= threshold {
+            *a += delta;
+        }
+    };
+    for block in &mut plan.blocks {
+        for op in &mut block.ops {
+            match op {
+                RewriteOp::Instruction(instr) => {
+                    for operand in &mut instr.operands {
+                        if let RewriteOperand::Branch(Target::Absolute(a))
+                        | RewriteOperand::Page(Target::Absolute(a)) = operand
+                        {
+                            bump(a);
+                        }
+                    }
+                }
+                // Fused load-address macros (adrp+add) carry the FULL absolute
+                // target — the __cstring / data pointer a gap copy loads.
+                RewriteOp::Macro(m) => {
+                    if let Target::Absolute(a) = &mut m.target {
+                        bump(a);
+                    }
+                }
+                RewriteOp::Raw(_) => {}
+            }
+        }
+    }
+}
+
+/// [`shift_plan_absolute_targets`] over the ISA-erased retained plan.
+fn shift_retained_absolute_targets(plan: &mut RetainedPlanAny, threshold: u64, delta: u64) {
+    match plan {
+        RetainedPlanAny::Aarch64(p) => shift_plan_absolute_targets(p, threshold, delta),
+        RetainedPlanAny::Thumb(p) => shift_plan_absolute_targets(p, threshold, delta),
+        RetainedPlanAny::Arm(p) => shift_plan_absolute_targets(p, threshold, delta),
+        RetainedPlanAny::X86(p) => shift_plan_absolute_targets(p, threshold, delta),
     }
 }
 
@@ -2432,6 +2486,63 @@ impl BinaryState {
             capacity: plan.capacity,
             sources: vec![(plan.source, plan.capacity)],
         })
+    }
+
+    /// Set up a **deferred** `__TEXT` grow: fix the grow geometry (insert point
+    /// and gap base) now, but leave the growth size to be computed at commit from
+    /// the actual appended payload. Unlike [`Self::reserve_text_region`] with
+    /// [`Exhaustion::Grow`](crate::rewrite::space::Exhaustion::Grow), there is no
+    /// fixed-capacity region to carve from — callers append with the ordinary
+    /// `add_function` / `add_data` path (their content lands in the gap because
+    /// `appended.segment_vaddr` is the gap base), and commit grows `__TEXT` by
+    /// exactly enough pages to hold whatever accumulated. If nothing is appended,
+    /// no grow happens and the commit is unchanged.
+    ///
+    /// This is the "spill the whole binary's overflow into one grown segment"
+    /// mode: the caller places what it can in freed holes and lets everything else
+    /// append here, without knowing the total up front. Mach-O only; must run
+    /// before any append / front edit (it seeds the append state).
+    pub fn reserve_text_grow(&mut self) -> Result<(), TextEditorError> {
+        if !matches!(self.container.format, crate::container::BinaryFormat::Macho) {
+            return Err(TextEditorError::ReserveUnsupportedFormat(self.container.format));
+        }
+        if !self.pending_library_deps.is_empty() || self.force_segment_placement {
+            return Err(TextEditorError::ReserveNeedsFrontEditsFirst);
+        }
+        if self.reserved_text_region.is_some() || self.appended.is_some() {
+            return Err(TextEditorError::TextRegionAlreadyReserved);
+        }
+        let (growth_point, base_address) = {
+            let image = self
+                .container
+                .macho_image
+                .as_ref()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            let text = image
+                .layout
+                .segments
+                .iter()
+                .find(|s| s.name == "__TEXT")
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            let growth_point = image
+                .layout
+                .sections
+                .iter()
+                .filter(|s| s.segname == "__TEXT" && s.file_offset > 0)
+                .map(|s| s.file_offset)
+                .min()
+                .ok_or(TextEditorError::AppendMissingElfImage)?;
+            (growth_point, text.vmaddr + (growth_point - text.fileoff))
+        };
+        // delta == 0 marks "size at commit from the appended payload".
+        self.pending_text_grow = Some((growth_point, 0));
+        self.appended = Some(AppendedFunctionsState {
+            segment_vaddr: base_address,
+            bytes: Vec::new(),
+            exports: Vec::new(),
+            items: Vec::new(),
+        });
+        Ok(())
     }
 
     /// Set up a reservation fulfilled by growing `__TEXT` (uniform-shift)
@@ -4816,6 +4927,14 @@ impl BinaryEditor {
         // state out to split the `appended` / `container` borrows.
         let payload = if let Some(mut app) = self.binary.appended.take() {
             let gap_base = app.segment_vaddr;
+            // Follow the shift for symbol-less references (Target::Absolute) into
+            // the moved region before re-emitting — otherwise a gap copy's
+            // `__cstring`/`__stubs` refs point back into the gap.
+            for item in &mut app.items {
+                if let RetainedAppend::Function { plan, .. } = item {
+                    shift_retained_absolute_targets(plan, insert_vaddr, delta);
+                }
+            }
             app.rebase(gap_base, &mut self.binary.container)?
         } else {
             Vec::new()
@@ -4883,8 +5002,22 @@ impl BinaryEditor {
         // load-command patch, chained-fixup + export-trie +delta) lives
         // in build_grown_macho. The reserved region's placed content is
         // the appended buffer, dropped into the inserted gap.
-        if let Some((growth_point, delta)) = self.binary.pending_text_grow {
-            return self.commit_grown(growth_point, delta, sign);
+        if let Some((growth_point, mut delta)) = self.binary.pending_text_grow {
+            // A deferred grow (delta == 0, from `reserve_text_grow`) is sized here
+            // from the actual appended payload — page-rounded so the gap holds it.
+            if delta == 0 {
+                const PAGE: u64 = 0x4000;
+                let payload = self.binary.appended.as_ref().map_or(0, |a| a.bytes.len() as u64);
+                delta = ((payload + PAGE - 1) / PAGE) * PAGE;
+            }
+            if delta == 0 {
+                // Nothing accumulated in the reserved gap — no grow needed. Drop
+                // the empty reservation so the normal in-place commit path runs.
+                self.binary.pending_text_grow = None;
+                self.binary.appended = None;
+            } else {
+                return self.commit_grown(growth_point, delta, sign);
+            }
         }
 
         // Library-dep additions need to land in the appended
