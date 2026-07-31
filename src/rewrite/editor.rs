@@ -577,6 +577,29 @@ fn shift_retained_absolute_targets(plan: &mut RetainedPlanAny, threshold: u64, d
     }
 }
 
+/// [`shift_plan_absolute_targets`] over the ISA-erased **lifted `__text`** plan.
+/// The lifted section is re-emitted at `base + delta` under a grow; a RETAINED
+/// native function's symbol-less external refs — `bl` into `__stubs`, `adrp` into
+/// `__cstring`/`__got`, all baked as `Target::Absolute` by `resolve_address` —
+/// point at referents that also moved `+delta`, but the emitter resolves an
+/// absolute target against its literal (pre-shift) address from a post-shift PC,
+/// landing the ref `delta` bytes low (in the inserted gap). Following the shift
+/// here makes those `Target::Absolute` refs resolve to the moved referent, exactly
+/// as [`shift_retained_absolute_targets`] does for gap copies. Symbolic / block
+/// targets are untouched (the symbol table shift and intra-copy layout own those,
+/// and trampolines to the un-shifted gap must stay un-shifted).
+fn shift_lifted_any_absolute_targets(text: &mut LiftedTextSectionAny, threshold: u64, delta: u64) {
+    match text {
+        LiftedTextSectionAny::Aarch64(s) => {
+            shift_plan_absolute_targets(&mut s.plan, threshold, delta)
+        }
+        LiftedTextSectionAny::Thumb(s) => shift_plan_absolute_targets(&mut s.plan, threshold, delta),
+        LiftedTextSectionAny::Arm(s) => shift_plan_absolute_targets(&mut s.plan, threshold, delta),
+        // x86 text-growth isn't supported (see emit_lifted_any_shifted).
+        LiftedTextSectionAny::X86(_) => {}
+    }
+}
+
 /// x86 commit: assemble the (possibly edited) instruction list via
 /// iced's `BlockEncoder` and splice the result back into the section.
 /// Unlike the fixed-width ISAs, x86 doesn't go through the generic
@@ -2547,6 +2570,20 @@ impl BinaryState {
             items: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Bytes accumulated for a pending **deferred** `__TEXT` grow (one armed by
+    /// [`Self::reserve_text_grow`], i.e. `delta` not yet fixed). This is the exact
+    /// payload commit will drop into the grown gap; commit page-rounds it up to the
+    /// grow `delta`, so `Some(0)` means the grow is armed but nothing overflowed
+    /// into it and commit will perform **no** grow. `None` when no deferred grow is
+    /// armed (no reservation, or a fixed-`delta` reservation). Lets a caller report
+    /// whether the image actually grew without re-parsing the committed bytes.
+    pub fn pending_grow_payload_len(&self) -> Option<u64> {
+        match self.pending_text_grow {
+            Some((_, 0)) => Some(self.appended.as_ref().map_or(0, |a| a.bytes.len() as u64)),
+            _ => None,
+        }
     }
 
     /// Set up a reservation fulfilled by growing `__TEXT` (uniform-shift)
@@ -4941,7 +4978,15 @@ impl BinaryEditor {
             Vec::new()
         };
 
-        // (3) Emit the edited lifted `__text` at its post-shift base.
+        // (3) Emit the edited lifted `__text` at its post-shift base. First follow
+        // the shift for a retained native function's symbol-less external refs
+        // (`bl __stubs`, `adrp __cstring`/`__got`) — baked as `Target::Absolute`,
+        // they'd otherwise resolve `delta` bytes low into the gap (mirrors the gap-
+        // copy shift in step 2). Symbolic trampolines into the un-shifted gap stay
+        // put (they're `Target::Symbol`, not touched here).
+        if let Some(text) = self.text.as_mut() {
+            shift_lifted_any_absolute_targets(text, insert_vaddr, delta);
+        }
         let section_overrides: Vec<(usize, Vec<u8>)> = match &self.text {
             Some(text) => vec![emit_lifted_any_shifted(text, &self.binary.container, delta)?],
             None => Vec::new(),
