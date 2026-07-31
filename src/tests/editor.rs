@@ -1212,6 +1212,7 @@ fn write_with_text_growth_applies_uniform_shift_structurally() {
     let opts = MachOWriteOptions {
         sign: false,
         raw_byte_overrides: vec![],
+        chained_fixups_blob: None,
     };
     let out = write_with_text_growth_opts(
         &container,
@@ -1274,6 +1275,7 @@ fn write_with_text_growth_rejects_bad_params() {
     let opts = MachOWriteOptions {
         sign: false,
         raw_byte_overrides: vec![],
+        chained_fixups_blob: None,
     };
     let gp = first_text_section_offset(&container);
     // Zero delta is rejected.

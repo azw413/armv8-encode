@@ -251,6 +251,38 @@ impl<I: Isa> RewritePlan<I> {
         Some(&mut self.blocks[b].ops[i])
     }
 
+    /// If a fused [`RewriteOp::Macro`] *begins* at `address`, split it back into
+    /// its source instructions so the first is individually addressable. No-op if
+    /// there's no op at `address`, it isn't a macro, or the macro starts earlier.
+    ///
+    /// Needed to edit a function whose entry instruction was fused — e.g. one that
+    /// opens with an `adrp`+`add` load-address macro. Without this, an edit at the
+    /// entry (a trampoline) finds a `Macro`, which [`Self::instruction_at_mut`]
+    /// can't return, and the edit fails. Splitting is safe: the macro carries its
+    /// original instructions, and re-emitting them raw is equivalent to the fused
+    /// form (the fusion is a layout optimisation, not a semantic change).
+    pub fn unfuse_macro_at(&mut self, address: u64) {
+        let Some((b, i)) = self.locate(address) else {
+            return;
+        };
+        let replacement: Vec<RewriteOp<I>> = match &self.blocks[b].ops[i] {
+            RewriteOp::Macro(m)
+                if m.original_instructions
+                    .first()
+                    .and_then(|ins| ins.original_address)
+                    == Some(address) =>
+            {
+                m.original_instructions
+                    .iter()
+                    .cloned()
+                    .map(RewriteOp::Instruction)
+                    .collect()
+            }
+            _ => return,
+        };
+        self.blocks[b].ops.splice(i..=i, replacement);
+    }
+
     pub fn instruction_at(&self, address: u64) -> Option<&RewriteInstruction<I>> {
         match self.op_at(address)? {
             RewriteOp::Instruction(insn) => Some(insn),

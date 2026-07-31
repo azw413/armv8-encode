@@ -96,6 +96,12 @@ pub struct MachOWriteOptions {
     /// neutral container model doesn't represent — e.g. a
     /// rewritten `LC_DYLD_CHAINED_FIXUPS` blob.
     pub raw_byte_overrides: Vec<(u64, Vec<u8>)>,
+    /// A rewritten `LC_DYLD_CHAINED_FIXUPS` blob to place under a `__TEXT` grow:
+    /// `(orig_dataoff, orig_datasize, bytes)`. Written in place at
+    /// `orig_dataoff + delta` if it still fits its slot, otherwise **relocated**
+    /// to a grown `__LINKEDIT` tail (the `+delta` re-encode can outgrow the
+    /// slot). Only consulted by [`write_with_text_growth_opts`].
+    pub chained_fixups_blob: Option<(u64, u64, Vec<u8>)>,
 }
 
 impl MachOWriteOptions {
@@ -106,6 +112,7 @@ impl MachOWriteOptions {
         Self {
             sign: true,
             raw_byte_overrides: Vec::new(),
+            chained_fixups_blob: None,
         }
     }
 }
@@ -1162,35 +1169,32 @@ pub fn write_with_text_growth_opts(
                 }
             }
             let rebuilt = crate::container::macho_export_trie::build(&exports);
-            let shifted_off = (trie.dataoff + delta) as usize;
-            if rebuilt.len() as u64 <= trie.datasize {
-                // Fits the (shifted) slot: overwrite in place, zero the tail.
-                bytes[shifted_off..shifted_off + rebuilt.len()].copy_from_slice(&rebuilt);
-                for b in &mut bytes[shifted_off + rebuilt.len()..shifted_off + trie.datasize as usize]
-                {
-                    *b = 0;
-                }
-            } else {
-                // Relocate: strip the trailing signature (so the trie lands at the
-                // real __LINKEDIT tail, not after the signature), append the trie
-                // 8-aligned, resize __LINKEDIT to cover it, and repoint the load
-                // command. codesign re-signs — extending __LINKEDIT again — after.
-                strip_trailing_code_signature(&mut bytes)?;
-                while bytes.len() % 8 != 0 {
-                    bytes.push(0);
-                }
-                let new_off = bytes.len() as u64;
-                bytes.extend_from_slice(&rebuilt);
-                let new_end = bytes.len() as u64;
-                extend_linkedit_segment(&mut bytes, layout.load_commands_offset, new_end)?;
-                patch_lc_linkedit_data(
-                    &mut bytes,
-                    object::macho::LC_DYLD_EXPORTS_TRIE,
-                    new_off,
-                    rebuilt.len() as u64,
-                )?;
-            }
+            place_or_relocate_linkedit_blob(
+                &mut bytes,
+                layout.load_commands_offset,
+                object::macho::LC_DYLD_EXPORTS_TRIE,
+                trie.dataoff,
+                trie.datasize,
+                delta,
+                &rebuilt,
+            )?;
         }
+    }
+
+    // Chained-fixups blob: the editor re-encoded LC_DYLD_CHAINED_FIXUPS with every
+    // rebase target `+delta` (originals shifted up), which can outgrow the original
+    // slot. Place in the shifted slot if it still fits, else relocate to the grown
+    // __LINKEDIT tail. Order after the trie so both relocations append cleanly.
+    if let Some((dataoff, datasize, blob)) = options.chained_fixups_blob.as_ref() {
+        place_or_relocate_linkedit_blob(
+            &mut bytes,
+            layout.load_commands_offset,
+            object::macho::LC_DYLD_CHAINED_FIXUPS,
+            *dataoff,
+            *datasize,
+            delta,
+            blob,
+        )?;
     }
 
     if options.sign {
@@ -1654,6 +1658,43 @@ fn strip_trailing_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWri
         bytes.truncate(dataoff);
     }
     strip_load_command(bytes, macho::LC_CODE_SIGNATURE)?;
+    Ok(())
+}
+
+/// Place a rewritten (already `+delta`-adjusted) `__LINKEDIT` blob under a text
+/// grow: write it in place at `orig_dataoff + delta` if it still fits
+/// `orig_datasize`, otherwise RELOCATE it to a fresh 8-aligned slot at a grown
+/// `__LINKEDIT` tail (stripping any trailing code signature first — codesign
+/// re-adds it) and repoint `lc_id`. `apply_growth_to_load_commands` already
+/// shifted the LC's `dataoff` by `delta`; relocation overrides that. Used for the
+/// export trie and the chained-fixups blob, both of which can outgrow their slot
+/// when their offsets are re-encoded `+delta`.
+fn place_or_relocate_linkedit_blob(
+    bytes: &mut Vec<u8>,
+    load_commands_offset: u64,
+    lc_id: u32,
+    orig_dataoff: u64,
+    orig_datasize: u64,
+    delta: u64,
+    blob: &[u8],
+) -> Result<(), ContainerWriteError> {
+    let shifted_off = (orig_dataoff + delta) as usize;
+    if blob.len() as u64 <= orig_datasize {
+        bytes[shifted_off..shifted_off + blob.len()].copy_from_slice(blob);
+        for b in &mut bytes[shifted_off + blob.len()..shifted_off + orig_datasize as usize] {
+            *b = 0;
+        }
+    } else {
+        strip_trailing_code_signature(bytes)?;
+        while bytes.len() % 8 != 0 {
+            bytes.push(0);
+        }
+        let new_off = bytes.len() as u64;
+        bytes.extend_from_slice(blob);
+        let new_end = bytes.len() as u64;
+        extend_linkedit_segment(bytes, load_commands_offset, new_end)?;
+        patch_lc_linkedit_data(bytes, lc_id, new_off, blob.len() as u64)?;
+    }
     Ok(())
 }
 

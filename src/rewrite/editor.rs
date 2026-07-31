@@ -2022,6 +2022,10 @@ impl<I: Isa> LiftedTextSection<I> {
         address: u64,
         new_instruction: RewriteInstructionGeneric<I>,
     ) -> Result<(), TextEditorError> {
+        // A function whose entry instruction fused into a macro (e.g. adrp+add)
+        // would otherwise be un-editable at its entry: split it so the entry is a
+        // plain instruction the trampoline can replace.
+        self.plan.unfuse_macro_at(address);
         let target = self
             .plan
             .instruction_at_mut(address)
@@ -2918,6 +2922,7 @@ impl BinaryState {
         }
 
         let mut raw_overrides: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut chained_fixups_blob: Option<(u64, u64, Vec<u8>)> = None;
 
         // The load-critical fixup: shift every chained-fixup slot + rebase
         // target by `delta` and re-emit blob + slots at shifted offsets.
@@ -2938,15 +2943,10 @@ impl BinaryState {
                         let ser = cf
                             .serialize(&shifted)
                             .map_err(|e| TextEditorError::ContainerWrite(e.into()))?;
-                        let mut blob = ser.bytes;
-                        if blob.len() as u64 > cfhdr.datasize {
-                            return Err(TextEditorError::ChainedFixupsBlobTooLarge {
-                                new_size: blob.len() as u64,
-                                capacity: cfhdr.datasize,
-                            });
-                        }
-                        blob.resize(cfhdr.datasize as usize, 0);
-                        raw_overrides.push((cfhdr.dataoff + delta, blob));
+                        // The +delta re-encode can outgrow the original slot; let
+                        // the writer place it in-slot or relocate it into a grown
+                        // __LINKEDIT (parallel to the export trie).
+                        chained_fixups_blob = Some((cfhdr.dataoff, cfhdr.datasize, ser.bytes));
                     }
                 }
                 Err(crate::container::chained_fixups::ChainedFixupsError::Truncated(_)) => {
@@ -2963,6 +2963,7 @@ impl BinaryState {
         let opts = MachOWriteOptions {
             sign,
             raw_byte_overrides: raw_overrides,
+            chained_fixups_blob,
         };
         write_with_text_growth_opts(
             &self.container,
@@ -5079,6 +5080,7 @@ impl BinaryEditor {
                     let opts = crate::container::macho_writer::MachOWriteOptions {
                         sign,
                         raw_byte_overrides: binary.macho_raw_byte_overrides.clone(),
+                        chained_fixups_blob: None,
                     };
                     crate::container::macho_writer::write_with_options(&edited, &opts)
                         .map_err(TextEditorError::from)
@@ -5249,6 +5251,7 @@ impl BinaryEditor {
                         let opts = crate::container::macho_writer::MachOWriteOptions {
                             sign,
                             raw_byte_overrides: binary.macho_raw_byte_overrides.clone(),
+                            chained_fixups_blob: None,
                         };
                         return crate::container::macho_writer::write_with_intra_text_append_opts(
                             &updated, intra, &all_overrides, &opts,
@@ -5296,6 +5299,7 @@ impl BinaryEditor {
                     let opts = crate::container::macho_writer::MachOWriteOptions {
                         sign,
                         raw_byte_overrides: binary.macho_raw_byte_overrides.clone(),
+                        chained_fixups_blob: None,
                     };
                     return crate::container::macho_writer::write_with_appended_segment_opts(
                         &updated,
