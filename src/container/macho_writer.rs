@@ -1144,6 +1144,38 @@ pub fn write_with_text_growth_opts(
 
     apply_raw_byte_overrides(&mut bytes, &options.raw_byte_overrides)?;
 
+    // Init-offsets `+delta`: `S_INIT_FUNC_OFFSETS` (`__TEXT,__init_offsets`) stores
+    // each initializer as a 32-bit offset from the image base (the mach header),
+    // NOT as a rebased pointer — so nothing in the fixup chain relocates it. The
+    // grow moved every initializer up by `delta` (they live in `__text`, past
+    // `growth_point`), so each offset value must gain `delta` too; otherwise dyld
+    // calls the initializer at its stale offset, which now points into the
+    // pre-`__text` header region, and executes garbage → crash on the first
+    // `dlopen`. (`__mod_init_func` pointers, by contrast, ARE rebased and already
+    // pick up `+delta` through the chained-fixups re-encode.) Patch in the shifted
+    // slot, after section/raw overrides so an override's values shift too.
+    for sec in &layout.sections {
+        if sec.flags & object::macho::SECTION_TYPE != object::macho::S_INIT_FUNC_OFFSETS {
+            continue;
+        }
+        let base = if sec.file_offset >= growth_point {
+            (sec.file_offset + delta) as usize
+        } else {
+            sec.file_offset as usize
+        };
+        for i in 0..(sec.size / 4) as usize {
+            let at = base + i * 4;
+            if at + 4 > bytes.len() {
+                break;
+            }
+            let v = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            if v as u64 >= growth_point {
+                let shifted = (v as u64 + delta) as u32;
+                bytes[at..at + 4].copy_from_slice(&shifted.to_le_bytes());
+            }
+        }
+    }
+
     // Exports-critical `+delta`: the export trie stores each symbol's address as an
     // offset from the (fixed) image base, but every regular export moved up by
     // `delta`, so its offset must too — else dlsym / linked callers resolve moved
@@ -1197,10 +1229,341 @@ pub fn write_with_text_growth_opts(
         )?;
     }
 
+    // A grow can relocate the chained-fixups / export-trie blob to the
+    // __LINKEDIT tail (past symtab/strtab), leaving a non-canonical layout.
+    // dyld tolerates it, but strippers that assume clang's canonical order
+    // (chained-fixups + export-trie first, before the symtab tables) mishandle
+    // it. Re-lay __LINKEDIT into canonical order so the output matches a
+    // freshly-linked image.
+    canonicalize_linkedit(&mut bytes)?;
+
     if options.sign {
         sign_ad_hoc(&mut bytes)?;
     }
     Ok(bytes)
+}
+
+/// Re-lay the `__LINKEDIT` sub-blobs into canonical (clang) file order:
+///
+///   [chained-fixups] [export-trie] [function-starts] [data-in-code]
+///   [symtab nlist] [indirect syms] [strtab]
+///
+/// A `__TEXT` grow relocates any blob that outgrew its slot to the segment
+/// tail (see [`place_or_relocate_linkedit_blob`]), so the chained-fixups blob
+/// can end up *after* the symtab/strtab. dyld accepts that, but downstream
+/// consumers (e.g. a symbol stripper that preserves everything before the first
+/// symtab table verbatim) assume the canonical order and corrupt the image.
+///
+/// Each blob is self-contained — internal references are blob-relative
+/// (chained-fixups / export-trie offsets) or table-index-relative (nlist string
+/// indices, indirect-symbol indices), never absolute file offsets — so moving
+/// whole blobs and repointing their load commands is sound. Reads every offset
+/// from the *current* load commands, so it is independent of how the grow left
+/// things. Leaves any binary whose `__LINKEDIT` uses a shape this doesn't model
+/// (2-level-namespace dysymtab tables, `LC_DYLD_INFO`, split-info, an
+/// unstripped code signature) untouched rather than risk dropping data.
+fn canonicalize_linkedit(bytes: &mut Vec<u8>) -> Result<(), ContainerWriteError> {
+    use object::macho;
+    if bytes.len() < 32 {
+        return Ok(());
+    }
+    let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let lc_end = 32 + sizeofcmds;
+    if lc_end > bytes.len() {
+        return Ok(());
+    }
+
+    let mut le_lc = None;
+    let mut cf_lc = None;
+    let mut et_lc = None;
+    let mut fs_lc = None;
+    let mut dc_lc = None;
+    let mut sym_lc = None;
+    let mut dys_lc = None;
+    let mut cursor = 32usize;
+    for _ in 0..ncmds {
+        if cursor + 8 > lc_end {
+            return Ok(());
+        }
+        let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if cmdsize < 8 || cursor + cmdsize > lc_end {
+            return Ok(());
+        }
+        match cmd {
+            macho::LC_SEGMENT_64 => {
+                if bytes[cursor + 8..cursor + 24].starts_with(b"__LINKEDIT\0") {
+                    le_lc = Some(cursor);
+                }
+            }
+            macho::LC_DYLD_CHAINED_FIXUPS => cf_lc = Some(cursor),
+            macho::LC_DYLD_EXPORTS_TRIE => et_lc = Some(cursor),
+            macho::LC_FUNCTION_STARTS => fs_lc = Some(cursor),
+            macho::LC_DATA_IN_CODE => dc_lc = Some(cursor),
+            macho::LC_SYMTAB => sym_lc = Some(cursor),
+            macho::LC_DYSYMTAB => dys_lc = Some(cursor),
+            // Shapes we don't model — leave the image untouched.
+            macho::LC_DYLD_INFO
+            | macho::LC_DYLD_INFO_ONLY
+            | macho::LC_SEGMENT_SPLIT_INFO => return Ok(()),
+            macho::LC_CODE_SIGNATURE => {
+                // A live code signature must be the last __LINKEDIT blob; the
+                // grow strips it before relocation, so a non-zero one here means
+                // an unexpected order — don't touch it.
+                let sz = u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                if sz != 0 {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        cursor += cmdsize;
+    }
+
+    let (Some(le_lc), Some(sym_lc)) = (le_lc, sym_lc) else {
+        return Ok(());
+    };
+    // We only reorder chained-fixups images; a dyld_info image already bailed.
+    if cf_lc.is_none() {
+        return Ok(());
+    }
+    let le_fileoff = u64::from_le_bytes(bytes[le_lc + 40..le_lc + 48].try_into().unwrap()) as usize;
+
+    // linkedit_data_command: dataoff@+8, datasize@+12.
+    let ld = |lc: usize| -> (usize, usize) {
+        (
+            u32::from_le_bytes(bytes[lc + 8..lc + 12].try_into().unwrap()) as usize,
+            u32::from_le_bytes(bytes[lc + 12..lc + 16].try_into().unwrap()) as usize,
+        )
+    };
+    // symtab_command: symoff@+8, nsyms@+12, stroff@+16, strsize@+20.
+    let symoff = u32::from_le_bytes(bytes[sym_lc + 8..sym_lc + 12].try_into().unwrap()) as usize;
+    let nsyms = u32::from_le_bytes(bytes[sym_lc + 12..sym_lc + 16].try_into().unwrap()) as usize;
+    let stroff = u32::from_le_bytes(bytes[sym_lc + 16..sym_lc + 20].try_into().unwrap()) as usize;
+    let strsize = u32::from_le_bytes(bytes[sym_lc + 20..sym_lc + 24].try_into().unwrap()) as usize;
+
+    // dysymtab: only `indirectsymoff`(+56)/`nindirectsyms`(+60) are modelled;
+    // if any 2-level-namespace table (toc/modtab/extrefsym/extrel/locrel) is
+    // present, bail rather than drop it.
+    let (ind_off, ind_size) = if let Some(d) = dys_lc {
+        for off in [32usize, 40, 48, 64, 72] {
+            if u32::from_le_bytes(bytes[d + off..d + off + 4].try_into().unwrap()) != 0 {
+                return Ok(());
+            }
+        }
+        (
+            u32::from_le_bytes(bytes[d + 56..d + 60].try_into().unwrap()) as usize,
+            u32::from_le_bytes(bytes[d + 60..d + 64].try_into().unwrap()) as usize * 4,
+        )
+    } else {
+        (0, 0)
+    };
+
+    // Collect blobs in canonical order as (lc_offset, field_offset, bytes). The
+    // field offset is the u32 in the LC that holds this blob's file offset.
+    let mut plan: Vec<(usize, usize, usize, usize)> = Vec::new(); // (lc, field, off, size)
+    for (lc, field, off, size) in [
+        cf_lc.map(|lc| (lc, 8, ld(lc).0, ld(lc).1)),
+        et_lc.map(|lc| (lc, 8, ld(lc).0, ld(lc).1)),
+        fs_lc.map(|lc| (lc, 8, ld(lc).0, ld(lc).1)),
+        dc_lc.map(|lc| (lc, 8, ld(lc).0, ld(lc).1)),
+        Some((sym_lc, 8, symoff, nsyms * 16)),
+        dys_lc.map(|lc| (lc, 56, ind_off, ind_size)),
+        Some((sym_lc, 16, stroff, strsize)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if size == 0 {
+            continue;
+        }
+        if off + size > bytes.len() {
+            return Ok(()); // range out of bounds — don't touch
+        }
+        plan.push((lc, field, off, size));
+    }
+
+    // Copy each blob out (order matters: they may overlap the region we rebuild).
+    let blobs: Vec<(usize, usize, Vec<u8>)> = plan
+        .iter()
+        .map(|&(lc, field, off, size)| (lc, field, bytes[off..off + size].to_vec()))
+        .collect();
+
+    // Re-lay tightly, 8-aligned, from __LINKEDIT start; record new offsets.
+    let mut new_le: Vec<u8> = Vec::new();
+    let mut patches: Vec<(usize, usize, u32)> = Vec::new();
+    for (lc, field, data) in &blobs {
+        while new_le.len() % 8 != 0 {
+            new_le.push(0);
+        }
+        let new_off = le_fileoff + new_le.len();
+        new_le.extend_from_slice(data);
+        patches.push((*lc, *field, new_off as u32));
+    }
+    while new_le.len() % 8 != 0 {
+        new_le.push(0);
+    }
+
+    // __LINKEDIT is the last segment in the file — replace its content wholesale.
+    bytes.truncate(le_fileoff);
+    bytes.extend_from_slice(&new_le);
+
+    for (lc, field, new_off) in &patches {
+        bytes[lc + field..lc + field + 4].copy_from_slice(&new_off.to_le_bytes());
+    }
+    let new_filesize = new_le.len() as u64;
+    bytes[le_lc + 48..le_lc + 56].copy_from_slice(&new_filesize.to_le_bytes()); // filesize
+    let vmsize = (new_filesize + 0x3fff) & !0x3fff; // 16 KB page round-up
+    bytes[le_lc + 32..le_lc + 40].copy_from_slice(&vmsize.to_le_bytes()); // vmsize
+    Ok(())
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use super::canonicalize_linkedit;
+
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_SYMTAB: u32 = 0x2;
+    const LC_DYSYMTAB: u32 = 0xb;
+    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+    const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
+
+    fn w32(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn w64(b: &mut [u8], o: usize, v: u64) {
+        b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    fn r32(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+
+    /// A chained-fixups image whose `__LINKEDIT` blobs are laid out
+    /// non-canonically — export-trie, symtab nlist, strtab, then chained-fixups
+    /// last (exactly what a grow's tail-relocation produces). Canonicalization
+    /// must move chained-fixups (and export-trie) ahead of the symtab tables,
+    /// preserve every blob's bytes, repoint each load command, and resize
+    /// `__LINKEDIT`.
+    #[test]
+    fn reorders_tail_relocated_chained_fixups_to_front() {
+        // Header (32) + 5 LCs. Sizes: seg 0x48, cf 0x10, et 0x10, symtab 0x18,
+        // dysymtab 0x50 → sizeofcmds 0xd0, lc_end 0xf0. __LINKEDIT at 0x100.
+        const LE: usize = 0x100;
+        let mut b = vec![0u8; LE + 0x28];
+        w32(&mut b, 0, 0xfeed_facf); // MH_MAGIC_64
+        w32(&mut b, 4, 0x0100_000c); // arm64
+        w32(&mut b, 12, 6); // MH_DYLIB
+        w32(&mut b, 16, 5); // ncmds
+        w32(&mut b, 20, 0xd0); // sizeofcmds
+
+        // __LINKEDIT segment LC.
+        let seg = 32;
+        w32(&mut b, seg, LC_SEGMENT_64);
+        w32(&mut b, seg + 4, 0x48);
+        b[seg + 8..seg + 8 + 10].copy_from_slice(b"__LINKEDIT");
+        w64(&mut b, seg + 24, 0x5_0000); // vmaddr
+        w64(&mut b, seg + 32, 0x4000); // vmsize
+        w64(&mut b, seg + 40, LE as u64); // fileoff
+        w64(&mut b, seg + 48, 0x28); // filesize
+
+        // Blobs laid out NON-canonically in the file:
+        //   export-trie @0x100 (8B, 0xEE), nlist @0x108 (16B, 0x11),
+        //   strtab @0x118 (8B, 0x77), chained-fixups @0x120 (8B, 0xCC).
+        for (off, len, fill) in [(0x100, 8, 0xEE), (0x108, 16, 0x11), (0x118, 8, 0x77), (0x120, 8, 0xCC)] {
+            for x in &mut b[off..off + len] {
+                *x = fill;
+            }
+        }
+
+        // LC_DYLD_CHAINED_FIXUPS → 0x120.
+        let cf = seg + 0x48;
+        w32(&mut b, cf, LC_DYLD_CHAINED_FIXUPS);
+        w32(&mut b, cf + 4, 0x10);
+        w32(&mut b, cf + 8, 0x120);
+        w32(&mut b, cf + 12, 8);
+        // LC_DYLD_EXPORTS_TRIE → 0x100.
+        let et = cf + 0x10;
+        w32(&mut b, et, LC_DYLD_EXPORTS_TRIE);
+        w32(&mut b, et + 4, 0x10);
+        w32(&mut b, et + 8, 0x100);
+        w32(&mut b, et + 12, 8);
+        // LC_SYMTAB → symoff 0x108 (nsyms 1 → 16B), stroff 0x118 (strsize 8).
+        let sym = et + 0x10;
+        w32(&mut b, sym, LC_SYMTAB);
+        w32(&mut b, sym + 4, 0x18);
+        w32(&mut b, sym + 8, 0x108);
+        w32(&mut b, sym + 12, 1);
+        w32(&mut b, sym + 16, 0x118);
+        w32(&mut b, sym + 20, 8);
+        // LC_DYSYMTAB, all zero tables (indirect 0).
+        let dys = sym + 0x18;
+        w32(&mut b, dys, LC_DYSYMTAB);
+        w32(&mut b, dys + 4, 0x50);
+
+        canonicalize_linkedit(&mut b).unwrap();
+
+        let cf_off = r32(&b, cf + 8) as usize;
+        let et_off = r32(&b, et + 8) as usize;
+        let symoff = r32(&b, sym + 8) as usize;
+        let stroff = r32(&b, sym + 16) as usize;
+
+        // Canonical: fixups + export-trie precede the symtab tables.
+        assert!(cf_off < symoff && cf_off < stroff, "chained-fixups before symtab");
+        assert!(et_off < symoff && et_off < stroff, "export-trie before symtab");
+        assert_eq!(cf_off, LE, "chained-fixups is now first in __LINKEDIT");
+
+        // Every blob's bytes survived the move at its new offset.
+        assert!(b[cf_off..cf_off + 8].iter().all(|&x| x == 0xCC), "chained-fixups bytes intact");
+        assert!(b[et_off..et_off + 8].iter().all(|&x| x == 0xEE), "export-trie bytes intact");
+        assert!(b[symoff..symoff + 16].iter().all(|&x| x == 0x11), "nlist bytes intact");
+        assert!(b[stroff..stroff + 8].iter().all(|&x| x == 0x77), "strtab bytes intact");
+
+        // __LINKEDIT filesize recomputed to cover the tightly-packed blobs.
+        let filesize = u64::from_le_bytes(b[seg + 48..seg + 56].try_into().unwrap());
+        assert_eq!(filesize, (stroff + 8 - LE) as u64, "filesize covers all blobs");
+    }
+
+    /// A tight, already-canonical image keeps its blob offsets (idempotent) and
+    /// preserves content.
+    #[test]
+    fn canonical_input_keeps_offsets() {
+        const LE: usize = 0x100;
+        let mut b = vec![0u8; LE + 0x20];
+        w32(&mut b, 0, 0xfeed_facf);
+        w32(&mut b, 4, 0x0100_000c);
+        w32(&mut b, 12, 6);
+        // 2 LCs: seg(0x48) + symtab(0x18) = 0x60.
+        w32(&mut b, 16, 2);
+        w32(&mut b, 20, 0x60);
+        let seg = 32;
+        w32(&mut b, seg, LC_SEGMENT_64);
+        w32(&mut b, seg + 4, 0x48);
+        b[seg + 8..seg + 8 + 10].copy_from_slice(b"__LINKEDIT");
+        w64(&mut b, seg + 40, LE as u64);
+        w64(&mut b, seg + 48, 0x18);
+        // A chained-fixups image needs LC_DYLD_CHAINED_FIXUPS to be reordered at
+        // all; without it, canonicalize bails. Use the reorder test for that.
+        // Here: canonical tight layout nlist @0x100 (16B) then strtab @0x110 (8B).
+        let sym = seg + 0x48;
+        w32(&mut b, sym, LC_SYMTAB);
+        w32(&mut b, sym + 4, 0x18);
+        w32(&mut b, sym + 8, 0x100);
+        w32(&mut b, sym + 12, 1);
+        w32(&mut b, sym + 16, 0x110);
+        w32(&mut b, sym + 20, 8);
+        for (off, len, fill) in [(0x100, 16, 0x11), (0x110, 8, 0x77)] {
+            for x in &mut b[off..off + len] {
+                *x = fill;
+            }
+        }
+        // No LC_DYLD_CHAINED_FIXUPS → canonicalize is a no-op (guarded).
+        let before = b.clone();
+        canonicalize_linkedit(&mut b).unwrap();
+        assert_eq!(b, before, "no chained-fixups → left untouched");
+        assert_eq!(r32(&b, sym + 8), 0x100);
+        assert_eq!(r32(&b, sym + 16), 0x110);
+    }
 }
 
 /// Patch the load-command header after `delta` bytes were inserted at
@@ -1247,6 +1610,36 @@ fn apply_growth_to_load_commands(
     let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
     let lc_end = lc_start + sizeofcmds;
 
+    // Pre-pass: find the vaddr of the growth point from the segment whose file
+    // range straddles it (`__TEXT`). Trailing segments are then classified by
+    // vmaddr against this — NOT by fileoff — because a zerofill-only segment
+    // (e.g. a `__DATA` holding just `__common`/`__bss`: filesize == 0, fileoff ==
+    // 0) sits AFTER the insert in vaddr space yet has no meaningful fileoff, so a
+    // fileoff test wrongly reads it as "before the insert" and leaves its vmaddr
+    // unshifted — colliding it into the grown `__TEXT`, which the kernel rejects
+    // at load (SIGKILL / ENOMEM at exec).
+    let mut insert_vaddr = growth_point;
+    {
+        let mut c = lc_start;
+        while c + 8 <= lc_end {
+            let cmd = u32::from_le_bytes(bytes[c..c + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(bytes[c + 4..c + 8].try_into().unwrap()) as usize;
+            if cmdsize == 0 || c + cmdsize > lc_end {
+                break;
+            }
+            if cmd == macho::LC_SEGMENT_64 && c + 56 <= lc_end {
+                let vmaddr = u64::from_le_bytes(bytes[c + 24..c + 32].try_into().unwrap());
+                let fileoff = u64::from_le_bytes(bytes[c + 40..c + 48].try_into().unwrap());
+                let filesize = u64::from_le_bytes(bytes[c + 48..c + 56].try_into().unwrap());
+                if fileoff <= growth_point && growth_point < fileoff + filesize {
+                    insert_vaddr = vmaddr + (growth_point - fileoff);
+                    break;
+                }
+            }
+            c += cmdsize;
+        }
+    }
+
     let mut cursor = lc_start;
     while cursor + 8 <= lc_end {
         let cmd = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
@@ -1268,20 +1661,22 @@ fn apply_growth_to_load_commands(
                     u64::from_le_bytes(bytes[cursor + 40..cursor + 48].try_into().unwrap());
                 let filesize =
                     u64::from_le_bytes(bytes[cursor + 48..cursor + 56].try_into().unwrap());
-                if fileoff >= growth_point {
-                    // Trailing segment: moves wholesale by `delta`.
-                    add_u64(bytes, cursor + 24); // vmaddr
-                    add_u64(bytes, cursor + 40); // fileoff
-                    shift_segment_sections(bytes, cursor, lc_end, delta, 0);
-                } else if fileoff + filesize > growth_point {
+                if fileoff <= growth_point && growth_point < fileoff + filesize {
                     // Segment straddling the insert (__TEXT): grows in
                     // place; its sections at/after the insert move.
                     add_u64(bytes, cursor + 32); // vmsize
                     add_u64(bytes, cursor + 48); // filesize
-                    let insert_vaddr = vmaddr + (growth_point - fileoff);
                     shift_segment_sections(bytes, cursor, lc_end, delta, insert_vaddr);
+                } else if vmaddr >= insert_vaddr {
+                    // Trailing segment (by vmaddr, so zerofill-only segments with
+                    // fileoff == 0 are still caught): moves wholesale by `delta`.
+                    // `add_u64` skips a zero fileoff, so a pure-zerofill segment
+                    // keeps fileoff == 0 while its vmaddr shifts.
+                    add_u64(bytes, cursor + 24); // vmaddr
+                    add_u64(bytes, cursor + 40); // fileoff
+                    shift_segment_sections(bytes, cursor, lc_end, delta, 0);
                 }
-                // else: entirely before the insert — leave it.
+                // else: entirely before the insert (e.g. __PAGEZERO) — leave it.
             }
             macho::LC_DYLD_INFO | macho::LC_DYLD_INFO_ONLY => {
                 if cmdsize >= 48 {
