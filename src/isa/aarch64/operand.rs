@@ -350,7 +350,19 @@ impl OperandCodec for Aarch64Opnd {
                 ctx.address,
                 imm26(ctx.word),
             ))),
-            Aarch64Opnd::AddrPcrel21 => Ok(DecodedOperand::Immediate(imm21(ctx.word))),
+            // ADR's ±1 MiB PC-relative displacement is anchored to an ABSOLUTE
+            // target (like the branch forms above), NOT kept as a raw offset. A
+            // raw offset silently breaks under any layout change: when the
+            // rewriter relocates the instruction or inserts code between it and
+            // its target, the displacement must be recomputed — but a bare
+            // `Immediate` isn't recognized as PC-relative (`pcrel_kind` returns
+            // `None`), so it was copied/re-encoded verbatim with a now-stale
+            // offset → the register gets a wild address. `imm21` is byte-granular
+            // (no `<< 2`), so `branch_target` yields the absolute target directly.
+            Aarch64Opnd::AddrPcrel21 => Ok(DecodedOperand::BranchTarget(branch_target(
+                ctx.address,
+                imm21(ctx.word),
+            ))),
             Aarch64Opnd::AddrAdrp => Ok(DecodedOperand::PageTarget(adrp_target(
                 ctx.address,
                 ctx.word,
@@ -460,7 +472,7 @@ impl OperandCodec for Aarch64Opnd {
             Aarch64Opnd::AddrUimm12 => encode_addr_uimm12(self, operand, ctx.base_word),
             Aarch64Opnd::AddrPcrel14 => encode_pcrel(self, operand, ctx.address, 14, 5),
             Aarch64Opnd::AddrPcrel19 => encode_pcrel(self, operand, ctx.address, 19, 5),
-            Aarch64Opnd::AddrPcrel21 => encode_pcrel21(self, operand),
+            Aarch64Opnd::AddrPcrel21 => encode_pcrel21(self, operand, ctx.address),
             Aarch64Opnd::AddrPcrel26 => encode_pcrel(self, operand, ctx.address, 26, 0),
             Aarch64Opnd::AddrAdrp => encode_adrp(self, operand, ctx.address),
             Aarch64Opnd::SimdAddrSimple => encode_addr_simple(self, operand),
@@ -1512,15 +1524,24 @@ fn encode_pcrel(
     Ok(((imm as i32 as u32) & ((1_u32 << bits) - 1)) << bit_offset)
 }
 
-fn encode_pcrel21(kind: Aarch64Opnd, operand: &DecodedOperand) -> Result<Word, EncodeError> {
-    let DecodedOperand::Immediate(value) = operand else {
+/// Encode ADR's 21-bit, byte-granular PC-relative field. The operand carries the
+/// ABSOLUTE target (see the decode of `AddrPcrel21`); the displacement is
+/// recomputed from `address` here, which is what makes a relocated or
+/// code-shifted ADR land on the right target instead of a stale offset.
+fn encode_pcrel21(
+    kind: Aarch64Opnd,
+    operand: &DecodedOperand,
+    address: u64,
+) -> Result<Word, EncodeError> {
+    let DecodedOperand::BranchTarget(target) = operand else {
         return Err(EncodeError::InvalidOperand { kind: kind.name() });
     };
-    if !(-(1 << 20)..(1 << 20)).contains(value) {
+    let value = (*target as i128) - (address as i128);
+    if !(-(1 << 20)..(1 << 20)).contains(&value) {
         return Err(EncodeError::InvalidOperand { kind: kind.name() });
     }
 
-    let encoded = (*value as i32 as Word) & 0x1f_ffff;
+    let encoded = (value as i32 as Word) & 0x1f_ffff;
     Ok(((encoded & 0x3) << 29) | (((encoded >> 2) & 0x7ffff) << 5))
 }
 

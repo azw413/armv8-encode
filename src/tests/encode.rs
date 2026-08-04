@@ -802,16 +802,46 @@ fn encoded_logical_immediate_operands_match_otool_fixture() {
 #[test]
 fn encoded_pcrel21_operand_matches_otool_fixture() {
     let fixture = parse_otool_fixture(INTEGER_OTOOL_FIXTURE);
+    // ADR carries an ABSOLUTE target (0x28 + 4 = 0x2c), not a raw offset; the
+    // encoder derives the displacement from the instruction address (0x28) and
+    // the disassembler renders it back as `#4`.
     let instruction = template(
         0x28,
         Aarch64Mnemonic::Adr,
         vec![
             DecodedOperand::Register(x_reg(19)),
-            DecodedOperand::Immediate(4),
+            DecodedOperand::BranchTarget(0x2c),
         ],
     );
 
     assert_encoded_instruction_matches_fixture(&fixture, "adr x19, #4", &instruction);
+}
+
+/// Regression: an ADR's target must survive relocation. Before ADR was anchored
+/// to an absolute target it decoded to a raw `Immediate`, invisible to the
+/// PC-relative machinery, so a relocated or code-shifted ADR kept its stale
+/// displacement and computed a wild address — the root cause of a startup
+/// wild-pointer crash in mutated (junk/split-enlarged) binaries. Decoding at one
+/// address and re-encoding at another must preserve the ABSOLUTE target.
+#[test]
+fn adr_target_survives_relocation() {
+    // `adr x19, #4` at 0x28 -> absolute target 0x2c.
+    let original = aarch64::decode_instruction(0x28, 0x1000_0033).unwrap();
+    match &original.operands[1] {
+        DecodedOperand::BranchTarget(t) => assert_eq!(*t, 0x2c),
+        other => panic!("adr operand should be an absolute BranchTarget, got {other:?}"),
+    }
+
+    // Re-emit the SAME instruction 0x1000 bytes later. The encoded displacement
+    // must change so the resolved target stays 0x2c.
+    let relocated = template(0x1028, Aarch64Mnemonic::Adr, original.operands.clone());
+    let word = aarch64::encode_instruction(&relocated).unwrap();
+    let redecoded = aarch64::decode_instruction(0x1028, word).unwrap();
+    assert_eq!(
+        &redecoded.operands[1],
+        &DecodedOperand::BranchTarget(0x2c),
+        "relocated adr must still point at 0x2c"
+    );
 }
 
 #[test]

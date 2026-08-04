@@ -34,6 +34,11 @@ pub fn pcrel_range_bytes(mnemonic: Aarch64Mnemonic) -> Option<i64> {
         | Aarch64Mnemonic::Cbz
         | Aarch64Mnemonic::Cbnz => 1024 * 1024,
         Aarch64Mnemonic::Tbz | Aarch64Mnemonic::Tbnz => 32 * 1024,
+        // ADR is byte-granular ±1 MiB (21-bit signed). Not a branch, but it now
+        // carries a PC-relative target the layout pass must keep in range; an
+        // out-of-range ADR can't be widened (no inverse) and surfaces as a loud
+        // `DisplacementTooLarge` rather than a stale offset.
+        Aarch64Mnemonic::Adr => 1024 * 1024,
         _ => return None,
     })
 }

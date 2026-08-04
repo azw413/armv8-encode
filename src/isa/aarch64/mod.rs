@@ -386,6 +386,9 @@ impl DecodedInstruction {
         if raw == "adrp" {
             return format_adrp_operands(self.address, &self.operands, &symbol_for_address);
         }
+        if raw == "adr" {
+            return format_adr_operands(self.address, &self.operands, &symbol_for_address);
+        }
         format_operands(raw, &self.operands, symbol_for_address)
     }
 
@@ -822,6 +825,32 @@ fn format_operand_decimal(operand: &DecodedOperand, immediate_prefix: Option<&st
         }
         _ => format_operand_with_symbols(operand, &|_| None, immediate_prefix),
     }
+}
+
+/// `adr Xd, <target>`. The target is stored as an ABSOLUTE `BranchTarget` (so the
+/// rewrite layer can relocate it), but otool — and this disassembler — render it
+/// as a signed byte displacement from the instruction address (`#4`, `#-120`),
+/// or a symbol when one resolves. Undo the anchoring here for display.
+fn format_adr_operands<F>(
+    address: u64,
+    operands: &[DecodedOperand],
+    symbol_for_address: &F,
+) -> String
+where
+    F: Fn(u64) -> Option<String>,
+{
+    let Some((first, rest)) = operands.split_first() else {
+        return String::new();
+    };
+    let reg = format_operand_with_symbols(first, symbol_for_address, None);
+    let Some(DecodedOperand::BranchTarget(target)) = rest.first() else {
+        return reg;
+    };
+    if let Some(symbol) = symbol_for_address(*target) {
+        return format!("{reg}, {symbol}");
+    }
+    let offset = (*target as i64).wrapping_sub(address as i64);
+    format!("{reg}, #{offset}")
 }
 
 fn format_adrp_operands<F>(
