@@ -117,6 +117,25 @@ pub fn external_defined_nlist(strtab_offset: u32, n_sect: u8, value: u64) -> Nli
     }
 }
 
+/// After a `__TEXT` grow that shifted everything at or above `growth_point` up by
+/// `delta`, bump each DEFINED section symbol's `n_value` by the same amount so the
+/// symbol table stays consistent with the moved code. Mirrors the export-trie /
+/// `__init_offsets` `+delta` fixups the grow already applies. Leaves untouched:
+/// undefined symbols (`N_UNDF`, no in-image address), absolute symbols (`N_ABS`,
+/// not shifted), debug entries (`N_STAB`), and any symbol below `growth_point`.
+/// Without this a pass that reads the symbol table to bake a callee address (e.g.
+/// resolving an entry symbol) gets the stale pre-grow address.
+pub fn shift_defined_symbol_values(entries: &mut [Nlist64], growth_point: u64, delta: u64) {
+    const N_STAB: u8 = 0xe0; // debug-symbol bits
+    const N_TYPE: u8 = 0x0e; // type mask
+    const N_SECT: u8 = 0x0e; // defined in a section → n_value is an address
+    for e in entries {
+        if e.n_type & N_STAB == 0 && e.n_type & N_TYPE == N_SECT && e.n_value >= growth_point {
+            e.n_value += delta;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +171,27 @@ mod tests {
         assert_eq!(nl.n_type & 0x0e, 0x0e); // N_SECT
         assert_eq!(nl.n_sect, 5);
         assert_eq!(nl.n_value, 0x1000);
+    }
+
+    /// Regression: a `__TEXT` grow must `+delta` each defined section symbol's
+    /// address, or a pass that reads the symbol table (e.g. baking a callee
+    /// address) gets the stale pre-grow value and jumps into the grown gap.
+    #[test]
+    fn shift_defined_symbol_values_only_moves_defined_syms_above_growth_point() {
+        let mut e = vec![
+            // defined section symbol above growth_point → shifted (the crashing case)
+            Nlist64 { n_strx: 1, n_type: 0x0e, n_sect: 1, n_desc: 0, n_value: 0xa8d8 },
+            // defined external symbol below growth_point → untouched
+            Nlist64 { n_strx: 2, n_type: 0x0f, n_sect: 1, n_desc: 0, n_value: 0x100 },
+            // undefined external (N_UNDF) above growth_point → untouched (no address)
+            Nlist64 { n_strx: 3, n_type: 0x01, n_sect: 0, n_desc: 0, n_value: 0xb000 },
+            // debug stab (N_FUN=0x24) above growth_point → untouched
+            Nlist64 { n_strx: 4, n_type: 0x24, n_sect: 1, n_desc: 0, n_value: 0xc000 },
+        ];
+        shift_defined_symbol_values(&mut e, 0x800, 0x10000);
+        assert_eq!(e[0].n_value, 0x1a8d8, "defined section sym above growth_point += delta");
+        assert_eq!(e[1].n_value, 0x100, "below growth_point untouched");
+        assert_eq!(e[2].n_value, 0xb000, "undefined untouched");
+        assert_eq!(e[3].n_value, 0xc000, "stab untouched");
     }
 }

@@ -1213,6 +1213,35 @@ pub fn write_with_text_growth_opts(
         }
     }
 
+    // Symbol-table `+delta`: `LC_SYMTAB`'s `nlist_64.n_value` holds each DEFINED
+    // symbol's ADDRESS. `apply_growth_to_load_commands` shifted the symtab's file
+    // OFFSET by `delta` but NOT the addresses inside it — so a symbol above
+    // `growth_point` moved up by `delta` while its `n_value` stayed stale. dlsym
+    // uses the export trie (patched above) and is fine, but anything that reads
+    // the SYMBOL TABLE to bake a callee address — notably armadillo's
+    // shatter/whitebox packer resolving a supervisor entry like `_ymixitif` — then
+    // gets the pre-grow address, and the reconstruction later branches into the
+    // grown gap → wild-pointer crash. Patch each defined section symbol in place
+    // (the table's fixed 16-byte entries keep the same length, so no relocation).
+    if let Some(symtab) = layout.symtab.as_ref() {
+        if symtab.nsyms > 0 {
+            // __LINKEDIT (which holds the symtab) is past `growth_point`, so it was
+            // shifted up by `delta`; the blob now lives at `symoff + delta`.
+            let off = (symtab.symoff + delta) as usize;
+            let len = symtab.nsyms as usize * 16;
+            if let Some(slice) = bytes.get(off..off + len) {
+                let mut entries = crate::container::macho_symtab::parse_symtab(slice)?;
+                crate::container::macho_symtab::shift_defined_symbol_values(
+                    &mut entries,
+                    growth_point,
+                    delta,
+                );
+                let rebuilt = crate::container::macho_symtab::encode_symtab(&entries);
+                bytes[off..off + len].copy_from_slice(&rebuilt);
+            }
+        }
+    }
+
     // Chained-fixups blob: the editor re-encoded LC_DYLD_CHAINED_FIXUPS with every
     // rebase target `+delta` (originals shifted up), which can outgrow the original
     // slot. Place in the shifted slot if it still fits, else relocate to the grown
