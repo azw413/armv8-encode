@@ -38,6 +38,8 @@ pub(crate) mod elf_writer;
 pub(crate) mod gnu_hash;
 pub mod macho_export_trie;
 pub mod chained_fixups;
+pub mod macho_dyld_info;
+pub mod macho_unwind;
 mod macho_image;
 pub mod macho_objc;
 pub mod macho_swift;

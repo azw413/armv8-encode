@@ -1176,6 +1176,52 @@ pub fn write_with_text_growth_opts(
         }
     }
 
+    let dyld_info = crate::container::macho_dyld_info::find(raw);
+    // Classic-rebase `+delta`: an `LC_DYLD_INFO` image stores each rebased
+    // pointer's TARGET in the data itself (dyld only adds the slide), so every
+    // pointer into the shifted range — code past `growth_point`, the later
+    // __TEXT sections, __DATA* — must gain `delta`, or function/vtable/string
+    // pointers keep addressing the pre-grow layout (startup wild jump through
+    // an unshifted pointer). Chained-fixup images get the same shift through
+    // the re-encoded chain blob below instead.
+    if let Some(info) = dyld_info {
+        let (off, size) = info.rebase;
+        if size > 0 {
+            let opcodes = raw.get(off as usize..(off + size) as usize).ok_or_else(|| {
+                ContainerWriteError::ObjectWrite("grow: rebase opcodes out of bounds".into())
+            })?;
+            let locations = crate::container::macho_dyld_info::rebase_locations(opcodes)
+                .map_err(ContainerWriteError::ObjectWrite)?;
+            crate::container::macho_dyld_info::shift_rebased_pointers(
+                &mut bytes,
+                &layout.segments,
+                &locations,
+                growth_point,
+                delta,
+            )
+            .map_err(|e| ContainerWriteError::ObjectWrite(format!("grow: {e}")))?;
+        }
+    }
+
+    // Compact-unwind `+delta`: `__unwind_info` addresses functions, LSDAs and
+    // personality slots by image offset; stale offsets make a panic/exception
+    // in a moved function abort instead of unwinding.
+    for sec in &layout.sections {
+        if sec.segname != "__TEXT" || sec.sectname != "__unwind_info" || sec.file_offset == 0 {
+            continue;
+        }
+        let start = if sec.file_offset >= growth_point {
+            sec.file_offset + delta
+        } else {
+            sec.file_offset
+        } as usize;
+        let section = bytes.get_mut(start..start + sec.size as usize).ok_or_else(|| {
+            ContainerWriteError::ObjectWrite("grow: __unwind_info out of bounds".into())
+        })?;
+        crate::container::macho_unwind::shift_unwind_info(section, growth_point, delta)
+            .map_err(|e| ContainerWriteError::ObjectWrite(format!("grow: {e}")))?;
+    }
+
     // Exports-critical `+delta`: the export trie stores each symbol's address as an
     // offset from the (fixed) image base, but every regular export moved up by
     // `delta`, so its offset must too — else dlsym / linked callers resolve moved
@@ -1184,10 +1230,25 @@ pub fn write_with_text_growth_opts(
     // overwrite in place, otherwise RELOCATE it to a fresh slot appended at the end
     // of __LINKEDIT (grown) and repoint LC_DYLD_EXPORTS_TRIE. (`apply_growth...`
     // already shifted the LC's dataoff by delta; relocation overrides that.)
-    if let Some(trie) = layout.exports_trie {
-        if trie.datasize > 0 {
-            let start = trie.dataoff as usize;
-            let end = start + trie.datasize as usize;
+    let export_blob = match (layout.exports_trie, dyld_info) {
+        (Some(t), _) => Some((object::macho::LC_DYLD_EXPORTS_TRIE, 8, t.dataoff, t.datasize)),
+        (None, Some(info)) => {
+            let cmd = u32::from_le_bytes(
+                raw[info.command_offset..info.command_offset + 4].try_into().unwrap(),
+            );
+            Some((
+                cmd,
+                crate::container::macho_dyld_info::EXPORT_FIELD_OFFSET,
+                info.export.0,
+                info.export.1,
+            ))
+        }
+        (None, None) => None,
+    };
+    if let Some((export_lc, export_field, export_off, export_size)) = export_blob {
+        if export_size > 0 {
+            let start = export_off as usize;
+            let end = start + export_size as usize;
             let blob = raw.get(start..end).ok_or_else(|| {
                 ContainerWriteError::ObjectWrite("grow: export trie range out of bounds".into())
             })?;
@@ -1204,9 +1265,10 @@ pub fn write_with_text_growth_opts(
             place_or_relocate_linkedit_blob(
                 &mut bytes,
                 layout.load_commands_offset,
-                object::macho::LC_DYLD_EXPORTS_TRIE,
-                trie.dataoff,
-                trie.datasize,
+                export_lc,
+                export_field,
+                export_off,
+                export_size,
                 delta,
                 &rebuilt,
             )?;
@@ -1251,6 +1313,7 @@ pub fn write_with_text_growth_opts(
             &mut bytes,
             layout.load_commands_offset,
             object::macho::LC_DYLD_CHAINED_FIXUPS,
+            8,
             *dataoff,
             *datasize,
             delta,
@@ -1960,14 +2023,27 @@ fn patch_lc_linkedit_data(
     dataoff: u64,
     datasize: u64,
 ) -> Result<(), ContainerWriteError> {
+    patch_lc_data_range(bytes, cmd_id, 8, dataoff, datasize)
+}
+
+/// Repoint the `(u32 off, u32 size)` pair at `field_off` inside load command
+/// `cmd_id`.
+fn patch_lc_data_range(
+    bytes: &mut [u8],
+    cmd_id: u32,
+    field_off: usize,
+    dataoff: u64,
+    datasize: u64,
+) -> Result<(), ContainerWriteError> {
     let lc = find_load_command(bytes, cmd_id)?;
     let Some(off) = lc else {
         return Err(ContainerWriteError::ObjectWrite(format!(
             "Mach-O export: load command 0x{cmd_id:x} not found",
         )));
     };
-    bytes[off + 8..off + 12].copy_from_slice(&(dataoff as u32).to_le_bytes());
-    bytes[off + 12..off + 16].copy_from_slice(&(datasize as u32).to_le_bytes());
+    let at = off + field_off;
+    bytes[at..at + 4].copy_from_slice(&(dataoff as u32).to_le_bytes());
+    bytes[at + 4..at + 8].copy_from_slice(&(datasize as u32).to_le_bytes());
     Ok(())
 }
 
@@ -2093,10 +2169,14 @@ fn strip_trailing_code_signature(bytes: &mut Vec<u8>) -> Result<(), ContainerWri
 /// shifted the LC's `dataoff` by `delta`; relocation overrides that. Used for the
 /// export trie and the chained-fixups blob, both of which can outgrow their slot
 /// when their offsets are re-encoded `+delta`.
+/// `field_off` is where the blob's `(u32 off, u32 size)` pair sits inside
+/// its load command: 8 for `linkedit_data_command`s,
+/// [`macho_dyld_info::EXPORT_FIELD_OFFSET`] for the `LC_DYLD_INFO` export trie.
 fn place_or_relocate_linkedit_blob(
     bytes: &mut Vec<u8>,
     load_commands_offset: u64,
     lc_id: u32,
+    field_off: usize,
     orig_dataoff: u64,
     orig_datasize: u64,
     delta: u64,
@@ -2117,7 +2197,7 @@ fn place_or_relocate_linkedit_blob(
         bytes.extend_from_slice(blob);
         let new_end = bytes.len() as u64;
         extend_linkedit_segment(bytes, load_commands_offset, new_end)?;
-        patch_lc_linkedit_data(bytes, lc_id, new_off, blob.len() as u64)?;
+        patch_lc_data_range(bytes, lc_id, field_off, new_off, blob.len() as u64)?;
     }
     Ok(())
 }
