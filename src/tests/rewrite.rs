@@ -1041,6 +1041,65 @@ mod macros {
         }
     }
 
+    /// `beq 0x1000 ; nop ; adrp x8, 0x1000 ; add <rd>, x8, #8 ; ret` at 0xff8:
+    /// the ADRP's page (0x1000) coincides with the start of a basic block (the
+    /// beq target), which is exactly the ADRP itself.
+    fn page_coincides_with_block(add_rd: u8) -> Vec<aarch64::InstructionTemplate> {
+        vec![beq(0x1000), nop(), adrp(8, 0x1000), add_imm(add_rd, 8, 8), ret()]
+    }
+
+    #[test]
+    fn adrp_page_on_a_block_boundary_is_not_a_block_reference() {
+        // Regression (gecko `InvalidOperand { AddrAdrp }`): the bare page used to
+        // be symbolized to the coincident block, so once code was inserted ahead
+        // of it the block's new, unaligned address reached the ADRP encoder.
+        let mut plan = plan_from(page_coincides_with_block(9), 0xff8);
+        let page = plan
+            .instruction_at(0x1000)
+            .expect("unfused adrp (add writes another register)")
+            .operands
+            .iter()
+            .find_map(|o| match o {
+                RewriteOperand::Page(t) => Some(*t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(page, Target::Absolute(0x1000));
+
+        // Shift the block by one instruction and re-emit: must encode, and the
+        // ADRP still yields the original page.
+        plan.insert_after_address(
+            0xffc,
+            vec![RewriteInstruction {
+                mnemonic: Aarch64Mnemonic::Nop,
+                operands: Vec::new(),
+                original_address: None,
+                source_size: None,
+            }],
+        )
+        .unwrap();
+        let layout = lay_out(&plan, 0xff8, None).unwrap();
+        let out = emit(&plan, &layout, None).expect("emit after a shift").bytes;
+        let word = u32::from_le_bytes(out[0xc..0x10].try_into().unwrap());
+        let adrp = aarch64::decode_instruction(0x1004, word).unwrap();
+        assert_eq!(adrp.mnemonic, Aarch64Mnemonic::Adrp);
+        assert_eq!(adrp.operands[1], DecodedOperand::PageTarget(0x1000));
+    }
+
+    #[test]
+    fn same_register_pair_on_a_block_boundary_still_fuses() {
+        // The coincident block used to block fusion too (fusion only combines an
+        // absolute page with the lo12).
+        let plan = plan_from(page_coincides_with_block(8), 0xff8);
+        let fused = plan.blocks.iter().flat_map(|b| &b.ops).find_map(|op| match op {
+            RewriteOp::Macro(m) => Some(m),
+            _ => None,
+        });
+        let m = fused.expect("adrp x8 + add x8, x8, #8 fuses");
+        assert_eq!(m.kind, MacroKind::LoadAddress);
+        assert_eq!(m.original_addresses, vec![0x1000, 0x1004]);
+    }
+
     #[test]
     fn fusion_skipped_when_destination_registers_differ() {
         // adrp x0, 0x10000 ; add x1, x0, #0 ← different Rd

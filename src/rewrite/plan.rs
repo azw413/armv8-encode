@@ -405,11 +405,16 @@ fn lift_instruction<'a, I: Isa>(
                 });
                 RewriteOperand::Branch(target)
             }
+            // An ADRP's page base is NOT a reference to whatever block or
+            // symbol happens to start on that page boundary — what it addresses
+            // is page + the companion's lo12, which only fusion
+            // (`try_fuse_adrp_add`) can see. Symbolizing the bare page to a
+            // coincident block made the block's relocated, unaligned address
+            // reach the ADRP encoder (`InvalidOperand { AddrAdrp }`) and also
+            // blocked fusing the pair. Keep it absolute; fusion resolves the
+            // combined target to a block/symbol itself.
             Some((PcRelKind::Page, addr)) => {
-                let target = reloc_target.unwrap_or_else(|| {
-                    resolve_address(addr, block_at_address, container)
-                });
-                RewriteOperand::Page(target)
+                RewriteOperand::Page(reloc_target.unwrap_or(Target::Absolute(addr)))
             }
             None => RewriteOperand::Decoded(operand.clone()),
         })
