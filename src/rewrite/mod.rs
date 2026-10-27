@@ -50,7 +50,7 @@ pub use data::{
     DataLift, DataLiftError, DataPayload, DataSection,
 };
 pub use editor::{
-    BinaryEditor, BinaryState, InitialiserPosition, LiftedTextSection, RegionId, Reservation,
+    AppendedSectionNames, BinaryEditor, BinaryState, InitialiserPosition, LiftedTextSection, RegionId, Reservation,
     ScatterPlacement, TextEditorError,
 };
 #[allow(deprecated)]

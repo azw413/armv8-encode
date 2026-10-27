@@ -1521,3 +1521,55 @@ fn reserve_grow_then_commit_produces_grown_dylib() {
     assert_eq!(new_text.1, old_text.1 + delta, "__TEXT vmsize += delta");
     assert!(!reparsed.symbols.is_empty(), "symtab still parses");
 }
+
+/// Commit the ARMv7 fixture with one appended Thumb function and one
+/// writable buffer, optionally naming the appended sections, and return
+/// the output's section names.
+fn appended_section_names_after_commit(
+    names: Option<crate::rewrite::AppendedSectionNames>,
+) -> Vec<String> {
+    use crate::isa::armv7::operand::{DecodedOperand, Register, RegisterClass};
+    use crate::isa::armv7::table_generated::ThumbMnemonicGenerated;
+    use crate::isa::armv7::ThumbIsa;
+    use crate::rewrite::ir::{RewriteInstruction as RewriteInstructionGeneric, RewriteOperand};
+
+    let container = Container::from_bytes(&libtool_checker_bytes()).expect("parse");
+    let mut editor = BinaryEditor::new(&container).expect("editor");
+    if let Some(names) = names {
+        editor.binary.set_appended_section_names(names);
+    }
+    let body: Vec<RewriteInstructionGeneric<ThumbIsa>> = vec![RewriteInstructionGeneric {
+        mnemonic: ThumbMnemonicGenerated::Bx,
+        operands: vec![RewriteOperand::Decoded(DecodedOperand::Register(Register {
+            class: RegisterClass::R,
+            index: 14,
+        }))],
+        original_address: None,
+        source_size: None,
+    }];
+    editor.binary.add_function_generic::<ThumbIsa>("fn_a", body).expect("add_function_generic");
+    editor.binary.add_writable_data("buf_a", &[0u8; 64], 8).expect("add_writable_data");
+    let written = editor.commit_to_bytes().expect("commit_to_bytes");
+    let reparsed = Container::from_bytes(&written).expect("re-parse");
+    reparsed.sections.iter().map(|s| s.name.clone()).collect()
+}
+
+#[test]
+fn appended_sections_use_the_default_names() {
+    let defaults = crate::rewrite::AppendedSectionNames::default();
+    let names = appended_section_names_after_commit(None);
+    assert!(names.contains(&defaults.code), "{names:?}");
+    assert!(names.contains(&defaults.writable), "{names:?}");
+}
+
+#[test]
+fn appended_sections_take_caller_names() {
+    let custom = crate::rewrite::AppendedSectionNames {
+        code: ".text.hot".to_string(),
+        writable: ".data.rel.local".to_string(),
+    };
+    let names = appended_section_names_after_commit(Some(custom.clone()));
+    assert!(names.contains(&custom.code), "{names:?}");
+    assert!(names.contains(&custom.writable), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("armv8_encode")), "default name leaked: {names:?}");
+}

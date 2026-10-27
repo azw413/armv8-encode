@@ -867,6 +867,31 @@ pub struct BinaryState {
     /// uniform-shift growth geometry `(growth_point, delta)`. Commit
     /// routes to [`Self::build_grown_macho`] when this is set.
     pending_text_grow: Option<(u64, u64)>,
+    /// Section-header names given to the appended ELF segments. Set via
+    /// [`Self::set_appended_section_names`].
+    appended_names: AppendedSectionNames,
+}
+
+/// Section-header names for the segments an ELF commit appends: the
+/// R-X code (+ read-only data) segment and the separate R-W segment of
+/// [`BinaryState::add_writable_data`]. The loader ignores section
+/// names, so callers that don't want the defaults to identify the tool
+/// can pick anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendedSectionNames {
+    /// Name of the appended code segment's section.
+    pub code: String,
+    /// Name of the appended writable segment's section.
+    pub writable: String,
+}
+
+impl Default for AppendedSectionNames {
+    fn default() -> Self {
+        Self {
+            code: ".text.armv8_encode_appended".to_string(),
+            writable: ".data.armv8_encode_writable".to_string(),
+        }
+    }
 }
 
 /// Opaque handle to a reserved text-space region. Passed back to the
@@ -1444,6 +1469,7 @@ impl BinaryEditor {
                 macho_raw_byte_overrides: Vec::new(),
                 reserved_text_region: None,
                 pending_text_grow: None,
+                appended_names: AppendedSectionNames::default(),
             },
             text: None,
         })
@@ -2107,6 +2133,13 @@ impl BinaryState {
     /// editor should construct a fresh one.
     pub fn prohibit_new_segments(&mut self) {
         self.no_new_segments = true;
+    }
+
+    /// Name the sections of the segments an ELF commit appends
+    /// (defaults: [`AppendedSectionNames::default`]). Mach-O output is
+    /// unaffected.
+    pub fn set_appended_section_names(&mut self, names: AppendedSectionNames) {
+        self.appended_names = names;
     }
 
     /// Stage a freshly-serialised `LC_DYLD_CHAINED_FIXUPS`
@@ -5477,6 +5510,7 @@ impl BinaryEditor {
                     appended.segment_vaddr,
                     segment_bytes,
                 );
+                segment.section_name = binary.appended_names.code.clone();
                 if no_executable_append {
                     use object::elf;
                     segment.p_flags = elf::PF_R | elf::PF_W;
@@ -5494,7 +5528,7 @@ impl BinaryEditor {
                     crate::container::elf_writer::WritableSegment {
                         vaddr: w.segment_vaddr,
                         bytes: w.bytes.clone(),
-                        section_name: ".data.armv8_encode_writable".to_string(),
+                        section_name: binary.appended_names.writable.clone(),
                     }
                 });
                 crate::container::elf_writer::write_with_appended_segment_inner(
